@@ -1,6 +1,6 @@
 # HN Rerank status
 
-Updated 2026-10-11. Previous handoff (one-classifier research, Why-this-story
+Updated 2026-10-12. Previous handoff (one-classifier research, Why-this-story
 preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
@@ -22,8 +22,8 @@ A new profile's first feed therefore matters too.
 Chosen next goals (user 2026-10-12): discovery (fewer same-y
 feeds: Explore first, since it is outside the trial; Recommended diversity
 after 2026-11-05), a reading signal (TUI opens and dwell) and a good
-first feed for new profiles. Serve-time score logging (`deck-scores`
-branch) supports all three.
+first feed for new profiles. Serve-time score logging (`deck_scores`
+table, live since 2026-10-12) supports all three.
 
 ## Objective
 Deploy the approved Codex Forum source-safety target 794caa4 (user 2026-10-11).
@@ -48,6 +48,13 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Training neutral votes as down gave no gain either. Five weak feeds
   (FIRE trio, r/MachineLearning, Haskell Discourse) dropped and deployed
   2026-10-12 00:23 UTC, with the user's OK to restart mid-trial.
+  Serve-time score logging (`deck_scores`, cf9594d) deployed 2026-10-12
+  12:06 UTC with the user's OK: VPS gate 1,344 passed / 1 skipped, ruff and
+  ty clean; the startup warm wrote profile 151's row (5 windows, no null
+  scores); a cold smoke profile wrote none; journal clean.
+  Discover (replaces Novel in Explore; FINDINGS "Discover Phase 0"):
+  Phase 1 build approved by the user 2026-10-12, built by Muse on branch
+  `discover`; not merged or deployed.
   Teach (active learning in place of Explore): Phase 0 simulation showed
   only a tiny gain over random picks; parked by the user.
   [Evidence](FINDINGS.md#blind-re-vote-calibration-recency-check-re-votes-applied--2026-10-11).
@@ -285,6 +292,11 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Discover: check Muse's build on branch `discover`, run the full gate,
+  offer a review, then deploy with the user's restart OK. Read the result
+  about 2026-11-02 (PLAN.md Phase 2).
+- After 2026-11-05: replay rank caps and score bars on `deck_scores`
+  (FINDINGS "Short-window Recommended: score bar check").
 - After the trial ends (2026-11-05): merge `muse-primary-fallback`, set
   `LLM_PROVIDER=gospark` and `LLM_FALLBACK_PROVIDER=mistral` in the VPS
   shared `.env`, restart with the user's OK, smoke-test a tap and watch Go
