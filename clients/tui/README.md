@@ -52,8 +52,12 @@ can still outrun generation, and changing the time window warms its own targets.
 Selected-story transitions that remain selected for at least one second send
 best-effort impression events to your configured server's existing interaction
 ledger: story ID, zero-based list position, filters, feed version, time and a
-random session ID. Prefetches do not count; failures never block reading.
-This measures selection, not attention or terminal-window visibility. Events
+random session ID. The reader also logs article/comment opens (`o`/`c`) at
+once and dwell intervals per selection, with the same 1 s minimum and a
+5 min idle cap (input idle ends the segment). Prefetches do not count;
+failures never block reading. Dwell also ends when the terminal reports a
+focus loss (in tmux this needs `focus-events on`); without such reports only
+the idle cap bounds it, so it measures selection time, not attention. Events
 are not sent to a separate analytics service and are not retried.
 
 Configuration lives in platformdirs' user config directory (`hn-rerank/profile.json`),

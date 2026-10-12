@@ -44,7 +44,7 @@ from textual.worker import Worker, WorkerState
 from .api import (
     API,
     APIError,
-    Impression,
+    InteractionEvent,
     InvalidProfile,
     Profile,
     TransientError,
@@ -56,6 +56,7 @@ from .api import (
     save_window,
 )
 from .api import Summary as SummaryResult
+from .dwell import Dwell, DwellContext, DwellTracker
 from .models import (
     DEFAULT_WINDOW,
     GRAVITY_TIME_SCALE,
@@ -67,6 +68,19 @@ from .models import (
 
 DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
 QUIT_VOTE_WAIT_SECONDS = 5.0
+# Telemetry quit budget: pending dwell/opens/impressions flush within ~1 s.
+QUIT_TELEMETRY_WAIT_SECONDS = 1.0
+
+
+def _monotonic() -> float:
+    """Monotonic clock for dwell segments (monkeypatched in tests)."""
+    return time.monotonic()
+
+
+def _wall_time() -> float:
+    """Wall clock for interaction occurred_at (monkeypatched in tests)."""
+    return time.time()
+
 
 DARK_PALETTE: dict[str, str] = {
     "bg": "#171717",
@@ -817,6 +831,7 @@ class Reader(App[None]):
         self._quit_requested = False
         self.selection_serial = 0
         self.interaction_session = str(uuid4())
+        self.dwell_tracker = DwellTracker()
         self.summary_story_id: int | None = None
         self.reading = False
         self.help_open = False
@@ -1056,6 +1071,9 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "refresh")
         self.workers.cancel_group(self, "vote")
         self.workers.cancel_group(self, "impression")
+        self.workers.cancel_group(self, "interaction")
+        # A profile switch drops the open segment unsent.
+        self.dwell_tracker.stop(_monotonic())
         self.push_screen(
             Setup(
                 self.config_path,
@@ -1075,6 +1093,7 @@ class Reader(App[None]):
         self.server = profile.server
         self.api = API(profile.server, profile.token)
         self.interaction_session = str(uuid4())
+        self.dwell_tracker = DwellTracker()
         self.feed = None
         self.feeds.clear()
         self.window_attempts.clear()
@@ -1224,6 +1243,7 @@ class Reader(App[None]):
             self.summary_story_id = None
             self.selection_serial += 1
             self.workers.cancel_group(self, "summary")
+            self._stop_dwell()
             self.query_one("#summary", Markdown).update(
                 EMPTY_NOTICE
                 if self.feed is not None
@@ -1293,7 +1313,131 @@ class Reader(App[None]):
         self._marked_id = current_id
         self.schedule_summary()
 
-    def schedule_summary(self) -> None:
+    def _dwell_ctx(self, story: FeedStory) -> DwellContext | None:
+        """The dwell/impression dimensions for *story* as currently shown."""
+        if self.feed is None or not self.query("#headlines"):
+            return None
+        try:
+            position = self.stories.index(story)
+        except ValueError:
+            return None
+        return DwellContext(
+            story_id=story.id,
+            position=position,
+            dashboard_version=self.feed.version,
+            sort_mode=str(self.query_one("#sort", Select).value),
+            window=self.feed.window,
+            badges=tuple(badge.kind for badge in story.badge_details),
+        )
+
+    def _interaction_event(
+        self,
+        ctx: DwellContext,
+        event_type: str,
+        occurred_at: float,
+        duration_ms: int | None = None,
+    ) -> InteractionEvent:
+        return InteractionEvent(
+            event_id=str(uuid4()),
+            client_session_id=self.interaction_session,
+            story_id=ctx.story_id,
+            dashboard_version=ctx.dashboard_version,
+            position=ctx.position,
+            sort_mode=ctx.sort_mode,
+            window=ctx.window,
+            occurred_at=occurred_at,
+            event_type=event_type,
+            badges=list(ctx.badges),
+            duration_ms=duration_ms,
+        )
+
+    @work(group="interaction", exclusive=False)
+    async def _send_interaction(self, event: InteractionEvent) -> None:
+        api = self.api
+        if api is None:
+            return
+        try:
+            await api.interaction(event)
+        except APIError:
+            # Best effort; telemetry never blocks reading or voting.
+            pass
+
+    def _dwell_event(self, dwell: Dwell) -> InteractionEvent:
+        return self._interaction_event(
+            dwell.ctx, "dwell", _wall_time(), dwell.duration_ms
+        )
+
+    def _send_dwell(self, dwell: Dwell | None) -> None:
+        if dwell is not None:
+            self._send_interaction(self._dwell_event(dwell))
+
+    def _stop_dwell(self) -> None:
+        """End the open dwell segment and send it best effort."""
+        self._send_dwell(self.dwell_tracker.stop(_monotonic()))
+
+    def _touch_dwell(self) -> None:
+        """Record input for the open dwell segment (idle may close it)."""
+        self._send_dwell(self.dwell_tracker.touch(_monotonic()))
+
+    async def _wait_for_interaction_workers(self, timeout: float) -> None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            pending = any(
+                worker.group == "interaction" and not worker.is_finished
+                for worker in self.workers
+            )
+            if not pending:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.05, remaining))
+
+    async def _flush_quit_telemetry(
+        self, events_to_send: list[InteractionEvent]
+    ) -> None:
+        api = self.api
+        if api is not None:
+            for event in events_to_send:
+                try:
+                    await asyncio.wait_for(
+                        api.interaction(event),
+                        timeout=QUIT_TELEMETRY_WAIT_SECONDS,
+                    )
+                except (APIError, TimeoutError):
+                    # Best effort: a failing server changes nothing visible.
+                    pass
+        # In-flight opens/dwells sent just before quitting get a chance
+        # within the same budget; impressions keep their own 1 s delay and
+        # are covered by the pending event above instead.
+        try:
+            await asyncio.wait_for(
+                self._wait_for_interaction_workers(QUIT_TELEMETRY_WAIT_SECONDS),
+                timeout=QUIT_TELEMETRY_WAIT_SECONDS,
+            )
+        except TimeoutError:
+            pass
+
+    async def on_event(self, event: events.Event) -> None:
+        if isinstance(event, (events.Key, events.MouseEvent)):
+            self._touch_dwell()
+        await super().on_event(event)
+
+    def on_app_blur(self, event: events.AppBlur) -> None:
+        self._stop_dwell()
+
+    def on_app_focus(self, event: events.AppFocus) -> None:
+        # Resume without a new impression when a story is selected.
+        if self.help_open or self.setting_up or self.closing:
+            return
+        story = self.selected() if self.query("#headlines") else None
+        if story is None or self.feed is None:
+            return
+        ctx = self._dwell_ctx(story)
+        if ctx is not None:
+            self._send_dwell(self.dwell_tracker.start(ctx, _monotonic()))
+
+    def schedule_summary(self, *, emit_impression: bool = True) -> None:
         story = self.selected()
         if self.help_open:
             return
@@ -1302,20 +1446,14 @@ class Reader(App[None]):
             self.summary_story_id = story.id
             self.selection_serial += 1
             if self.feed is not None:
-                self.record_impression(
-                    Impression(
-                        event_id=str(uuid4()),
-                        client_session_id=self.interaction_session,
-                        story_id=story.id,
-                        dashboard_version=self.feed.version,
-                        position=self.stories.index(story),
-                        sort_mode=str(self.query_one("#sort", Select).value),
-                        window=self.feed.window,
-                        occurred_at=time.time(),
-                        badges=[badge.kind for badge in story.badge_details],
-                    ),
-                    self.selection_serial,
-                )
+                ctx = self._dwell_ctx(story)
+                if ctx is not None:
+                    self._send_dwell(self.dwell_tracker.start(ctx, _monotonic()))
+                    if emit_impression:
+                        self.record_impression(
+                            self._interaction_event(ctx, "impression", _wall_time()),
+                            self.selection_serial,
+                        )
             cached = self.summaries.get(story.id)
             if cached is not None:
                 self.query_one("#summary", Markdown).update(cached)
@@ -1326,7 +1464,7 @@ class Reader(App[None]):
             self.query_one("#summary", Markdown).scroll_home(animate=False)
 
     @work(group="impression", exclusive=True)
-    async def record_impression(self, event: Impression, serial: int) -> None:
+    async def record_impression(self, event: InteractionEvent, serial: int) -> None:
         # Only a selected card visible for >=1s counts, not prefetched stories.
         api = self.api
         await asyncio.sleep(1.0)
@@ -1346,7 +1484,7 @@ class Reader(App[None]):
         ):
             return
         try:
-            await api.impression(event)
+            await api.interaction(event)
         except APIError:
             # Best effort; telemetry must never interrupt reading or voting.
             pass
@@ -2341,6 +2479,25 @@ class Reader(App[None]):
         url = getattr(story, field, "") if story else ""
         if urlsplit(url).scheme in {"http", "https"}:
             open_in_browser(url)
+            if (
+                story is None
+                or self.feed is None
+                or self._quit_requested
+                or self.closing
+            ):
+                return
+            if field == "article_url":
+                event_type = "article_open"
+            elif field == "comments_url":
+                event_type = "comments_open"
+            else:
+                return
+            ctx = self._dwell_ctx(story)
+            if ctx is None:
+                return
+            self._send_interaction(
+                self._interaction_event(ctx, event_type, _wall_time())
+            )
         else:
             self.status("No link available for this story.")
 
@@ -2479,12 +2636,13 @@ class Reader(App[None]):
         self.query_one("#headlines", OptionList).focus()
         if self.help_open:
             self.help_open = False
-            self.schedule_summary()
+            self.schedule_summary(emit_impression=False)
 
     def action_why_story(self) -> None:
         story = self.selected()
         if story is None:
             return
+        self._stop_dwell()
         self.help_open = True
         self.summary_story_id = None
         self.selection_serial += 1
@@ -2538,6 +2696,7 @@ class Reader(App[None]):
         self.focus_summary()
 
     def action_badge_legend(self) -> None:
+        self._stop_dwell()
         self.help_open = True
         self.summary_story_id = None
         self.selection_serial += 1
@@ -2553,6 +2712,7 @@ class Reader(App[None]):
         self.focus_summary()
 
     def action_help(self) -> None:
+        self._stop_dwell()
         self.help_open = True
         self.summary_story_id = None
         self.selection_serial += 1
@@ -2595,19 +2755,35 @@ class Reader(App[None]):
         if self._quit_requested:
             return
         self._quit_requested = True
+        # The open reading segment's dwell (if >= 1 s) is sent with a ~1 s
+        # cap in the quit worker, never delaying votes. A still-delayed
+        # impression is under 1 s old, so it is not sent.
+        dwell = self.dwell_tracker.stop(_monotonic())
+        quit_events = [] if dwell is None else [self._dwell_event(dwell)]
         votes: tuple[Worker[None], ...] = tuple(
             worker
             for worker in self.workers
             if worker.group == "vote" and not worker.is_finished
         )
-        self._quit_after_votes(votes, self._unconfirmed_votes)
+        self._quit_after_votes(votes, self._unconfirmed_votes, quit_events)
 
     @work(group="quit")
     async def _quit_after_votes(
-        self, votes: tuple[Worker[None], ...], unconfirmed_before: int
+        self,
+        votes: tuple[Worker[None], ...],
+        unconfirmed_before: int,
+        quit_events: list[InteractionEvent] | None = None,
     ) -> None:
         exiting = False
+        flush_task: asyncio.Task[None] | None = None
         try:
+            if quit_events or any(
+                worker.group == "interaction" and not worker.is_finished
+                for worker in self.workers
+            ):
+                flush_task = asyncio.create_task(
+                    self._flush_quit_telemetry(list(quit_events or []))
+                )
             if votes:
                 self.status("Saving pending votes before quitting…")
             deadline = time.monotonic() + QUIT_VOTE_WAIT_SECONDS
@@ -2637,9 +2813,18 @@ class Reader(App[None]):
                     error=True,
                 )
                 return
+            if flush_task is not None:
+                try:
+                    await asyncio.wait_for(
+                        flush_task, timeout=QUIT_TELEMETRY_WAIT_SECONDS
+                    )
+                except TimeoutError:
+                    pass
             self.exit()
             exiting = True
         finally:
+            if flush_task is not None and not flush_task.done():
+                flush_task.cancel()
             if not exiting:
                 self._quit_requested = False
 
