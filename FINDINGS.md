@@ -1,5 +1,44 @@
 # HN Rerank findings
 
+## Discover Phase 0: pick rules for far stories — 2026-10-12
+
+Plan: `docs/evaluations/discovery-20261012/PLAN.md`. Read-only on profile
+151:
+- 2,234 stories first shown since 2026-09-24 in any view, scored by day-old
+  production models.
+- "Far" = max cosine similarity below tau to every up-vote cast before the
+  story's day.
+- Each rule picks 3 far stories per (day, window) group.
+- Outcome = up-vote cast after the first showing.
+- Paired bootstrap over 18-19 days.
+- Script: laptop `~/revote/discover-phase0.py` (written by Muse, reviewed and
+  run by the agent).
+
+At tau 0.60 (465 far stories, 34 groups, far up-rate 3.4%):
+
+| rule | up-rate of picks | vs random far [95% CI] | vs today's Novel [95% CI] |
+|---|---|---|---|
+| R0 Novel (farthest from all votes) | 3.9% | +0.1 pts [-4.1, +4.1] | — |
+| R1 best production score | 11.8% | +6.5 [+1.9, +12.1] | +6.4 [+0.6, +13.5] |
+| R2 source quality | 8.8% | +2.7 [-0.5, +5.9] | +2.6 [-2.9, +7.9] |
+| R3 blend R1+R2 | 10.8% | +5.9 [+1.8, +10.7] | +5.8 [+0.3, +12.0] |
+| R4 topic bandit | 10.4% | +5.5 [+2.0, +9.7] | +5.5 [+0.6, +11.7] |
+| random far | 4.5% | — | — |
+
+- The simplest rule, R1, passes the plan's gate (beats random with the CI
+  above 0, at least 8% up) and does as well as the more complex rules.
+- R1 holds in short windows (11.1% vs random 1.7%) and long ones (12.3% vs
+  6.7%).
+- Tau trades novelty for hits: at 0.65, R1 reaches 15.3% up; at 0.55 it
+  reaches 8.0% (CI touches 0).
+- Today's Novel matches random, in line with its live 1 of 58.
+- Limits:
+  - The pool is stories already shown, including Recommended's own far
+    cards. A live Discover excludes Recommended's picks, so it gets the far
+    stories just below Recommended's cutoff and may land less often.
+  - HN points and comments are read at snapshot time.
+  - About 12 up-votes per rule, so the read is directional.
+
 ## Sameness and novel up-votes, profile 151 — 2026-10-12
 
 Read-only; the user named a same-y feed as the worst failure. Impressions

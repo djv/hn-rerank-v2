@@ -1,8 +1,9 @@
 # Discover: Explore that finds new topics the user likes — plan (2026-10-12)
 
 Status: approved to start by the user 2026-10-12 ("go ahead with the
-explore plan"). Phase 0 is running; Phase 1 needs the user's OK on the
-Phase 0 result.
+explore plan"). Phase 0 done: R1 (best production score among far
+stories, tau 0.60) passes the gate (FINDINGS.md "Discover Phase 0").
+Phase 1 needs the user's OK.
 
 ## Why
 
