@@ -1,5 +1,30 @@
 # HN Rerank findings
 
+## Live feed metrics, profile 151 — 2026-10-12
+
+Read-only on the live DB, impressions 2026-09-28 to 2026-10-12 02:43 UTC
+(user asked for metrics beyond AUC, which is near the vote-consistency
+ceiling). Outcome = the current vote if cast after the story's first showing
+in that view; the 29 calibration re-vote rows excluded. Script: laptop
+`~/revote/feed-metrics.py`.
+
+| view | shown | up | neutral | down | no vote | down / voted |
+|---|---|---|---|---|---|---|
+| Recommended | 697 | 20.5% | 30.1% | 28.8% | 20.5% | 36% |
+| Popular | 780 | 6.2% | 20.1% | 60.6% | 13.1% | 70% |
+| Explore | 438 | 4.3% | 13.7% | 40.2% | 41.8% | 69% |
+
+- Recommended by window: 12h 14% up / 39% down, 1d 19% / 35%, 1w 27% / 17%,
+  1m 32% / 12%. Short windows fill eight slots from a thin pool.
+- Recommended by source: other RSS 28% up / 18% down, HN 19% / 29%,
+  Reddit 14% / 40%.
+- Slide-ins (positions 8-11) do worse than the first eight (12% vs 22% up).
+- Repeats are rare: 28 of 143 unvoted Recommended cards showed on 2+ days;
+  near-duplicate pairs (cos >= 0.87, same view and day) 11 over 822
+  story-days.
+- No reading signal exists: all 5,097 of profile 151's interaction events
+  are impressions; the TUI sends no opens or dwell.
+
 ## Teach Phase 0: selection simulation — 2026-10-12
 
 `scripts/simulate_teach.py` (46ebd0b) on a live-DB snapshot (2026-10-12
