@@ -321,8 +321,11 @@ TALK_MIN_COMMENTS = 50
 # in templates/index.html and the TUI; 12 before 2026-10-08, user's choice)
 # plus 4 that slide in as cards ahead of them are voted.
 VIEW_SIZE = 12
-# Explore serves this many each of Unsure, Novel and Interest.
+# Explore serves this many each of Unsure, Discover and Interest.
 EXPLORE_PER_BADGE = 3
+# Stories with a max cosine similarity to the user's up-votes strictly below
+# this are Discover candidates; value from FINDINGS "Discover Phase 0".
+DISCOVER_MAX_SIM_UP = 0.60
 # Views are picked at this multiple of their served size, so that dedup,
 # votes and stories ageing out of a window between warms leave enough.
 SELECT_MARGIN = 2
@@ -398,7 +401,7 @@ class RankedStory:
     prob_neutral: float | None = None
     prob_up: float | None = None
     is_uncertain: bool = False
-    is_novel: bool = False
+    is_discover: bool = False
     is_discussion_rich: bool = False
     is_high_engagement: bool = False
     is_hot: bool = False
@@ -2015,7 +2018,7 @@ def window_pool(
 class WindowViews:
     """The three views of one time window. Recommended is in model-score
     order and Popular in HN-gravity order. A cached deck's Explore is in
-    pick order (Unsure, then Novel, then Interest picks, each best first) so
+    pick order (Unsure, then Discover, then Interest picks, each best first) so
     ``serve_window`` can cap it per badge; a served Explore is in model-score
     order."""
 
@@ -2043,7 +2046,7 @@ class WindowViews:
                     else replace(
                         prev,
                         is_uncertain=prev.is_uncertain or r.is_uncertain,
-                        is_novel=prev.is_novel or r.is_novel,
+                        is_discover=prev.is_discover or r.is_discover,
                         is_discussion_rich=prev.is_discussion_rich
                         or r.is_discussion_rich,
                         is_high_engagement=prev.is_high_engagement
@@ -2109,17 +2112,19 @@ class WindowDeck:
 
 @dataclass(frozen=True)
 class ExploreContext:
-    """Per-candidate arrays for the personalized Explore picks (Unsure/Novel/
+    """Per-candidate arrays for the personalized Explore picks (Unsure/Discover/
     Interest), rows looked up by story id through ``row_of``. Absent
     (``None``) on the cold-deck path, which has no feedback to personalize
     against.
 
-    ``cand_interest`` is each candidate's nearest interest (a cluster of the
-    user's upvotes, ``interest_centers``); ``interest_sizes`` counts the
-    upvotes in each. No interests (empty ``interest_sizes``), no Interest
-    picks."""
+    ``cand_closest_up`` is each candidate's max cosine similarity to the
+    user's up-votes (zeros when the user has none); Discover picks from
+    stories strictly below ``DISCOVER_MAX_SIM_UP``. ``cand_interest`` is each
+    candidate's nearest interest (a cluster of the user's upvotes,
+    ``interest_centers``); ``interest_sizes`` counts the upvotes in each. No
+    interests (empty ``interest_sizes``), no Interest picks."""
 
-    cand_max_sim: NDArray[np.float32]
+    cand_closest_up: NDArray[np.float32]
     cand_interest: NDArray[np.int64]
     interest_sizes: NDArray[np.int64]
     row_of: Mapping[int, int]
@@ -2153,11 +2158,13 @@ def assemble_window_deck(
       ``HOT_MIN_SCORE`` points; 🏆 Top with at least ``TOP_MIN_SCORE``
       points; 💬 Talk with at least ``TALK_MIN_COMMENTS`` comments and at
       least as many comments as points. Cards may have no Popular badge.
-    - Explore, only with *explore*: Unsure (highest entropy), Novel
-      (farthest from every vote) and Interest (the best story of each of
-      the user's interests, least covered by the served Recommended first;
-      ``interest_picks``), picked in that order, each excluding earlier
-      picks and the window's Recommended stories.
+    - Explore, only with *explore*: Unsure (highest entropy), Discover (the
+      window's highest-scored stories with max cosine similarity to the
+      user's up-votes below ``DISCOVER_MAX_SIM_UP``, no backfill) and
+      Interest (the best story of each of the user's interests, least covered
+      by the served Recommended first; ``interest_picks``), picked in that
+      order, each excluding earlier picks and the window's Recommended
+      stories.
       *is_feedback_match* marks stories that duplicate a voted one;
       Explore skips them and backfills from the rest (``canonicalize_hn_
       dupes`` would drop them downstream anyway; see WORKLOG 2026-07-10).
@@ -2199,13 +2206,15 @@ def assemble_window_deck(
                 out.append(r)
         return out
 
-    # Explore passes: sort key, badge, and whether the pass needs model
-    # probabilities (Unsure does: no trained SVM, no Unsure).
+    # Explore passes: sort key, badge, whether the pass needs model
+    # probabilities (Unsure does: no trained SVM, no Unsure), and an
+    # optional eligibility filter (Discover does: far from up-votes only).
     explore_passes: list[
         tuple[
             Callable[[RankedStory], float],
             Callable[[RankedStory], RankedStory],
             bool,
+            Callable[[RankedStory], bool] | None,
         ]
     ] = []
     if explore is not None:
@@ -2216,11 +2225,16 @@ def assemble_window_deck(
                 lambda r: entropy[r.story.id],
                 lambda r: replace(r, is_uncertain=True),
                 True,
+                None,
             ),
             (
-                lambda r: float(1.0 - ctx.cand_max_sim[ctx.row_of[r.story.id]]),
-                lambda r: replace(r, is_novel=True),
+                lambda r: r.score,
+                lambda r: replace(r, is_discover=True),
                 False,
+                lambda r: (
+                    float(ctx.cand_closest_up[ctx.row_of[r.story.id]])
+                    < DISCOVER_MAX_SIM_UP
+                ),
             ),
         ]
 
@@ -2287,12 +2301,13 @@ def assemble_window_deck(
         )[: VIEW_SIZE * margin]
         picked = {r.story.id for r in recommended}
         explore_view: list[RankedStory] = []
-        for key, mark, needs_probs in explore_passes:
+        for key, mark, needs_probs, keep in explore_passes:
             eligible = [
                 r
                 for r in pool
                 if r.story.id not in picked
                 and (not needs_probs or r.prob_down is not None)
+                and (keep is None or keep(r))
             ]
             eligible.sort(key=key, reverse=True)
             for r in take_unmatched(eligible, EXPLORE_PER_BADGE * margin):
@@ -2351,7 +2366,7 @@ def serve_window(views: WindowViews, window: Window, now: float) -> WindowViews:
         return [r for r in items if in_window(r.story.time, window, now)]
 
     explore: list[RankedStory] = []
-    for badge in ("is_uncertain", "is_novel", "is_interest"):
+    for badge in ("is_uncertain", "is_discover", "is_interest"):
         explore.extend(
             [r for r in current(views.explore) if getattr(r, badge)][:EXPLORE_PER_BADGE]
         )
@@ -2472,7 +2487,7 @@ def rerank_candidates(
 # Minimum closest-up similarity for showing an attribution. A bogus
 # "because you upvoted X" on a weak match is worse than none.
 ATTRIBUTION_MIN_SIM = 0.35
-# Badged cards (Hot/Top/Talk/Unsure/Novel) are in the deck for popularity
+# Badged cards (Hot/Top/Talk/Unsure/Discover) are in the deck for popularity
 # or exploration, not for resembling an upvote, and full-text similarity to
 # the nearest upvote is 0.6-0.8 for most loosely related stories (median
 # 0.77 on profile 151's 1w deck, 2026-09-30). They name one only on a close
@@ -2528,7 +2543,7 @@ def card_attribution(r: RankedStory) -> str:
         or r.is_high_engagement
         or r.is_discussion_rich
         or r.is_uncertain
-        or r.is_novel
+        or r.is_discover
     )
     if badged and r.best_match_sim < BADGED_ATTRIBUTION_MIN_SIM:
         return ""
@@ -2657,8 +2672,6 @@ def assemble_ranked_deck(
         # otherwise compute them (chunked) on demand.
         if score_context.cand_closest_up is not None:
             cand_closest_up = score_context.cand_closest_up
-            cand_closest_down = score_context.cand_closest_down
-            cand_closest_neutral = score_context.cand_closest_neutral
         else:
             feedback_stories, feedback_labels, _ = db.get_feedback_for_training(
                 user_id=user_id
@@ -2669,8 +2682,6 @@ def assemble_ranked_deck(
             feedback_stories = [effective_codex_story(s) for s in feedback_stories]
             fb_labels_arr = np.array(feedback_labels)
             up_mask = fb_labels_arr == 2
-            down_mask = fb_labels_arr == 0
-            neutral_mask = fb_labels_arr == 1
             fb_embs = get_or_compute_embeddings(feedback_stories, embedder, db)
             score_context.fb_up_embeddings = fb_embs[up_mask]
             cand_closest_up = (
@@ -2678,21 +2689,6 @@ def assemble_ranked_deck(
                 if up_mask.any()
                 else np.zeros(len(candidates), dtype=np.float32)
             )
-            cand_closest_down = (
-                _chunked_max_dot(cand_embeddings, fb_embs[down_mask])
-                if down_mask.any()
-                else np.zeros(len(candidates), dtype=np.float32)
-            )
-            cand_closest_neutral = (
-                _chunked_max_dot(cand_embeddings, fb_embs[neutral_mask])
-                if neutral_mask.any()
-                else np.zeros(len(candidates), dtype=np.float32)
-            )
-
-        assert cand_closest_down is not None and cand_closest_neutral is not None
-        cand_max_sim = np.maximum.reduce(
-            [cand_closest_up, cand_closest_down, cand_closest_neutral]
-        )
 
     with trace.stage("interest_clusters"):
         up_embs = score_context.fb_up_embeddings
@@ -2714,7 +2710,7 @@ def assemble_ranked_deck(
             config=config,
             now=time.time(),
             explore=ExploreContext(
-                cand_max_sim=cand_max_sim,
+                cand_closest_up=cand_closest_up,
                 cand_interest=cand_interest.astype(np.int64),
                 interest_sizes=interest_sizes.astype(np.int64),
                 row_of={s.id: idx for idx, s in enumerate(candidates)},

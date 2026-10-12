@@ -83,7 +83,7 @@ def test_feed_parity_authentication_stale_cache_and_eviction(tmp_path: Path) -> 
             score=float(4 - i),
             best_match_title="",
             is_hot=i == 1,
-            is_novel=i == 2,
+            is_discover=i == 2,
         )
         for i in (1, 2, 3)
     ]

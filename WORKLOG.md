@@ -1,5 +1,23 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — Discover replaces Novel in Explore
+
+Novel (farthest from every vote) got 1 up-vote in 58; Phase 0 (FINDINGS
+"Discover Phase 0") measured R1 best-production-score-among-far at 11.8% up
+against 4.5% for random far. `pipeline/ranking.py`: new `DISCOVER_MAX_SIM_UP
+= 0.60`, `RankedStory.is_novel` → `is_discover`, `ExploreContext.cand_max_sim`
+→ `cand_closest_up` (up-votes only, zeros when none), Discover pass takes the
+window's highest-scored far stories below the threshold (strict, no backfill;
+Unsure, Discover, Interest order kept). `pipeline/render.py`, web
+`templates/index.html` (`.badge--discover`), TUI legend, `scripts/cap_sweep.py`,
+`scripts/cap_loss_check.py`, `scripts/preview_explore.py` renamed to discover;
+`ARCHITECTURE.md` updated (pre-2026-10-12 impressions carry `novel`). Tests
+rewritten for the Discover rule plus new property/boundary/render/zero-upvote
+coverage. Checks on the VPS: backend 1,349 passed / 1 skipped, TUI 219
+passed / 1 skipped, ruff, format and ty clean. Built by Muse (OpenCode) from
+a brief; the property test's pools were widened afterwards so Discover
+actually fills. Needs a service restart to go live.
+
 ## 2026-10-12 — Log production scores for every cached deck
 
 Added optional raw SVM margins and typed per-window pool quantiles/ranks,

@@ -155,7 +155,7 @@ BADGE_LEGEND: tuple[tuple[str, str], ...] = (
     ("🏆", "Top"),
     ("💬", "Talk"),
     ("🤔", "Unsure"),
-    ("✨", "Novel"),
+    ("✨", "Discover"),
     ("🎯", "Interest"),
 )
 
@@ -171,13 +171,13 @@ def _build_badges(item: RankedStory, *, hot_badge_percentile: float) -> list[Fee
                 tooltip="Model is highly uncertain about this story (high entropy distribution)",
             )
         )
-    if item.is_novel:
+    if item.is_discover:
         badges.append(
             FeedBadge(
-                kind="novel",
+                kind="discover",
                 icon="✨",
-                label="Novel",
-                tooltip="Semantically distant from anything you've voted on",
+                label="Discover",
+                tooltip="New to you: unlike your up-votes, but the model's best guess you'll like it",
             )
         )
     if item.is_discussion_rich:
@@ -259,7 +259,7 @@ def _feed_story(
                         item.is_high_engagement,
                         item.is_discussion_rich,
                         item.is_uncertain,
-                        item.is_novel,
+                        item.is_discover,
                     )
                 )
                 else 0.0

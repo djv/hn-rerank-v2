@@ -418,13 +418,16 @@ the fully scored pool at one `now` for all five windows:
   A card may have all three badges or none. Popular membership and order
   still depend only on HN gravity, not the badges.
 * **Explore** (personalized decks only; the cold deck has none): Unsure
-  (highest entropy; needs SVM probabilities), Novel (`1 - max_sim`, farthest
-  from every vote) and 🎯 Interest, picked in that order, each
-  excluding earlier picks and the window's Recommended picks (spares
-  included, since they refill Recommended), skipping (and
-  backfilling past) stories that duplicate a voted one (`is_feedback_match`,
-  WORKLOG 2026-07-10). Served 3 each (`EXPLORE_PER_BADGE`), in model-score
-  order. Interest (replaced 🎯 Similar, 2026-09-30): `interest_centers`
+  (highest entropy; needs SVM probabilities), Discover (since 2026-10-12,
+  replaces Novel: the window's highest-scored stories with max cosine
+  similarity to the user's up-votes below `DISCOVER_MAX_SIM_UP` (0.60), no
+  backfill; Phase 0 basis in FINDINGS "Discover Phase 0") and 🎯 Interest,
+  picked in that order, each excluding earlier picks and the window's
+  Recommended picks (spares included, since they refill Recommended),
+  skipping (and backfilling past) stories that duplicate a voted one
+  (`is_feedback_match`, WORKLOG 2026-07-10). Served 3 each
+  (`EXPLORE_PER_BADGE`), in model-score order. Impressions before 2026-10-12
+  carry the old kind `novel`. Interest (replaced 🎯 Similar, 2026-09-30): `interest_centers`
   clusters the user's upvote embeddings (KMeans, `interest_cluster_k=10`,
   cached per user and warm-started from the last centers when upvotes
   change); each candidate belongs to its nearest center. `interest_picks`
@@ -451,14 +454,14 @@ window is served short, never widened. A card's badges are OR'd across the
 views of its window only (`WindowViews.stories`); the view orders are
 authoritative, nothing is derived from badge flags.
 
-**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Top and Talk use the fixed 100-point and 50-comment floors above (user-selected 2026-10-02). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Novel and Interest.
+**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Top and Talk use the fixed 100-point and 50-comment floors above (user-selected 2026-10-02). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Discover and Interest.
 
 **Attribution (F2, `9a83ffd`).** Cards carry a "Because you upvoted …" line
 populated from the already-computed KNN argmax (`cand_closest_up_idx` → the
 nearest upvoted feedback title, no new matmul), shown only when the max
 similarity clears `ATTRIBUTION_MIN_SIM=0.35`. A weak-match attribution is
 worse than none, so cold users and sub-threshold cards show nothing. Cards
-with a Hot/Top/Talk/Unsure/Novel badge from any view of their window need
+with a Hot/Top/Talk/Unsure/Discover badge from any view of their window need
 `BADGED_ATTRIBUTION_MIN_SIM=0.85` (`card_attribution`, applied when the feed
 is built): they are there for popularity or exploration, and full-text
 similarity to the nearest upvote is 0.6-0.8 for most loosely related pairs

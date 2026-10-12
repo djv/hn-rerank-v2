@@ -119,7 +119,7 @@ def _pools(draw: st.DrawFn) -> tuple[list[RankedStory], ExploreContext | None]:
     rng = np.random.default_rng(draw(st.integers(0, 2**32 - 1)))
     n_interests = int(rng.integers(0, 6))
     return pool, ExploreContext(
-        cand_max_sim=rng.random(len(pool), dtype=np.float32),
+        cand_closest_up=rng.random(len(pool), dtype=np.float32),
         cand_interest=rng.integers(0, max(n_interests, 1), len(pool)),
         interest_sizes=rng.integers(1, 50, n_interests),
         row_of={r.story.id: i for i, r in enumerate(pool)},
@@ -127,7 +127,7 @@ def _pools(draw: st.DrawFn) -> tuple[list[RankedStory], ExploreContext | None]:
 
 
 _POPULAR_ICONS = {"\U0001f525", "\U0001f3c6", "\U0001f4ac"}  # 🔥 🏆 💬
-_EXPLORE_KINDS = ("uncertain", "novel", "interest")
+_EXPLORE_KINDS = ("uncertain", "discover", "interest")
 
 
 @settings(max_examples=80, deadline=None)

@@ -416,7 +416,7 @@
       border: 1px solid hsl(280, 50%, 35%);
     }
 
-    .badge--novel {
+    .badge--discover {
       background: hsl(170, 50%, 25%);
       color: hsl(170, 80%, 90%);
       border: 1px solid hsl(170, 50%, 35%);
@@ -1394,7 +1394,7 @@
       paragraph({
         recommended: "Recommended orders stories by the model's learned preferences from your votes.",
         popular: 'Popular orders eligible HN stories by points and age; older stories lose weight.',
-        explore: 'Explore offers discovery picks, including unfamiliar stories and interests Recommended misses. Its order is shuffled.',
+        explore: 'Explore offers discovery picks: stories unlike your up-votes that the model still rates highly, stories it is unsure about, and interests Recommended misses. Its order is shuffled.',
       }[currentSort]);
       if (currentSort !== 'popular' && story.ranking_factors?.length) {
         paragraph('What helped or hurt:');

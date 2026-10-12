@@ -72,8 +72,8 @@ def main() -> None:
             badge = (
                 "unsure"
                 if r.is_uncertain
-                else "novel"
-                if r.is_novel
+                else "discover"
+                if r.is_discover
                 else "interest"
                 if r.is_interest
                 else "?"

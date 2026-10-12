@@ -3401,7 +3401,7 @@ async def test_prefetch_tldrs_for_ranked_walks_the_default_window_views(
             "1w": WindowViews(
                 recommended=(top, second),
                 popular=(popular_top, top),
-                explore=(replace(top, is_novel=True),),
+                explore=(replace(top, is_discover=True),),
             ),
             "1d": WindowViews(recommended=(other,)),
         }
@@ -7581,7 +7581,8 @@ def test_warm_deck_scores_logging(
     deck = WindowDeck(
         {
             w: replace(
-                v, explore=tuple(replace(r, is_novel=True) for r in v.recommended[-3:])
+                v,
+                explore=tuple(replace(r, is_discover=True) for r in v.recommended[-3:]),
             )
             for w, v in deck.windows.items()
         }
