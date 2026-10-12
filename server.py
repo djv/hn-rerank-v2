@@ -45,7 +45,10 @@ from clients.tui.src.hn_rerank.models import (
     Window,
 )
 from database import (
+    CardScore,
     Database,
+    DeckScores,
+    WindowScores,
     InteractionEvent,
     InteractionEventType,
     InterleaveDeck,
@@ -2132,6 +2135,7 @@ class Handler:
         # Stored before the deck can be served, so every impression of an
         # interleaved version has its arms on record.
         cls._record_interleave(user.id, requested_version, deck)
+        cls._record_deck_scores(user.id, requested_version, deck)
         with cls._dashboard_versions_guard:
             cls._decks[user.id] = DeckState(deck, time.time(), requested_version)
             cls._evict_old_decks_locked()
@@ -2195,6 +2199,75 @@ class Handler:
                 daemon=True,
             )
             t.start()
+
+    @classmethod
+    def _record_deck_scores(cls, user_id: int, version: int, deck: WindowDeck) -> None:
+        try:
+            if not any(
+                r.prob_up is not None
+                for views in deck.windows.values()
+                for view in VIEWS
+                for r in views.view(view)
+            ):
+                return
+            windows: dict[str, WindowScores] = {}
+            for window, views in deck.windows.items():
+                try:
+                    pool = views.pool
+                    if pool is None:
+                        raise ValueError(
+                            f"scored window {window} has no pool statistics"
+                        )
+                    cards_list: list[CardScore] = []
+                    for view in VIEWS:
+                        for position, r in enumerate(views.view(view)):
+                            if r.pool_rank is not None:
+                                window_rank = r.pool_rank.window_rank
+                                global_rank = r.pool_rank.global_rank
+                            else:
+                                rank = pool.ranks.get(r.story.id)
+                                window_rank = (
+                                    rank.window_rank if rank is not None else None
+                                )
+                                global_rank = (
+                                    rank.global_rank if rank is not None else None
+                                )
+                            cards_list.append(
+                                CardScore(
+                                    r.story.id,
+                                    view,
+                                    position,
+                                    r.score,
+                                    r.svm_margin,
+                                    r.prob_up,
+                                    r.prob_neutral,
+                                    r.prob_down,
+                                    window_rank,
+                                    global_rank,
+                                )
+                            )
+                    windows[window] = WindowScores(
+                        pool.pool_size,
+                        pool.candidates_total,
+                        pool.quantiles,
+                        tuple(cards_list),
+                    )
+                except Exception:
+                    logging.warning(
+                        "deck scores window skipped user_id=%s version=%s window=%s",
+                        user_id,
+                        version,
+                        window,
+                        exc_info=True,
+                    )
+                    continue
+            if not windows:
+                return
+            cls.db.insert_deck_scores(
+                DeckScores(user_id, version, time.time(), windows)
+            )
+        except Exception:
+            logging.exception("deck scores persist failed user_id=%s", user_id)
 
     @classmethod
     def _record_interleave(cls, user_id: int, version: int, deck: WindowDeck) -> None:

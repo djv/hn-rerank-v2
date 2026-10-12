@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import threading
 import time
@@ -14,6 +16,7 @@ from typing import Any, cast
 from server import DeckState, Handler, SKELETON_HTML, create_app
 from pipeline import Config, Embedder, RankedStory, WindowDeck, WindowViews
 from pipeline.ranking import VIEW_SIZE
+from clients.tui.src.hn_rerank.models import Window
 from database import Database, Story, User
 from warm_scheduler import WarmScheduler
 
@@ -7548,3 +7551,89 @@ def test_tldr_detail_codex_legacy_row_summarizes_clean_inputs(
     stored = db.get_story(9102)
     assert stored is not None
     assert stored.article_body == "REPLY TEXT FROM NON-OPENING POSTS"
+
+
+@pytest.mark.parametrize("trained,fail", [(True, False), (True, True), (False, False)])
+def test_warm_deck_scores_logging(
+    test_env: tuple[int, Database, threading.Event, type[Handler], User],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    trained: bool,
+    fail: bool,
+) -> None:
+    import pipeline
+    from pipeline.ranking import assemble_window_deck
+    from database import DeckScores
+
+    port, db, _, TestHandler, user = test_env
+    cards = [
+        RankedStory(
+            Story(i, f"card {i}", None, 100, int(time.time()), ""),
+            i / 10,
+            "",
+            prob_up=0.6 if trained else None,
+            prob_down=0.2 if trained else None,
+            svm_margin=i / 2 if trained else None,
+        )
+        for i in range(1, 12)
+    ]
+    deck = assemble_window_deck(cards, config=Config(), now=time.time())
+    deck = WindowDeck(
+        {
+            w: replace(
+                v, explore=tuple(replace(r, is_novel=True) for r in v.recommended[-3:])
+            )
+            for w, v in deck.windows.items()
+        }
+    )
+    if trained:
+        db.upsert_story(Story(999, "previous vote", None, 1, 1, ""))
+        db.upsert_feedback(user.id, 999, "up")
+    else:
+        TestHandler._cold_deck = deck
+    monkeypatch.setattr(pipeline, "fast_rerank_for_user", lambda *args, **kwargs: deck)
+    monkeypatch.setattr(TestHandler, "_trigger_warm", classmethod(lambda *args: None))
+
+    def broken_insert(scores: DeckScores) -> None:
+        raise RuntimeError("score persistence unavailable")
+
+    if fail:
+        monkeypatch.setattr(db, "insert_deck_scores", broken_insert)
+    TestHandler._decks = {}
+    versions = []
+    for _ in range(2):
+        version = TestHandler._bump_user_version(user.id)
+        TestHandler._run_warm_attempt(user, version)
+        versions.append(version)
+        assert TestHandler._decks[user.id].deck == deck
+    response = local_http.get(
+        f"http://127.0.0.1:{port}/api/feed", cookies={"hn_token": user.token}
+    )
+    assert response.status_code == 200
+    feed_orders = response.json()["orders"]
+    for view in ("recommended", "popular", "explore"):
+        assert feed_orders[view] == [
+            r.story.id for r in deck.windows[cast(Window, "1w")].view(view)
+        ]
+    records = db.get_deck_scores(user.id)
+    if trained and not fail:
+        assert [r.version for r in records] == versions
+        for record in records:
+            assert set(record.windows) == set(deck.windows)
+            for window, scores in record.windows.items():
+                assert [
+                    (c.view, c.position, c.story_id, c.score, c.svm_margin)
+                    for c in scores.cards
+                ] == [
+                    (view, position, r.story.id, r.score, r.svm_margin)
+                    for view in ("recommended", "popular", "explore")
+                    for position, r in enumerate(
+                        deck.windows[cast(Window, window)].view(view)
+                    )
+                ]
+    else:
+        assert records == []
+    if fail:
+        assert "deck scores persist failed" in caplog.text
+        assert "RuntimeError: score persistence unavailable" in caplog.text
+        assert any(record.exc_info for record in caplog.records)

@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from collections.abc import Sequence
-from typing import Any, Literal, Generator, NamedTuple, TypeAlias
+from typing import Any, Literal, Generator, NamedTuple, TypeAlias, TYPE_CHECKING, cast
 from contextlib import contextmanager
 import queue
 import numpy as np
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from clients.tui.src.hn_rerank.models import View
 
 
 Action: TypeAlias = Literal["up", "neutral", "down"]
@@ -120,6 +124,46 @@ class User:
 
 
 @dataclass(frozen=True)
+class ScoreQuantiles:
+    p50: float
+    p75: float
+    p90: float
+    p95: float
+    p99: float
+    max: float
+
+
+@dataclass(frozen=True)
+class CardScore:
+    story_id: int
+    view: View
+    position: int
+    score: float
+    svm_margin: float | None
+    prob_up: float | None
+    prob_neutral: float | None
+    prob_down: float | None
+    window_rank: int | None
+    global_rank: int | None
+
+
+@dataclass(frozen=True)
+class WindowScores:
+    pool_size: int
+    candidates_total: int
+    quantiles: dict[str, ScoreQuantiles]
+    cards: tuple[CardScore, ...]
+
+
+@dataclass(frozen=True)
+class DeckScores:
+    user_id: int
+    version: int
+    created_at: float
+    windows: dict[str, WindowScores]
+
+
+@dataclass(frozen=True)
 class InterleaveDeck:
     """An interleaved deck as built: per window, its Recommended story IDs
     in order, each with the arm that drafted it; ``arms`` lists every arm,
@@ -199,6 +243,20 @@ class RedditFeedState:
     next_retry_at: float
     last_error: str
     item_count: int
+
+
+_DECK_SCORE_VIEWS = ("recommended", "popular", "explore")
+
+
+def _sanitize_deck_scores_json(value: object) -> object:
+    """Replace non-finite floats with null so `json.dumps(allow_nan=False)` holds."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _sanitize_deck_scores_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_deck_scores_json(v) for v in value]
+    return value
 
 
 class Database:
@@ -433,6 +491,16 @@ class Database:
                         version       INTEGER NOT NULL,
                         created_at    REAL NOT NULL,
                         arms_json     TEXT NOT NULL,
+                        windows_json  TEXT NOT NULL,
+                        PRIMARY KEY (user_id, version)
+                    ) STRICT
+                """)
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS deck_scores (
+                        user_id       INTEGER NOT NULL,
+                        version       INTEGER NOT NULL,
+                        created_at    REAL NOT NULL,
                         windows_json  TEXT NOT NULL,
                         PRIMARY KEY (user_id, version)
                     ) STRICT
@@ -1574,6 +1642,138 @@ class Database:
                         json.dumps(sample.fields),
                     ),
                 )
+
+    def insert_deck_scores(self, deck: DeckScores) -> None:
+        """Persist one warm's production values in a single small write."""
+        payload = _sanitize_deck_scores_json(
+            {w: asdict(v) for w, v in deck.windows.items()}
+        )
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO deck_scores "
+                    "(user_id, version, created_at, windows_json) VALUES (?, ?, ?, ?)",
+                    (
+                        deck.user_id,
+                        deck.version,
+                        deck.created_at,
+                        json.dumps(payload, allow_nan=False),
+                    ),
+                )
+
+    def get_deck_scores(self, user_id: int, since: float = 0.0) -> list[DeckScores]:
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT version, created_at, windows_json FROM deck_scores "
+                "WHERE user_id = ? AND created_at >= ? ORDER BY version",
+                (user_id, since),
+            ).fetchall()
+        out: list[DeckScores] = []
+        for version, created_at, windows_json in rows:
+            try:
+                version_int = int(version)
+                if isinstance(version, bool):
+                    raise ValueError("version must be an int")
+                created_float = float(created_at)
+                if isinstance(created_at, bool):
+                    raise ValueError("created_at must be a float")
+                raw_windows = json.loads(windows_json)
+                if not isinstance(raw_windows, dict):
+                    raise ValueError("windows_json must be an object")
+
+                def _req_int(value: object, field: str) -> int:
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        raise ValueError(f"{field} must be an int")
+                    return int(value)
+
+                def _req_float(value: object, field: str) -> float:
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise ValueError(f"{field} must be a float")
+                    result = float(value)
+                    if not math.isfinite(result):
+                        raise ValueError(f"{field} must be finite")
+                    return result
+
+                def _opt_float(value: object, field: str) -> float | None:
+                    if value is None:
+                        return None
+                    return _req_float(value, field)
+
+                def _opt_int(value: object, field: str) -> int | None:
+                    if value is None:
+                        return None
+                    return _req_int(value, field)
+
+                windows: dict[str, WindowScores] = {}
+                for w, v in raw_windows.items():
+                    if not isinstance(w, str):
+                        raise ValueError("window name must be a string")
+                    if not isinstance(v, dict):
+                        raise ValueError(f"window {w!r} must be an object")
+                    raw_quantiles = v["quantiles"]
+                    if not isinstance(raw_quantiles, dict):
+                        raise ValueError(f"window {w!r} quantiles must be an object")
+                    quantiles: dict[str, ScoreQuantiles] = {}
+                    for k, q in raw_quantiles.items():
+                        if not isinstance(k, str) or not isinstance(q, dict):
+                            raise ValueError(
+                                f"window {w!r} quantile {k!r} must be an object"
+                            )
+                        quantiles[str(k)] = ScoreQuantiles(
+                            p50=_req_float(q["p50"], "p50"),
+                            p75=_req_float(q["p75"], "p75"),
+                            p90=_req_float(q["p90"], "p90"),
+                            p95=_req_float(q["p95"], "p95"),
+                            p99=_req_float(q["p99"], "p99"),
+                            max=_req_float(q["max"], "max"),
+                        )
+                    raw_cards = v["cards"]
+                    if not isinstance(raw_cards, (list, tuple)):
+                        raise ValueError(f"window {w!r} cards must be a list")
+                    cards: list[CardScore] = []
+                    for c in raw_cards:
+                        if not isinstance(c, dict):
+                            raise ValueError(f"window {w!r} card must be an object")
+                        view = str(c["view"])
+                        if view not in _DECK_SCORE_VIEWS:
+                            raise ValueError(f"unknown view {view!r}")
+                        cards.append(
+                            CardScore(
+                                story_id=_req_int(c["story_id"], "story_id"),
+                                view=cast("View", view),
+                                position=_req_int(c["position"], "position"),
+                                score=_req_float(c["score"], "score"),
+                                svm_margin=_opt_float(c["svm_margin"], "svm_margin"),
+                                prob_up=_opt_float(c["prob_up"], "prob_up"),
+                                prob_neutral=_opt_float(
+                                    c["prob_neutral"], "prob_neutral"
+                                ),
+                                prob_down=_opt_float(c["prob_down"], "prob_down"),
+                                window_rank=_opt_int(c["window_rank"], "window_rank"),
+                                global_rank=_opt_int(c["global_rank"], "global_rank"),
+                            )
+                        )
+                    windows[str(w)] = WindowScores(
+                        pool_size=_req_int(v["pool_size"], "pool_size"),
+                        candidates_total=_req_int(
+                            v["candidates_total"], "candidates_total"
+                        ),
+                        quantiles=quantiles,
+                        cards=tuple(cards),
+                    )
+                out.append(
+                    DeckScores(
+                        user_id,
+                        version_int,
+                        created_float,
+                        windows,
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"malformed deck_scores row user_id={user_id} version={version}: {exc}"
+                ) from exc
+        return out
 
     def insert_interleave_deck(self, deck: InterleaveDeck) -> None:
         with self.conn() as conn:
