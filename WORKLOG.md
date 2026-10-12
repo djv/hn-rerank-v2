@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — Import AI Recommended live gate
+
+User requested a fresh unseen/unvoted Import AI issue as an integration
+gate. Added a read-only publisher-RSS/history/served-feed check with distinct
+PASS/FAIL/NOT_APPLICABLE exits and first8 visible-card checks in age-eligible
+windows. Added real Flask-feed integration tests and CLI boot registration;
+documented the standing gate in AGENTS.md and shared tool access. No ranking
+rule, model, timer, production checkout or service changed. Current issue476
+is already voted and correctly reports NOT_APPLICABLE. Real user reading
+also confirmed dwell delivery; browser-open delivery remains unverified.
+Validation and review bounds are in FINDINGS "Import AI visible Recommended gate".
+
 ## 2026-10-12 — Standalone TUI lint gate repaired
 
 The project's continuing CI check found Terminal client run38275441048

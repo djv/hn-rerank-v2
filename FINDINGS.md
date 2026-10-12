@@ -1,5 +1,54 @@
 # HN Rerank findings
 
+## Import AI visible Recommended gate — 2026-10-12
+
+Source: user live reading feedback: "Import AI is always good" and request
+to keep a new unseen/unvoted issue appearing in Recommended as an integration
+gate. Publisher editions474/475/476 are dated September28, October5, October12:
+https://jack-clark.net/ (recent weekly cadence, not a hardcoded Monday timer).
+
+Added scripts/check_import_ai_recommended.py plus integration coverage and
+CLI boot registration. The live gate finds the newest dated numbered issue
+from the actual publisher RSS. It uses the existing RSS urllib fallback
+(bare httpx reproduced403), but fetch errors fail rather than becoming skips.
+Fresh means at most seven days old. Existing profile history excludes any
+vote (including neutral) or recorded view/open/dwell; matching-URL HN
+crossposts count too. Missing ingestion fails. Applicable issues must appear
+within the first8 Recommended IDs in every age-eligible window and the feeds
+must be ready. First8 is the actual visible client limit; API's12 includes
+four reserves, so slot9 is explicitly a failing integration case.
+
+The DB opens read_only=True, profile cookies stay on a loopback origin, and
+API redirects/environment proxies are disabled. No POSTs, profile creation,
+score boosts, model fits, history clearing or forced summary generation.
+Exit0 PASS,1 FAIL/error,3 NOT_APPLICABLE; skips never count as a pass.
+This is a manual live ranking/deployment gate documented in AGENTS.md, not
+a new timer or an automatic source-pinning rule. Shared tool access row
+added in system-setup commit a485380 (documentation only).
+
+Integration tests exercise the real Flask /api/feed with a disposable DB:
+visible slot8 vs hidden slot9, stale deck, no event writes, other-profile
+feedback isolation, seen/voted/old issue skips, missing ingestion, RSS date
+selection, invalid origin rejection before network/DB creation, and transport
+failure not being treated as not-applicable. Before the final explicit
+proxy/redirect constructor settings, isolated VPS full gate1389 passed/
+1 skipped (23.45s), focused+CLI64 passed, Ruff/type/three-file format clean.
+Final source recheck after explicit proxy/redirect settings:1389 passed/
+1 skipped (23.04s), Ruff/type/three-file format clean; three source hashes
+match the checked VPS files. Independent-review offer follows; no result
+review has been authorized yet.
+
+Live run on production DB from isolated gate checkout returned exit3,
+NOT_APPLICABLE: "User has voted on this issue", Import AI476, published
+1791808239. This verifies real fetching/history applicability, not an unseen
+live ranking pass; no history reset was attempted to manufacture one.
+
+Reading-signal watch: expected hn process confirmed on laptop; profile151
+received8 real dwell segments totaling426.078s by the18:34 check. No article
+or comments open event yet. The owned SSH watch exited; remote process
+inspection found no remaining uv/python stdin watcher. Real user reading
+produced the events; gate tests only write disposable fixture databases.
+
 ## Reading-signal live verification pending — 2026-10-12 18:10 UTC
 
 The user selected Verify reading signal. Laptop process inspection found

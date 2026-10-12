@@ -38,6 +38,18 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Import AI Recommended integration gate implemented (user 2026-10-12):
+  `scripts/check_import_ai_recommended.py` checks real publisher RSS,
+  read-only feedback/seen history and existing-profile served feeds. Fresh
+  unseen/unvoted issues must be in the first eight visible Recommended cards
+  in age-eligible windows. PASS/FAIL/NOT_APPLICABLE are distinct exits;
+  no ranking boost, history edits, timer or service change. Live issue476
+  correctly NOT_APPLICABLE after the user's vote. Gate tests plus full
+  backend suite passed; final independent-review offer pending.
+- Real reading delivery observed 2026-10-12: profile151 has8 dwell events
+  totaling426.078s, with normal impressions. The hn reader is running from
+  the expected venv. Article/comments opens still unverified; no synthetic
+  telemetry or browser operation by the agent. Owned read-only watch ended.
 - Reading-signal prerequisite check 2026-10-12 18:10 UTC: no local reader
   process; `hn` points to the client venv and imports this checkout's
   app.py/dwell.py with telemetry hooks present. Profile 151 still has
@@ -362,7 +374,7 @@ ranking research remains paused and production trial configuration unchanged.
   card combined). Phase 0b (Combo, Far 1) runs 2026-11-05
   (`fu-20261012-104919-066`).
 - Reading signal: after the user restarts `hn`, confirm `article_open`,
-  `comments_open` and `dwell` rows arrive for profile 151; after about two
+  `comments_open` rows arrive for profile 151 (dwell is now verified); after about two
   weeks, check how opens and dwell relate to votes before using them.
 - Discover: read the result about 2026-11-02 (PLAN.md Phase 2: Discover
   up-rate, novel up-votes per week, Explore down-rate), next to the trial
