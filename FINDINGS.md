@@ -15,7 +15,15 @@ Standalone gates: dwell tests30 passed; full TUI251 passed/1 skipped
 installed wheel hn-rerank --version returned 0.1.0 outside the source tree.
 Full isolated backend gate1376 passed/1 skipped (23.96s), repository
 Ruff/ty/changed-file formatting clean. Same unrelated MLP warning as before.
-GitHub CI confirmation will follow the pre-authorized push to djv/hn-rerank-v2.
+Pushed source commit16f4cb3 to djv/hn-rerank-v2. Hosted confirmation:
+- Backend/browser CI38279791725 passed (1m47s):
+  https://github.com/djv/hn-rerank-v2/actions/runs/38279791725
+- Terminal client Ubuntu38279791694 passed (3m19s), including standalone
+  tests/lint/types/build and installed-wheel headless startup:
+  https://github.com/djv/hn-rerank-v2/actions/runs/38279791694
+- No Terminal client schedule run was returned by gh run list --event schedule;
+  macOS still unverified. No manual dispatch or extra reviewer requested.
+Both owned CI watchers exited successfully; production stayed on b1897f4.
 
 ## Live trial safety check — 2026-10-12 16:43 UTC
 

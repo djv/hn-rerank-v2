@@ -8,7 +8,9 @@ workspace, then applied Ruff's two min/max duration clamp substitutions
 in dwell.py (equivalent bounds). Focused dwell30, TUI251/1 skipped,
 backend1376/1 skipped passed; both environments' lint/types, touched-file
 format, standalone build and installed-wheel version check passed.
-No production/reader restart. GitHub workflow confirmation pending push.
+No production/reader restart. Pushed16f4cb3: backend/browser CI38279791725
+and Terminal client Ubuntu38279791694 both passed, including installed-wheel
+headless startup. macOS remains unverified. CI links saved in FINDINGS.md.
 
 ## 2026-10-12 — Warm-start test convergence regression
 

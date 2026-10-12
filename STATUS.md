@@ -42,7 +42,9 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   now uses equivalent min/max expressions. Standalone VPS gate: 251 passed /
   1 skipped, lint/types/format/build and wheel --version clean. Backend gate
   1,376 passed / 1 skipped, lint/types/format clean. Runtime unchanged;
-  GitHub CI confirmation pending push.
+  Pushed 16f4cb3; GitHub backend/browser and Terminal client Ubuntu workflows
+  both green, including installed-wheel headless startup. macOS remains
+  unverified under the new triggers (no scheduled run found).
 - Read-only trial safety check 2026-10-12 16:43 UTC: 61 credited votes
   across 16 decks after excluding 29 calibration re-votes. Production
   7 up / 8 neutral / 8 down; #2 10/8/2; #4 8/3/7. Descriptive only;
