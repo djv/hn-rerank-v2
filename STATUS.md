@@ -38,6 +38,13 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Warm-start test fix completed 2026-10-12: the test uses tol=1e-6 and
+  explicitly replays seed 1155516390, retaining the 5e-3 probability bound.
+  This reduces the recorded seed's gap below the assertion bound; production
+  tolerance is unchanged. Isolated VPS gates: 1,376 passed / 1 skipped,
+  ruff, touched-file formatting and ty clean. The independent review and
+  1,000-seed verification are saved in
+  `docs/evaluations/live-feed-review-20261012/`. No runtime rollout needed.
 - Read-only live check 2026-10-12 16:32 UTC: all five profile-151 feed
   windows ready, 12 Recommended with Discover at slot 12 / trial arm `far`,
   and 3 cards per Explore badge. Dashboard/readiness 200; service running,
@@ -317,11 +324,8 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
-None for the far card. Pre-existing flaky test:
-`tests/test_joined_classifier.py::test_warm_start_reaches_the_same_model_in_fewer_iterations`
-fails for seed 1155516390 (warm vs cold probabilities differ by 0.0076,
-against atol 5e-3). Hypothesis replays the seed in the VPS gate worktree,
-so main fails it too. It is unrelated to the far card.
+None for the far card or warm-start test. The recorded seed's failure is
+fixed with tighter test-only convergence; full backend gates pass.
 The Muse-fallback deploy waits for the trial to end (no restart before
 2026-11-05 without the user's OK). No Codex rollout blocker remains. The TUI medium result review is complete
 and its introduced findings corrected.
@@ -339,11 +343,6 @@ ranking research remains paused and production trial configuration unchanged.
   positions from impressions; novel up-votes per week; Discover plus the far
   card combined). Phase 0b (Combo, Far 1) runs 2026-11-05
   (`fu-20261012-104919-066`).
-- Fix the flaky warm-start test (raise its tolerance or pin the bad seed
-  after checking why lbfgs stops further apart). Recorded seed reproduced;
-  tighter test-only solver tolerance removes the discrepancy. Unvalidated
-  Muse draft parked in `/home/d/code/hn-rerank-warm-test-20261012`
-  (`fix/warm-test-20261012`); not integrated after the user's scope choice.
 - Reading signal: after the user restarts `hn`, confirm `article_open`,
   `comments_open` and `dwell` rows arrive for profile 151; after about two
   weeks, check how opens and dwell relate to votes before using them.

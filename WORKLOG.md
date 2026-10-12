@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — Warm-start test convergence regression
+
+User selected Finish test fix after the independent live-feed/draft review.
+The recorded seed 1155516390 failed at default solver tol=1e-4: maximum
+held-out probability gap 0.0076234 exceeded the test's 0.005 bound. Solver
+stopping tolerance does not bound held-out prediction error. The test-only
+factory now uses tol=1e-6 and explicitly includes that seed; its probability
+bound and warm/cold iteration check remain. No runtime classifier settings
+changed. Corrected STATUS's overbroad "removes the discrepancy" wording.
+The reviewed Muse draft was integrated with a descriptive local variable
+and clearer comment. Independent review and 1,000-seed verification:
+docs/evaluations/live-feed-review-20261012/. Full isolated VPS backend gate
+1,376 passed / 1 skipped; focused warm-start test passed; ruff, touched-file
+formatting and ty clean. No deployment or server restart for a test-only fix.
+
 ## 2026-10-12 — TUI quit always exits
 
 User (2026-10-12): block other keys briefly while saving, but Q must always

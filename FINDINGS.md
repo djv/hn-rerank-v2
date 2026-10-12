@@ -1,5 +1,28 @@
 # HN Rerank findings
 
+## Warm-start test fix completed — 2026-10-12
+
+The user authorized finishing the draft after `rv` and `q`. The test-only
+factory uses tol=1e-6, with @example(seed=1155516390) and the existing
+5e-3 probability bound retained. The recorded seed's gap falls from
+0.0076234 to 0.0000142874; production classifier tolerance stays 1e-4.
+Independent review and verified findings are in
+docs/evaluations/live-feed-review-20261012/. The 1,000-seed synthetic sweep
+found no iteration-inequality violation and maximum probability gap
+0.0000899132; this is finite evidence, not a universal guarantee.
+
+Final source was checked in isolated VPS worktree
+/home/dev/hn-rewrite/hn-warm-gate-20261012, based on laptop 7e7752f:
+- Focused pytest tests/test_joined_classifier.py -k warm_start: 1 passed.
+- Full pytest tests/ -n 4: 1,376 passed / 1 skipped (29.73 s).
+- ruff check ., touched-file ruff format --check, ty check: clean.
+- One unrelated MLP max-iterations ConvergenceWarning; no test failure.
+- Post-gate service active; load 2.05/0.74/0.69, RAM available 4.8 GiB.
+
+Only the test and handoff documents changed. No production checkout update,
+restart, interaction event, vote or provider request. Historical parked-draft
+notes below describe the earlier scope choice and are superseded by this result.
+
 ## Read-only live-feed check — 2026-10-12 16:32 UTC
 
 The user selected Check live feed after `hn rerank rr` and `q`.
