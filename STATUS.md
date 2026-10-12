@@ -45,7 +45,10 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   in age-eligible windows. PASS/FAIL/NOT_APPLICABLE are distinct exits;
   no ranking boost, history edits, timer or service change. Live issue476
   correctly NOT_APPLICABLE after the user's vote. Gate tests plus full
-  backend suite passed; final independent-review offer pending.
+  backend suite passed. Approved Claude cloud review found a confirmed
+  medium false-PASS case for HN-first mixed timestamps and a low future-date
+  skip; correction plan saved in `docs/evaluations/import-ai-gate-review-20261012/`.
+  Do not rely on PASS until those are fixed; separate fix authorization pending.
 - Real reading delivery observed 2026-10-12: profile151 has8 dwell events
   totaling426.078s, with normal impressions. The hn reader is running from
   the expected venv. Article/comments opens still unverified; no synthetic
@@ -368,6 +371,9 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Import AI gate: fix the verified mixed-timestamp window omission and
+  future-date skip, plus profile/CLI/crosspost coverage in the saved plan,
+  after the user authorizes editing the reviewed files. No extra reviewer.
 - Far card: read about 2026-11-02 with Discover (PLAN.md "Far card":
   far-card up- and down-rate vs Recommended cards 9–11, using served
   positions from impressions; novel up-votes per week; Discover plus the far

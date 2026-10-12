@@ -35,8 +35,12 @@ proxy/redirect constructor settings, isolated VPS full gate1389 passed/
 1 skipped (23.45s), focused+CLI64 passed, Ruff/type/three-file format clean.
 Final source recheck after explicit proxy/redirect settings:1389 passed/
 1 skipped (23.04s), Ruff/type/three-file format clean; three source hashes
-match the checked VPS files. Independent-review offer follows; no result
-review has been authorized yet.
+match the checked VPS files. Approved Claude cloud review completed;
+M1's false PASS and L1's future-entry omission were reproduced against
+disposable fixtures. Report and concrete correction plan:
+docs/evaluations/import-ai-gate-review-20261012/. Reviewed code remains
+unchanged pending separate fix authorization; PASS is not yet reliable
+for mixed publisher/DB timestamps. No additional review was launched.
 
 Live run on production DB from isolated gate checkout returned exit3,
 NOT_APPLICABLE: "User has voted on this issue", Import AI476, published
