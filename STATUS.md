@@ -22,7 +22,7 @@ A new profile's first feed therefore matters too.
 Chosen next goals (user 2026-10-12): discovery (fewer same-y
 feeds: Explore first, since it is outside the trial; Recommended diversity
 after 2026-11-05), a reading signal (TUI opens and dwell) and a good
-first feed for new profiles. Serve-time score logging (`deck_scores`
+first feed for new profiles (parked by the user 2026-10-12, in `~/TASKS.md`). Serve-time score logging (`deck_scores`
 table, live since 2026-10-12) supports all three.
 
 ## Objective
