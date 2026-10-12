@@ -1,5 +1,38 @@
 # HN Rerank findings
 
+## Far card deploy — 2026-10-12
+
+The user lifted the Recommended freeze and chose Far 1 (Phase 0's near
+miss) live. Plan: `docs/evaluations/diversity-20261012/PLAN.md` "Far card".
+- The rule: Recommended keeps its first 11 cards. Card 12 is the
+  best-scored story with closest-up similarity < 0.60, taken from the
+  Recommended tail or Explore's Discover picks.
+  - It prefers stories that stay in the window until the next hourly
+    rebuild.
+  - It is skipped for profiles with no up-votes.
+  - It carries the Discover badge and arm `far`, and is removed from
+    Explore.
+- Review: Claude cloud session ([report](docs/evaluations/diversity-20261012/FAR-CARD-REVIEW.md)).
+  - Verdict: safe for the trial; votes on the far card are credited to no
+    arm.
+  - Medium M1: the chosen far card could age out before the next rebuild.
+    Fixed by the horizon preference.
+  - Medium M2: profiles without up-votes got card 12 relabelled Discover.
+    Fixed with `has_upvotes`.
+  - Lows also fixed: strict `arm` parsing in deck_scores; far votes now go
+    to `skipped["far_card"]` in the trial report; docstrings; help text.
+  - L3: serving 11 drafted cards cuts a draft round. The credit stays
+    unbiased in expectation, but per-deck arm counts can differ by one.
+- Gate on bf80ec8:
+  - Backend 1,375 passed. 1 failure in the joined-classifier warm-start
+    property test, which also fails on main: a replayed Hypothesis seed,
+    unrelated.
+  - TUI 251 passed; ruff and ty clean.
+- Live after the 16:09:54 UTC restart: the far card is at position 12 in
+  all 5 windows of profile 151's first deck, and the drafted head splits
+  4/4/3. The interleave row lists arms production, far, joined_all and
+  joined_no_metadata; no other profile has rows. Journal clean.
+
 ## Diversity Phase 0: Recommended re-rank rules — 2026-10-12
 
 Plan: `docs/evaluations/diversity-20261012/PLAN.md` (gate fixed before the

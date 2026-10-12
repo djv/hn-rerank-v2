@@ -20,16 +20,15 @@ then other people's profiles; also a public showcase and an ML playground.
 A new profile's first feed therefore matters too.
 
 Chosen next goals (user 2026-10-12): discovery (fewer same-y
-feeds: Explore first, since it is outside the trial; Recommended diversity
-after 2026-11-05), a reading signal (TUI opens and dwell) and a good
+feeds: Explore's Discover, live 2026-10-12, and Recommended's far card, live
+2026-10-12 after the user lifted the Recommended freeze), a reading signal (TUI opens and dwell) and a good
 first feed for new profiles (parked by the user 2026-10-12, in `~/TASKS.md`). Serve-time score logging (`deck_scores`
 table, live since 2026-10-12) supports all three.
 
 ## Objective
-Deploy the approved Codex Forum source-safety target 794caa4 (user 2026-10-11).
-Rollout is verified on the VPS. The two low implementation findings and
-conditional clean-summary fallback remain unchanged/parked; the reply/count
-adapter remains outside this task.
+Make the feed less same-y without losing hits (Goals above). Discover is
+live in Explore. The far card (Recommended's last card) went live
+2026-10-12; read both about 2026-11-02.
 
 Compare shortlist #2 (one joined logistic classifier, all features) and #4
 (same, no metadata) live against production through team-draft
@@ -72,7 +71,23 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   from up-votes) just missed it: +0.049 diversity against the 0.05 bar,
   −1.1 points up-rate and twice the novel up-votes. MMR 0.8 was free on
   up-rate but gained only +0.040. Topic caps cost the most up-rate.
-  Recommended is unchanged. FINDINGS "Diversity Phase 0".
+  FINDINGS "Diversity Phase 0".
+  Far card (user 2026-10-12: "u can make changes to recommended now", chose
+  Far 1): Recommended's last served card is now the best-scored story
+  unlike the user's up-votes (closest-up similarity < 0.60), with the ✨
+  Discover badge. It is tagged arm `far`, so the trial credits it to no arm.
+  - Built by Muse (2a5fcfc). The Claude cloud review found no high issues
+    and 2 medium ones: ageing out, and profiles with no up-votes. Those and
+    all the low ones were fixed (bf80ec8).
+  - Merged b1897f4; VPS gate: backend 1,375 passed plus 1 pre-existing
+    flaky failure (see Blocker); TUI 251 passed; ruff and ty clean.
+  - Restarted 16:09:54 UTC with the user's OK. The first deck has a far card
+    at position 12 in all 5 windows for profile 151, the 11 drafted cards
+    split 4/4/3, and the trial row records `far`. No other profile got
+    interleave rows. Journal clean.
+  - Not verified live: the served feed's rendering (badge, last position)
+    in the web and TUI.
+  FINDINGS "Far card deploy".
   [Evidence](FINDINGS.md#blind-re-vote-calibration-recency-check-re-votes-applied--2026-10-11).
 - Muse-primary summaries with Mistral fallback: branch `muse-primary-fallback`
   (ddb424d, pushed, not merged or deployed). A failed primary call falls back once,
@@ -296,6 +311,11 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
+None for the far card. Pre-existing flaky test:
+`tests/test_joined_classifier.py::test_warm_start_reaches_the_same_model_in_fewer_iterations`
+fails for seed 1155516390 (warm vs cold probabilities differ by 0.0076,
+against atol 5e-3). Hypothesis replays the seed in the VPS gate worktree,
+so main fails it too. It is unrelated to the far card.
 The Muse-fallback deploy waits for the trial to end (no restart before
 2026-11-05 without the user's OK). No Codex rollout blocker remains. The TUI medium result review is complete
 and its introduced findings corrected.
@@ -308,6 +328,13 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Far card: read about 2026-11-02 with Discover (PLAN.md "Far card":
+  far-card up- and down-rate vs Recommended cards 9–11, using served
+  positions from impressions; novel up-votes per week; Discover plus the far
+  card combined). Phase 0b (Combo, Far 1) runs 2026-11-05
+  (`fu-20261012-104919-066`).
+- Fix the flaky warm-start test (raise its tolerance or pin the bad seed
+  after checking why lbfgs stops further apart).
 - Reading signal: after the user restarts `hn`, confirm `article_open`,
   `comments_open` and `dwell` rows arrive for profile 151; after about two
   weeks, check how opens and dwell relate to votes before using them.
