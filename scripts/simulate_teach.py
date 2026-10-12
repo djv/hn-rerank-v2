@@ -413,6 +413,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--budgets", default="50,100,200")
     parser.add_argument("--round-size", type=int, default=25)
     parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument(
+        "--initial-train-frac",
+        type=float,
+        default=0.5,
+        help="Share of timestamp groups before the first fold (evaluator default)",
+    )
     parser.add_argument("--rules", default="all")
     parser.add_argument(
         "--mix-base", choices=[r for r in RULES if r != "mix"], default="near_cutoff"
@@ -430,6 +436,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--budgets must be increasing positive cumulative budgets")
     if min(args.folds, args.round_size, args.seeds) < 1:
         parser.error("folds, round-size and seeds must be positive")
+    if not 0 < args.initial_train_frac < 1:
+        parser.error("--initial-train-frac must be between 0 and 1")
     names = list(RULES) if args.rules == "all" else args.rules.split(",")
     if not names or any(r not in RULES for r in names) or len(set(names)) != len(names):
         parser.error("--rules must be all or distinct comma-separated rule names")
@@ -488,7 +496,9 @@ def execute(
         ),
     )
     y, vote_times = labels[valid], times[valid]
-    splits = _temporal_splits(y, vote_times, folds=args.folds)
+    splits = _temporal_splits(
+        y, vote_times, folds=args.folds, initial_train_frac=args.initial_train_frac
+    )
     _validate_splits(
         splits,
         y,
@@ -582,6 +592,7 @@ def execute(
         "budgets": budgets,
         "round_size": args.round_size,
         "seeds": args.seeds,
+        "initial_train_frac": args.initial_train_frac,
         "rules": rules,
         "mix_base": args.mix_base,
         "bootstrap_resamples": 2000,
