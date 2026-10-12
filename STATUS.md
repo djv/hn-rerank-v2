@@ -38,6 +38,12 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Read-only trial safety check 2026-10-12 16:43 UTC: 61 credited votes
+  across 16 decks after excluding 29 calibration re-votes. Production
+  7 up / 8 neutral / 8 down; #2 10/8/2; #4 8/3/7. Descriptive only;
+  neither safety threshold triggered (last-24h median rank time 19.8 s).
+  Latest Arctic Shift refresh has zero failed feeds. Reading events still
+  only impressions. `docs/evaluations/live-interleaving-check-20261012/`.
 - Warm-start test fix completed 2026-10-12: the test uses tol=1e-6 and
   explicitly replays seed 1155516390, retaining the 5e-3 probability bound.
   This reduces the recorded seed's gap below the assertion bound; production
@@ -377,7 +383,8 @@ ranking research remains paused and production trial configuration unchanged.
   justified; prior-UP explanations occur in fixes and damage, while related
   similarity/lexical features already exist. No new annotations or fits.
   No further research work or annotation spending while paused. Live ML
-  interleaving continues unchanged; no winner established from 19 credits.
+  interleaving continues unchanged; no winner established from 61 credits
+  after excluding the calibration re-votes (2026-10-12 descriptive check).
   This does not rule out every LLM approach. Resume only when requested.
 - Optional: the remaining cold cost after a restart is linear blend
   scoring (7.1 s, candidate word counts recomputed); a persisted or

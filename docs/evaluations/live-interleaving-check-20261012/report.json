@@ -1,0 +1,82 @@
+{
+  "checked_utc": "2026-10-12T16:42:46.581528+00:00",
+  "user_id": 151,
+  "since": 1791432442.75,
+  "until": 1791823366.514476,
+  "raw_votes": 227,
+  "excluded_revotes": 29,
+  "votes": 198,
+  "credited": 61,
+  "skipped": {
+    "view_popular": 123,
+    "view_explore": 13,
+    "no_impression": 1
+  },
+  "summary": {
+    "credited_by_arm": {
+      "production": {
+        "up": 7,
+        "neutral": 8,
+        "down": 8
+      },
+      "joined_all": {
+        "neutral": 8,
+        "up": 10,
+        "down": 2
+      },
+      "joined_no_metadata": {
+        "neutral": 3,
+        "up": 8,
+        "down": 7
+      }
+    },
+    "decks_with_credit": 16,
+    "per_test_alpha": 0.025,
+    "joined_all": {
+      "deck_sign_p": 1.0,
+      "deck_wins": 4,
+      "deck_losses": 3,
+      "rate_p": 0.19058842408213117,
+      "up_rate": 0.5,
+      "control_up_rate": 0.30434782608695654,
+      "down_rate": 0.1,
+      "control_down_rate": 0.34782608695652173,
+      "credited": 20,
+      "control_credited": 23,
+      "deck_sign_rejects": false,
+      "rate_rejects": false
+    },
+    "joined_no_metadata": {
+      "deck_sign_p": 1.0,
+      "deck_wins": 5,
+      "deck_losses": 4,
+      "rate_p": 0.35535839677044323,
+      "up_rate": 0.4444444444444444,
+      "control_up_rate": 0.30434782608695654,
+      "down_rate": 0.3888888888888889,
+      "control_down_rate": 0.34782608695652173,
+      "credited": 18,
+      "control_credited": 23,
+      "deck_sign_rejects": false,
+      "rate_rejects": false
+    }
+  },
+  "rank_timing": {
+    "since_t0": {
+      "n": 349,
+      "median_s": 16.080610119970515,
+      "max_s": 104.02698505297303
+    },
+    "last24h": {
+      "n": 91,
+      "median_s": 19.75743551691994,
+      "max_s": 52.92083837208338
+    }
+  },
+  "reading_events": [
+    {
+      "type": "impression",
+      "n": 5141
+    }
+  ]
+}

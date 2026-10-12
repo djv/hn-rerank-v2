@@ -1,5 +1,32 @@
 # HN Rerank findings
 
+## Live trial safety check — 2026-10-12 16:43 UTC
+
+Read-only production DB at b1897f4, service active. Fixed report snapshot
+until=1791823366.514476; since=T0 1791432442.75. Used the existing report
+load/credit/summarize functions; excluded feedback updated_at in
+[1791763112.57,1791763180.12] per the calibration boundary. Raw 227 votes,
+29 excluded, 198 eligible: 61 credited across 16 decks; skipped 123 Popular,
+13 Explore and 1 without impression. No far-card vote yet in this snapshot.
+Production 7 up / 8 neutral / 8 down, joined_all 10/8/2,
+joined_no_metadata 8/3/7. Up-rate comparison p=.191/.355; interim
+descriptive values only, not an efficacy decision or early stopping test.
+
+Down-rate differences vs production: #2 −24.8 points, #4 +4.1 points;
+neither meets the +10-point safety requirement, so the p<.01 condition
+cannot trigger a stop. Positive rank_total_ms rows for profile 151:
+since T0 n=349, median16.08s/max104.03s; last24h n=91,
+median19.76s/max52.92s. Median remains below the 30s safety bar.
+No other profile has interleave_decks rows. Reading events: 5,141
+impressions, zero opens/dwell. No synthetic events or provider calls.
+Final analysis date remains 2026-11-05 04:07:22 UTC.
+
+Recent Arctic Shift refreshes: 08:26 zero failures; 10:29 one failed
+feed; 12:43,14:33,16:21 zero failures. Latest 130 requests, 9 overloaded,
+zero transport errors; normal refresh imported 12 changes/hydrated4.
+No source/config changes or extra refresh. Machine-readable snapshot:
+docs/evaluations/live-interleaving-check-20261012/report.json.
+
 ## Warm-start test fix completed — 2026-10-12
 
 The user authorized finishing the draft after `rv` and `q`. The test-only
