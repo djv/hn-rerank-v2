@@ -1,5 +1,23 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — TUI logs article/comments opens and dwell
+
+`clients/tui`: renamed `api.Impression`/`API.impression` to
+`InteractionEvent`/`API.interaction` (payload omits `duration_ms` unless a
+dwell), added pure `dwell.py` (`DwellTracker`, 1 s minimum, 5 min idle cap,
+integer ms clamped to a day), and wired the reader: immediate best-effort
+`article_open`/`comments_open` on `o`/`c`, dwell segments per selection
+ended on moves, rebuilds, help/legend/why, `AppBlur` and quit and resumed on
+`AppFocus`/panel close without a new impression, input `touch` on keys and
+mouse, quit flush with a ~1 s cap that never delays votes. Why: profile 151
+reads in the TUI (5,141 impressions, no opens/dwell) so the ranker had no
+reading signal; semantics match the web client. Built by Muse (OpenCode)
+from a brief; on review the agent removed a quit-time send of the still-
+delayed impression (it would log selections under 1 s) and the broad
+exception catches around the pure tracker. Goes live when the user
+restarts the reader; no server restart (server already accepts all four
+event types).
+
 ## 2026-10-12 — Discover replaces Novel in Explore
 
 Novel (farthest from every vote) got 1 up-vote in 58; Phase 0 (FINDINGS
