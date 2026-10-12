@@ -114,5 +114,11 @@ now") and chose Far 1, the Phase 0 near miss, to go live before 2026-11-05.
 - Read about 2026-11-02, next to Discover: the far card's up- and
   down-rate against Recommended cards 9–11, and novel up-votes per week
   against Phase 0's baseline (B caught 4 in 35 groups).
+- Readout caveats (cloud review 2026-10-12):
+  - The far card is often Discover's top pick, so from now on Discover's
+    Explore up-rate measures its picks 2–4. Compare the far card with
+    Discover on the far card plus Discover combined.
+  - Use the served positions in impressions, not `deck_scores` positions,
+    since head cards can age out between warms.
 - Phase 0b still runs on 2026-11-05. The far card makes its Far 1 row
   partly live data, and Combo stays offline-only.
