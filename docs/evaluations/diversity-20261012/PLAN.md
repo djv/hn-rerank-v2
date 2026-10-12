@@ -7,6 +7,23 @@ offline preparation only, ready to ship after the interleaving trial ends on
 Result (2026-10-12): Phase 0 ran; no rule passed the gate (FINDINGS.md
 "Diversity Phase 0"). Phase 1 does not start from this result.
 
+## Phase 0b — re-test on new days (user chose 2026-10-12)
+
+Fixed on 2026-10-12, before any of its data exists:
+- Data: stories first shown from 2026-10-13 to 2026-11-04 UTC (inclusive);
+  everything else as in Phase 0. Run on or after 2026-11-05.
+- Only these two rules are tested against B; others are printed for context
+  only:
+  - Far 1, unchanged.
+  - Combo: MMR 0.8 picks the first k − 1 stories. The last slot goes to the
+    best-scored remaining story with max similarity < 0.60 to up-votes cast
+    before the group's day. If there is none, it goes to MMR 0.8's k-th
+    pick.
+- Same gate as Phase 0. If both pass, the larger diversity gain per up-rate
+  point lost wins. A winner goes to Phase 1 with the user's OK.
+- Caveat: Discover (live in Explore since 2026-10-12) puts more far stories
+  on screen, so the pool holds more far stories than in Phase 0.
+
 ## Why
 
 - The user's worst failure is a same-y feed (STATUS.md "Goals").
@@ -79,3 +96,23 @@ user's restart OK.
 
 The ranker itself, Explore and Discover, Popular, the cold-start first feed
 (parked).
+
+## Far card — live now (user chose 2026-10-12)
+
+The user lifted the Recommended freeze ("u can make changes to recommended
+now") and chose Far 1, the Phase 0 near miss, to go live before 2026-11-05.
+- Each window's served Recommended keeps its first 11 cards. Card 12 is the
+  best-scored story whose max similarity to the user's up-votes is below
+  0.60, taken from Recommended below card 11 or from Explore's Discover
+  picks. It shows the ✨ Discover badge. If there is none, Recommended is
+  unchanged.
+- Trial safety: the card is tagged arm `far`, outside the team draft. The
+  trial report credits only the arms it names, so votes on it count for
+  neither production nor a challenger. The draft keeps 11 served slots.
+- Logging: `deck_scores` cards carry their arm, so far cards stay
+  identifiable after the trial ends.
+- Read about 2026-11-02, next to Discover: the far card's up- and
+  down-rate against Recommended cards 9–11, and novel up-votes per week
+  against Phase 0's baseline (B caught 4 in 35 groups).
+- Phase 0b still runs on 2026-11-05. The far card makes its Far 1 row
+  partly live data, and Combo stays offline-only.
