@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from collections.abc import Sequence
-from typing import Any, Literal, Generator, NamedTuple, TypeAlias
+from typing import Any, Literal, Generator, NamedTuple, TypeAlias, TYPE_CHECKING, cast
 from contextlib import contextmanager
 import queue
 import numpy as np
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from clients.tui.src.hn_rerank.models import View
 
 
 Action: TypeAlias = Literal["up", "neutral", "down"]
@@ -88,6 +92,20 @@ class StoryCounts:
 
 
 @dataclass(frozen=True)
+class TldrCacheRecord:
+    """One cached TLDR plus its generation-time source snapshot.
+
+    `source_comments` is the descendants count the summarized text was
+    built from (None = legacy/unknown). Text and snapshot are always read
+    together so a same-key rewrite can never mix text with another
+    generation's provenance.
+    """
+
+    text: str
+    source_comments: int | None
+
+
+@dataclass(frozen=True)
 class FeedbackRecord:
     story_id: int
     action: Action
@@ -103,6 +121,59 @@ class User:
     id: int
     token: str
     created_at: float
+
+
+@dataclass(frozen=True)
+class ScoreQuantiles:
+    p50: float
+    p75: float
+    p90: float
+    p95: float
+    p99: float
+    max: float
+
+
+@dataclass(frozen=True)
+class CardScore:
+    story_id: int
+    view: View
+    position: int
+    score: float
+    svm_margin: float | None
+    prob_up: float | None
+    prob_neutral: float | None
+    prob_down: float | None
+    window_rank: int | None
+    global_rank: int | None
+
+
+@dataclass(frozen=True)
+class WindowScores:
+    pool_size: int
+    candidates_total: int
+    quantiles: dict[str, ScoreQuantiles]
+    cards: tuple[CardScore, ...]
+
+
+@dataclass(frozen=True)
+class DeckScores:
+    user_id: int
+    version: int
+    created_at: float
+    windows: dict[str, WindowScores]
+
+
+@dataclass(frozen=True)
+class InterleaveDeck:
+    """An interleaved deck as built: per window, its Recommended story IDs
+    in order, each with the arm that drafted it; ``arms`` lists every arm,
+    production first."""
+
+    user_id: int
+    version: int
+    created_at: float
+    arms: tuple[str, ...]
+    windows: dict[str, tuple[tuple[int, str], ...]]
 
 
 @dataclass(frozen=True)
@@ -172,6 +243,20 @@ class RedditFeedState:
     next_retry_at: float
     last_error: str
     item_count: int
+
+
+_DECK_SCORE_VIEWS = ("recommended", "popular", "explore")
+
+
+def _sanitize_deck_scores_json(value: object) -> object:
+    """Replace non-finite floats with null so `json.dumps(allow_nan=False)` holds."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _sanitize_deck_scores_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_deck_scores_json(v) for v in value]
+    return value
 
 
 class Database:
@@ -334,6 +419,14 @@ class Database:
                         FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
                     ) STRICT
                 """)
+                cursor = conn.execute("PRAGMA table_info(tldr_cache)")
+                if "source_comments" not in {row[1] for row in cursor.fetchall()}:
+                    # Generation-time source snapshot bound to the cached text
+                    # (PLAN correction 1): nullable so legacy rows stay unknown
+                    # and are never backfilled from the mutable story row.
+                    conn.execute(
+                        "ALTER TABLE tldr_cache ADD COLUMN source_comments INTEGER"
+                    )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tldr_cache_story ON tldr_cache(story_id)"
                 )
@@ -387,6 +480,31 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_rank_perf_recorded_at "
                     "ON rank_perf(recorded_at)"
                 )
+
+                # One row per interleaved deck a warm built (Config.
+                # interleave_user_ids): each window's Recommended stories in
+                # order with the arm that drafted them. Votes are credited
+                # offline through interaction_events' deck version.
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS interleave_decks (
+                        user_id       INTEGER NOT NULL,
+                        version       INTEGER NOT NULL,
+                        created_at    REAL NOT NULL,
+                        arms_json     TEXT NOT NULL,
+                        windows_json  TEXT NOT NULL,
+                        PRIMARY KEY (user_id, version)
+                    ) STRICT
+                """)
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS deck_scores (
+                        user_id       INTEGER NOT NULL,
+                        version       INTEGER NOT NULL,
+                        created_at    REAL NOT NULL,
+                        windows_json  TEXT NOT NULL,
+                        PRIMARY KEY (user_id, version)
+                    ) STRICT
+                """)
 
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS interaction_events (
@@ -1072,13 +1190,37 @@ class Database:
         return found
 
     # TLDR cache
-    def get_tldr_cache(self, story_id: int, cache_key: str) -> str | None:
+    def get_tldr_cache_record(
+        self, story_id: int, cache_key: str
+    ) -> TldrCacheRecord | None:
+        """Atomic text+snapshot read for one cache key."""
         with self.conn() as conn:
             row = conn.execute(
-                "SELECT tldr FROM tldr_cache WHERE story_id = ? AND cache_key = ?",
+                "SELECT tldr, source_comments FROM tldr_cache "
+                "WHERE story_id = ? AND cache_key = ?",
                 (story_id, cache_key),
             ).fetchone()
-            return row[0] if row else None
+            if not row:
+                return None
+            snapshot = row[1]
+            return TldrCacheRecord(
+                text=row[0],
+                source_comments=int(snapshot) if snapshot is not None else None,
+            )
+
+    def get_tldr_cache(self, story_id: int, cache_key: str) -> str | None:
+        record = self.get_tldr_cache_record(story_id, cache_key)
+        return record.text if record is not None else None
+
+    def get_tldr_cache_snapshot(self, story_id: int, cache_key: str) -> int | None:
+        """Source descendants covered by a cached TLDR, when recorded.
+
+        Written atomically with the text at generation time; NULL (legacy
+        rows) means unknown and must never be treated as proof of the
+        current discussion size.
+        """
+        record = self.get_tldr_cache_record(story_id, cache_key)
+        return record.source_comments if record is not None else None
 
     def get_any_tldr_for_story(self, story_id: int) -> str | None:
         """Return the cached TLDR for a story regardless of cache key.
@@ -1107,16 +1249,23 @@ class Database:
             ).fetchall()
             return {row[0]: row[1] for row in rows}
 
-    def upsert_tldr_cache(self, story_id: int, cache_key: str, tldr: str) -> None:
+    def upsert_tldr_cache(
+        self,
+        story_id: int,
+        cache_key: str,
+        tldr: str,
+        source_comments: int | None = None,
+    ) -> None:
         with self.conn() as conn:
             with conn:
                 conn.execute("DELETE FROM tldr_cache WHERE story_id = ?", (story_id,))
                 conn.execute(
                     """
-                    INSERT INTO tldr_cache (story_id, cache_key, tldr, created_at)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO tldr_cache (story_id, cache_key, tldr, created_at,
+                                            source_comments)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (story_id, cache_key, tldr, time.time()),
+                    (story_id, cache_key, tldr, time.time(), source_comments),
                 )
 
     # LLM usage (spend visibility; additive, never blocks serving)
@@ -1233,7 +1382,9 @@ class Database:
 
         Score is forced to -1 so these stories always lose same-source
         tiebreaks in dedup — they participate only as suppressors, never
-        as survivors.
+        as survivors. Full text fields are populated so source-specific
+        read policies (e.g. the Codex Forum effective view) can
+        recompose clean inputs instead of reusing mixed stored text.
         """
         if not actions:
             return []
@@ -1241,7 +1392,9 @@ class Database:
         with self.conn() as conn:
             cursor = conn.execute(
                 f"SELECT DISTINCT s.id, s.title, s.url, s.time, "
-                f"       s.text_content, s.source "
+                f"       s.text_content, s.source, "
+                f"       COALESCE(s.self_text, ''), COALESCE(s.top_comments, ''), "
+                f"       COALESCE(s.article_body, '') "
                 f"FROM stories s "
                 f"JOIN feedback f ON f.story_id = s.id "
                 f"WHERE f.user_id = ? AND f.action IN ({placeholders}) "
@@ -1257,6 +1410,9 @@ class Database:
                     time=row[3] or 0,
                     text_content=row[4] or "",
                     source=row[5] or "hn",
+                    self_text=row[6],
+                    top_comments=row[7],
+                    article_body=row[8],
                 )
                 for row in cursor.fetchall()
             ]
@@ -1486,6 +1642,189 @@ class Database:
                         json.dumps(sample.fields),
                     ),
                 )
+
+    def insert_deck_scores(self, deck: DeckScores) -> None:
+        """Persist one warm's production values in a single small write."""
+        payload = _sanitize_deck_scores_json(
+            {w: asdict(v) for w, v in deck.windows.items()}
+        )
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO deck_scores "
+                    "(user_id, version, created_at, windows_json) VALUES (?, ?, ?, ?)",
+                    (
+                        deck.user_id,
+                        deck.version,
+                        deck.created_at,
+                        json.dumps(payload, allow_nan=False),
+                    ),
+                )
+
+    def get_deck_scores(self, user_id: int, since: float = 0.0) -> list[DeckScores]:
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT version, created_at, windows_json FROM deck_scores "
+                "WHERE user_id = ? AND created_at >= ? ORDER BY version",
+                (user_id, since),
+            ).fetchall()
+        out: list[DeckScores] = []
+        for version, created_at, windows_json in rows:
+            try:
+                version_int = int(version)
+                if isinstance(version, bool):
+                    raise ValueError("version must be an int")
+                created_float = float(created_at)
+                if isinstance(created_at, bool):
+                    raise ValueError("created_at must be a float")
+                raw_windows = json.loads(windows_json)
+                if not isinstance(raw_windows, dict):
+                    raise ValueError("windows_json must be an object")
+
+                def _req_int(value: object, field: str) -> int:
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        raise ValueError(f"{field} must be an int")
+                    return int(value)
+
+                def _req_float(value: object, field: str) -> float:
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise ValueError(f"{field} must be a float")
+                    result = float(value)
+                    if not math.isfinite(result):
+                        raise ValueError(f"{field} must be finite")
+                    return result
+
+                def _opt_float(value: object, field: str) -> float | None:
+                    if value is None:
+                        return None
+                    return _req_float(value, field)
+
+                def _opt_int(value: object, field: str) -> int | None:
+                    if value is None:
+                        return None
+                    return _req_int(value, field)
+
+                windows: dict[str, WindowScores] = {}
+                for w, v in raw_windows.items():
+                    if not isinstance(w, str):
+                        raise ValueError("window name must be a string")
+                    if not isinstance(v, dict):
+                        raise ValueError(f"window {w!r} must be an object")
+                    raw_quantiles = v["quantiles"]
+                    if not isinstance(raw_quantiles, dict):
+                        raise ValueError(f"window {w!r} quantiles must be an object")
+                    quantiles: dict[str, ScoreQuantiles] = {}
+                    for k, q in raw_quantiles.items():
+                        if not isinstance(k, str) or not isinstance(q, dict):
+                            raise ValueError(
+                                f"window {w!r} quantile {k!r} must be an object"
+                            )
+                        quantiles[str(k)] = ScoreQuantiles(
+                            p50=_req_float(q["p50"], "p50"),
+                            p75=_req_float(q["p75"], "p75"),
+                            p90=_req_float(q["p90"], "p90"),
+                            p95=_req_float(q["p95"], "p95"),
+                            p99=_req_float(q["p99"], "p99"),
+                            max=_req_float(q["max"], "max"),
+                        )
+                    raw_cards = v["cards"]
+                    if not isinstance(raw_cards, (list, tuple)):
+                        raise ValueError(f"window {w!r} cards must be a list")
+                    cards: list[CardScore] = []
+                    for c in raw_cards:
+                        if not isinstance(c, dict):
+                            raise ValueError(f"window {w!r} card must be an object")
+                        view = str(c["view"])
+                        if view not in _DECK_SCORE_VIEWS:
+                            raise ValueError(f"unknown view {view!r}")
+                        cards.append(
+                            CardScore(
+                                story_id=_req_int(c["story_id"], "story_id"),
+                                view=cast("View", view),
+                                position=_req_int(c["position"], "position"),
+                                score=_req_float(c["score"], "score"),
+                                svm_margin=_opt_float(c["svm_margin"], "svm_margin"),
+                                prob_up=_opt_float(c["prob_up"], "prob_up"),
+                                prob_neutral=_opt_float(
+                                    c["prob_neutral"], "prob_neutral"
+                                ),
+                                prob_down=_opt_float(c["prob_down"], "prob_down"),
+                                window_rank=_opt_int(c["window_rank"], "window_rank"),
+                                global_rank=_opt_int(c["global_rank"], "global_rank"),
+                            )
+                        )
+                    windows[str(w)] = WindowScores(
+                        pool_size=_req_int(v["pool_size"], "pool_size"),
+                        candidates_total=_req_int(
+                            v["candidates_total"], "candidates_total"
+                        ),
+                        quantiles=quantiles,
+                        cards=tuple(cards),
+                    )
+                out.append(
+                    DeckScores(
+                        user_id,
+                        version_int,
+                        created_float,
+                        windows,
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"malformed deck_scores row user_id={user_id} version={version}: {exc}"
+                ) from exc
+        return out
+
+    def insert_interleave_deck(self, deck: InterleaveDeck) -> None:
+        with self.conn() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO interleave_decks (
+                        user_id, version, created_at, arms_json, windows_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        deck.user_id,
+                        deck.version,
+                        deck.created_at,
+                        json.dumps(list(deck.arms)),
+                        json.dumps(
+                            {
+                                w: [list(p) for p in picks]
+                                for w, picks in deck.windows.items()
+                            }
+                        ),
+                    ),
+                )
+
+    def get_interleave_decks(
+        self, user_id: int, since: float = 0.0
+    ) -> list[InterleaveDeck]:
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT version, created_at, arms_json, windows_json "
+                "FROM interleave_decks WHERE user_id = ? AND created_at >= ? "
+                "ORDER BY version",
+                (user_id, since),
+            ).fetchall()
+        out = []
+        for version, created_at, arms_json, windows_json in rows:
+            windows = json.loads(windows_json)
+            out.append(
+                InterleaveDeck(
+                    user_id=user_id,
+                    version=int(version),
+                    created_at=float(created_at),
+                    arms=tuple(str(a) for a in json.loads(arms_json)),
+                    windows={
+                        str(w): tuple((int(sid), str(arm)) for sid, arm in picks)
+                        for w, picks in windows.items()
+                    },
+                )
+            )
+        return out
 
     def insert_interaction_events(
         self, events: list[InteractionEvent]

@@ -32,6 +32,7 @@ from .config import (
 
 from .ranking import (
     COMMENT_DEPTH_PENALTY,
+    draft_recommended,
     EXPLORE_PER_BADGE,
     Embedder,
     GRAVITY_TIME_SCALE,
@@ -40,6 +41,7 @@ from .ranking import (
     RankTrace,
     RankedComment,
     RankedStory,
+    SELECT_MARGIN,
     SOURCE_CATEGORIES,
     TOP_COMMENT_CORE_THREADS,
     TOP_COMMENT_LIMIT,
@@ -112,6 +114,7 @@ from .enrichment import (
     select_rss_article_prewarm,
 )
 from .ainews import AINEWS_SOURCE, AINEWS_TITLE_PREFIX, fetch_ainews_stories
+from .codex_forum import effective_codex_story
 from .hn_dupes import (
     FeedbackDupeContext,
     _load_feedback_context,
@@ -125,11 +128,13 @@ from .candidate_cache import (
     get_candidate_pool,
     invalidate_candidate_pool,
 )
+from .interleave import challenger_configs
 
 from .render import (
     generate_dashboard_bytes,
     source_label_filter,
 )
+import arctic_shift
 from reddit_feed_cache import cache as reddit_feed_cache
 from reddit_limiter import limiter as reddit_limiter
 
@@ -166,6 +171,7 @@ def build_cold_deck(
     trace: RankTrace | _NullTrace = NULL_TRACE,
     *,
     candidates: list[Story] | None = None,
+    margin: int = SELECT_MARGIN,
 ) -> WindowDeck:
     """The non-personalized deck: gravity-scored window views, no
     embeddings.
@@ -178,6 +184,9 @@ def build_cold_deck(
     personalized and needs feedback to compute against.
 
     When *user_id* is provided, already-voted stories are excluded.
+    *margin* is ``assemble_window_deck``'s: the server's shared cold deck
+    passes ``COLD_DECK_MARGIN`` so it still fills each view once a voter's
+    votes are removed.
 
     When *embedder* is provided, the candidate pool is served from the
     process-wide cache (``pipeline.candidate_cache``) instead of a fresh
@@ -212,6 +221,7 @@ def build_cold_deck(
         config=config,
         now=now_ts,
         trace=trace,
+        margin=margin,
     )
 
 
@@ -373,19 +383,26 @@ def load_production_candidate_stories(
                     config.recent_candidate_rss_limit,
                 ),
             )
+    # Stored Codex Forum rows may carry legacy mixed article bodies and
+    # generated footers; rank on their effective (clean) view. Raw rows,
+    # votes, and identities in the DB are untouched.
     hn_stories = [
         s
-        for s in (Database._row_to_story(row) for row in hn_rows)
+        for s in (effective_codex_story(Database._row_to_story(row)) for row in hn_rows)
         if is_summarizable(s)
     ]
     archive_stories = [
         s
-        for s in (Database._row_to_story(row) for row in archive_rows)
+        for s in (
+            effective_codex_story(Database._row_to_story(row)) for row in archive_rows
+        )
         if is_summarizable(s)
     ]
     rss_stories = [
         s
-        for s in (Database._row_to_story(row) for row in rss_rows)
+        for s in (
+            effective_codex_story(Database._row_to_story(row)) for row in rss_rows
+        )
         if is_summarizable(s)
     ]
     trace.set_count("pool_hn", len(hn_stories))
@@ -498,6 +515,14 @@ class LiveCounts:
     descendants: int
 
 
+_PROBE_MISSING: Any = object()
+"""Sentinel for a Firebase body with no ``descendants`` key at all.
+
+Story/job items omit the field at zero comments (a legitimate zero);
+an explicit ``descendants: null`` is unknown, never zero.
+"""
+
+
 async def _probe_live_items(
     stories: Sequence[Story], timeout_s: float
 ) -> dict[int, LiveCounts]:
@@ -513,6 +538,12 @@ async def _probe_live_items(
     async with httpx.AsyncClient(timeout=timeout_s) as client:
 
         async def _one(s: Story) -> tuple[int, LiveCounts] | None:
+            if not is_hn_source(s.source) or s.id <= 0:
+                # Only real HN items are ever probed: RSS/Reddit/archive
+                # rows and non-positive ids must never be sent to
+                # Firebase as live evidence.
+                logging.warning("tldr_probe story_id=%s unsupported target", s.id)
+                return None
             async with sem:
                 try:
                     resp = await client.get(_FIREBASE_ITEM_URL.format(sid=s.id))
@@ -525,16 +556,47 @@ async def _probe_live_items(
                     )
                     return None
                 try:
-                    body = resp.json() or {}
-                    score = body.get("score")
-                    live = LiveCounts(
-                        score=None if score is None else int(score),
-                        descendants=int(body.get("descendants") or 0),
-                    )
+                    body = resp.json()
                 except Exception:
                     logging.warning("tldr_probe story_id=%s unparseable body", s.id)
                     return None
-                return (s.id, live)
+                # Strict identity/type/count checks: null/empty/mismatched
+                # bodies are probe failures, never live data. A fabricated
+                # zero would pose as a checked count downstream (and
+                # True == 1 in Python, so identity is type-strict).
+                if not isinstance(body, dict) or not body:
+                    logging.warning("tldr_probe story_id=%s empty body", s.id)
+                    return None
+                item_id = body.get("id")
+                if type(item_id) is not int or item_id != s.id:
+                    logging.warning("tldr_probe story_id=%s identity mismatch", s.id)
+                    return None
+                if body.get("type") not in ("story", "job"):
+                    # Only discussion-bearing HN items carry comment counts;
+                    # anything else is not live data for this story.
+                    logging.warning("tldr_probe story_id=%s unexpected type", s.id)
+                    return None
+                if body.get("deleted") is True or body.get("dead") is True:
+                    # A removed item is not proof of current stats.
+                    logging.warning("tldr_probe story_id=%s removed item", s.id)
+                    return None
+                score = body.get("score")
+                if score is not None and type(score) is not int:
+                    logging.warning("tldr_probe story_id=%s bad score", s.id)
+                    return None
+                descendants = body.get("descendants", _PROBE_MISSING)
+                if descendants is _PROBE_MISSING:
+                    # Story/job items omit the field at zero comments.
+                    descendants = 0
+                elif descendants is None or type(descendants) is not int:
+                    # An explicit null is not a known zero, and a
+                    # non-integer (including True) is not a count.
+                    logging.warning("tldr_probe story_id=%s bad count", s.id)
+                    return None
+                if (score is not None and score < 0) or descendants < 0:
+                    logging.warning("tldr_probe story_id=%s negative count", s.id)
+                    return None
+                return (s.id, LiveCounts(score=score, descendants=descendants))
 
         for result in await asyncio.gather(*(_one(s) for s in stories)):
             if result is not None:
@@ -933,8 +995,14 @@ async def fetch_candidates(
     else:
         deduped_candidates = list(candidates)
 
-    # 6. Filter to summarizable stories (no content = no TLDR possible)
-    summarizable = [s for s in deduped_candidates if is_summarizable(s)]
+    # 6. Filter to summarizable stories (no content = no TLDR possible).
+    # Stored Codex Forum rows read through their effective view so legacy
+    # mixed inputs never reach ranking; the DB rows themselves are kept.
+    summarizable = [
+        s
+        for s in (effective_codex_story(s) for s in deduped_candidates)
+        if is_summarizable(s)
+    ]
     n_filtered = len(deduped_candidates) - len(summarizable)
     if n_filtered:
         logging.info(
@@ -996,6 +1064,8 @@ def fast_rerank_for_user(
     feedback_context = build_feedback_context(
         feedback, tuple(config.model.dedup_exclude_actions)
     )
+    challengers = challenger_configs(config, user_id)
+    arm_rankings: dict[str, list[int]] = {}
     deck = rerank_candidates(
         db=db,
         config=config,
@@ -1005,10 +1075,12 @@ def fast_rerank_for_user(
         user_id=user_id,
         trace=trace,
         is_feedback_match=lambda s: _matches_feedback(s, feedback_context),
+        challengers=challengers,
+        arm_rankings_out=arm_rankings,
     )
     _count_nonhn(trace, "deck_nonhn_pre_dedup", deck)
 
-    return finalize_ranked_deck(
+    final = finalize_ranked_deck(
         deck,
         candidates,
         cand_embeddings,
@@ -1020,6 +1092,10 @@ def fast_rerank_for_user(
         feedback=feedback,
         feedback_context=feedback_context,
     )
+    if arm_rankings:
+        with trace.stage("interleave_draft"):
+            final = draft_recommended(final, arm_rankings, np.random.default_rng())
+    return final
 
 
 def _count_nonhn(trace: RankTrace | _NullTrace, name: str, deck: WindowDeck) -> None:
@@ -1117,10 +1193,13 @@ def _apply_dedup_to_ranked(
     all_stories = [r.story for r in ranked]
     all_embeddings = dict(embeddings) if embeddings else {}
     if embedder is not None:
-        fb_stories = db.get_feedback_stories(
-            user_id,
-            actions=tuple(model_cfg.dedup_exclude_actions),
-        )
+        fb_stories = [
+            effective_codex_story(s)
+            for s in db.get_feedback_stories(
+                user_id,
+                actions=tuple(model_cfg.dedup_exclude_actions),
+            )
+        ]
         if fb_stories:
             fb_embs = get_or_compute_embeddings(fb_stories, embedder, db)
             for s, vec in zip(fb_stories, fb_embs):
@@ -1172,7 +1251,9 @@ async def fetch_candidates_only(
         logging.exception("fetch_candidates_only: growth refresh failed")
         touched = set()
     if touched:
-        refreshed = {s.id: s for s in db.get_stories(sorted(touched))}
+        refreshed = {
+            s.id: effective_codex_story(s) for s in db.get_stories(sorted(touched))
+        }
         candidates = [refreshed.get(s.id, s) for s in candidates]
 
     # HN prewarm
@@ -1245,6 +1326,7 @@ def refresh_reddit_candidates(
     from reddit_fetch_queue import queue as reddit_fetch_queue
 
     now_ts = time.time()
+    started = time.monotonic()
     feedback_urls = {f.url for f in db.get_all_feedback() if f.url}
     eligible_feeds = [
         feed
@@ -1252,18 +1334,49 @@ def refresh_reddit_candidates(
         if (state := db.get_reddit_feed_state(feed)) is None
         or state.next_retry_at <= now_ts
     ]
+    use_arctic = config.reddit_source == "arctic_shift"
     factories, feed_urls = build_reddit_topfeed_factories(
         eligible_feeds,
         config.rss.per_feed_limit,
         config.days,
         feedback_urls,
+        reddit_source=config.reddit_source,
     )
     if factories:
         reddit_fetch_queue.enqueue_all_reddit_fetches(
-            factories, [], min_stride_seconds=50.0
+            factories,
+            [],
+            min_stride_seconds=(
+                config.reddit_arctic_stride_seconds if use_arctic else 50.0
+            ),
         )
         if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
             logging.warning("reddit_refresh: topfeed queue timed out")
+        missing = [f for f in feed_urls if reddit_feed_cache.get(f) is None]
+        if use_arctic and missing and config.reddit_arctic_retry_delay_seconds > 0:
+            # Arctic Shift sheds load for minutes at a time; one later pass
+            # recovers most failed feeds instead of waiting for the next
+            # refresh. The factories skip feeds already in the cache.
+            logging.info(
+                "reddit_refresh: retrying %d Arctic Shift feeds in %.0f s",
+                len(missing),
+                config.reddit_arctic_retry_delay_seconds,
+            )
+            time.sleep(config.reddit_arctic_retry_delay_seconds)
+            retry_factories, _ = build_reddit_topfeed_factories(
+                missing,
+                config.rss.per_feed_limit,
+                config.days,
+                feedback_urls,
+                reddit_source=config.reddit_source,
+            )
+            reddit_fetch_queue.enqueue_all_reddit_fetches(
+                retry_factories,
+                [],
+                min_stride_seconds=config.reddit_arctic_stride_seconds,
+            )
+            if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
+                logging.warning("reddit_refresh: topfeed retry queue timed out")
 
     changed_ids: set[int] = set()
     for feed_url in feed_urls:
@@ -1284,12 +1397,20 @@ def refresh_reddit_candidates(
                 )
                 continue
             accepted_ids.append(story.id)
-            if existing is None or (
-                existing.title,
-                existing.url,
-                existing.time,
-                existing.self_text,
-            ) != (story.title, story.url, story.time, story.self_text):
+            # Compare stored rows: upsert keeps the longer self_text, so the
+            # fetched text alone would flag unchanged rows as changed.
+            stored = db.get_story(story.id)
+            if (
+                existing is None
+                or stored is None
+                or (
+                    existing.title,
+                    existing.url,
+                    existing.time,
+                    existing.self_text,
+                )
+                != (stored.title, stored.url, stored.time, stored.self_text)
+            ):
                 changed_ids.add(story.id)
         db.record_reddit_feed_success(feed_url, accepted_ids, now_ts)
 
@@ -1311,12 +1432,18 @@ def refresh_reddit_candidates(
                 ):
                     prewarm_ids.append(story.id)
 
-    prewarm_factories, updated_ids = build_reddit_prewarm_factories(prewarm_ids, db)
+    prewarm_factories, updated_ids = build_reddit_prewarm_factories(
+        prewarm_ids, db, reddit_source=config.reddit_source
+    )
     if prewarm_factories:
         reddit_fetch_queue.enqueue_all_reddit_fetches(
             [],
             prewarm_factories,
-            min_stride_seconds=config.reddit_min_fetch_spacing_seconds,
+            min_stride_seconds=(
+                config.reddit_arctic_stride_seconds
+                if use_arctic
+                else config.reddit_min_fetch_spacing_seconds
+            ),
         )
         if not reddit_fetch_queue.wait_until_empty(timeout=5400.0):
             logging.warning("reddit_refresh: prewarm queue timed out")
@@ -1333,10 +1460,22 @@ def refresh_reddit_candidates(
         prewarm_candidates=len(prewarm_ids),
     )
     logging.info(
-        "reddit_refresh_complete feeds=%d changed=%d hydrated=%d candidates=%d",
+        "reddit_refresh_complete feeds=%d changed=%d hydrated=%d candidates=%d "
+        "elapsed_s=%.0f",
         result.feeds,
         result.changed_stories,
         result.hydrated_stories,
         result.prewarm_candidates,
+        time.monotonic() - started,
     )
+    if use_arctic:
+        stats = arctic_shift.take_stats()
+        logging.info(
+            "reddit_refresh_arctic failed_feeds=%d requests=%d overloaded=%d "
+            "transport_errors=%d",
+            sum(reddit_feed_cache.get(f) is None for f in feed_urls),
+            stats.requests,
+            stats.overloaded,
+            stats.transport_errors,
+        )
     return result

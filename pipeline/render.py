@@ -34,6 +34,7 @@ from .ranking import (
     RankedStory,
     WindowDeck,
     card_attribution,
+    BADGED_ATTRIBUTION_MIN_SIM,
     serve_window,
 )
 
@@ -79,6 +80,7 @@ def source_label_filter(source: str) -> str:
         "lesswrong_com": "LessWrong",
         "lobste_rs": "Lobsters",
         "discourse_haskell_org": "Haskell Discourse",
+        "community_openai_com": "Codex Forum",
         "latent_space": "Latent Space",
         "ainews": "AINews",
         "scottaaronson_blog": "Scott Aaronson",
@@ -244,6 +246,25 @@ def _feed_story(
         source_label=source_label_filter(story.source),
         domain=_domain_of(story.url or "", story.discussion_url or ""),
         enriched=len(story.text_content) >= 1000,
+        ranking_factors=list(item.ranking_factors),
+        related_upvotes=[
+            title
+            for title, sim in item.related_upvotes
+            if sim
+            >= (
+                BADGED_ATTRIBUTION_MIN_SIM
+                if any(
+                    (
+                        item.is_hot,
+                        item.is_high_engagement,
+                        item.is_discussion_rich,
+                        item.is_uncertain,
+                        item.is_novel,
+                    )
+                )
+                else 0.0
+            )
+        ],
     )
 
 

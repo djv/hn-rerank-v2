@@ -15,13 +15,23 @@ command in `HN_RERANK_BROWSER`, e.g. `surf`);
 y copies the comments link (or the article link if there is none); a opens
 Claude Code in a tmux pane split beside the reader (in your home directory) with the article and
 comments links and a "dig deeper" prompt (`HN_RERANK_AGENT` overrides the
-`claude` command; outside tmux the prompt is copied instead); r refreshes; ? shows help; q quits.
+`claude` command; outside tmux the prompt is copied instead); r regenerates
+the selected summary and checks its live points/comments, automatically
+reloading if the discussion outgrew it; ? shows help; q quits. Both q and Ctrl+q
+wait up to five seconds for queued votes and undo requests to finish. If saving
+is still pending or a vote fails during that wait, the reader stays open with a
+warning. Press q again after checking the outcome. New votes and undo are
+disabled during the wait; ambiguous requests are never automatically retried.
 Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
 to the list. Escape also closes help. Use the sort and window selectors (or h/l and d) to change
 filters. Below 100 columns the headline list stacks above the summary.
 Non-HN stories show their feed's name (AINews, r/sub) and no score or comment
 count when the feed has none; the summary heading says which upvote a story
-resembles ("Because you upvoted: …").
+resembles ("Because you upvoted: …"). Press `w` for **Why this story**:
+model signals that helped or hurt relative to a middle-of-pool rating,
+related upvotes, feed ordering, and badge signals. Escape returns to the
+summary. Model details require a freshly ranked deck from an updated server;
+older servers still provide the original single-upvote attribution.
 
 Summaries are cached for the session across sort changes. Up to four background
 requests warm the next 20 stories, the previous three, and the first three
@@ -49,6 +59,8 @@ are not sent to a separate analytics service and are not retried.
 Configuration lives in platformdirs' user config directory (`hn-rerank/profile.json`),
 outside uv's cache. The profile token is a credential: keep that file and profile links private.
 Requests do not follow redirects or retry ambiguous votes. Refresh after a connection failure.
+HTTP 5xx summary failures keep the story available. Press r, or move away and
+back, to retry; an existing summary remains visible when its refresh fails.
 Reading requires an online server; no local ML.
 
 Local build: `uv build --project clients/tui`.
@@ -70,11 +82,20 @@ to full height at every terminal size,
 even for short summaries. On wide terminals the pane is centered and capped
 at 100 columns for comfortable reading. Enter or Escape restores the article
 list. The footer shows the zoom and return keys for the current mode.
-Press `r` to refresh the feed and request a fresh server-generated summary for
-only the selected story. Automatic refreshes keep using the server cache:
+Press `r` to regenerate only the selected summary and background-check its
+real points/comments. Visible counts update at once; when live comments
+still exceed the refreshed summary's snapshot, `r` automatically reloads
+that summary once per observed comment count, without a confirmation.
+Background feed checks update counts silently; press `r` to refresh the
+summary with the newer discussion. Nothing
+else is cleared, refetched or reordered; hidden stories stay hidden.
+Automatic refreshes keep using the server cache:
 once a minute the reader checks for a newer deck (a regen, a vote from another
-device, or the reranked deck after your vote) and reloads it without touching
-the open story.
+device, or the reranked deck after your vote) and reloads it; switching
+sorts (`s`/`h`/`l`, selectors and tabs alike) navigates the shared window
+feed immediately and fetches its latest existing version in the background
+(one request in flight, at most one queued follow-up), keeping the open
+story, its text and scroll usable while waiting.
 Regeneration still respects provider limits and does not guarantee a longer summary.
 Press `s` to cycle Recommended → Popular → Explore → Date; `h` / `l` step to
 the previous / next sort.

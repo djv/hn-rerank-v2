@@ -62,6 +62,59 @@ def test_followers_share_their_leaders_result(
         assert table.join_or_lead(key)[1]
 
 
+def test_captured_ordinary_keeps_its_forced_identity() -> None:
+    """Freshness is read off the captured flight, not the key: an old
+    ordinary flight still reports ordinary after a fresh leader takes the
+    key, while the table reports the new flight as forced."""
+    table: SingleFlight[int, str] = SingleFlight()
+    old, leading = table.join_or_lead(7)
+    assert leading
+    assert old.forced is False
+    table.land(7, old, "ordinary-result")
+    new, leading = table.join_or_lead(7, forced=True)
+    assert leading
+    assert new.forced is True
+    assert old.forced is False
+    assert old.wait(0) == "ordinary-result"
+    assert table.led_forced(7) is True
+    table.land(7, new, "fresh")
+    assert new.wait(0) == "fresh"
+    assert old.forced is False
+
+
+def test_followup_is_shared_even_after_it_lands() -> None:
+    """All forced waiters of one ordinary flight share a single follow-up,
+    including a waiter that asks after the follow-up already landed."""
+    table: SingleFlight[int, str] = SingleFlight()
+    ordinary, leading = table.join_or_lead(7)
+    assert leading
+    table.land(7, ordinary, "ordinary-result")
+    first, leading = table.followup_or_lead(ordinary, 7)
+    assert leading and first.forced is True
+    table.land(7, first, "fresh")
+    second, leading = table.followup_or_lead(ordinary, 7)
+    assert not leading
+    assert second is first
+    assert second.wait(0) == "fresh"
+
+
+def test_followup_refuses_parallel_work_on_ordinary_key() -> None:
+    """A forced follow-up never starts beside an ordinary flight: when the
+    key holds an ordinary (the waiter's own still-running flight, or a
+    newer one), the caller gets that non-forced flight back and must
+    report unfinished rather than spend again."""
+    table: SingleFlight[int, str] = SingleFlight()
+    ordinary, leading = table.join_or_lead(7)
+    assert leading
+    same, leading = table.followup_or_lead(ordinary, 7)
+    assert not leading and same is ordinary and not same.forced
+    table.land(7, ordinary, "ordinary-result")
+    newer, leading = table.join_or_lead(7)
+    assert leading and not newer.forced
+    blocked, leading = table.followup_or_lead(ordinary, 7)
+    assert not leading and blocked is newer and not blocked.forced
+
+
 def test_a_follower_stops_waiting_at_its_timeout() -> None:
     table: SingleFlight[str, str] = SingleFlight()
     table.join_or_lead("story")

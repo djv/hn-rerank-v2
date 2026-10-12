@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import itertools
 import json
 import logging
 import re
@@ -26,7 +27,7 @@ from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
 from clients.tui.src.hn_rerank.models import VIEWS, WINDOWS, View, Window
-from database import Database, Story
+from database import Database, ScoreQuantiles, Story
 from .config import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
@@ -37,9 +38,14 @@ from .config import (
     is_hn_source,
 )
 from . import linear_blend
+from .interleave import PRODUCTION_ARM, team_draft
+from . import joined_classifier
+from .joined_classifier import JoinedLogistic
 from .model_manifest import ModelManifest, verify_model_dir
 
 if TYPE_CHECKING:
+    from scipy.sparse import csr_matrix
+
     from ch_client import ChItem
 
 
@@ -140,7 +146,7 @@ class PrecomputedRbfSVC:
         return np.concatenate(chunks, axis=0)
 
 
-_CachedClassifier: TypeAlias = SVC | PrecomputedRbfSVC
+_CachedClassifier: TypeAlias = SVC | PrecomputedRbfSVC | JoinedLogistic
 _CachedModel = tuple[_CachedClassifier, StandardScaler, "NDArray[np.float32] | None"]
 _MODEL_CACHE: LRUCache[tuple[int, str, int], _CachedModel] = LRUCache(
     maxsize=_MODEL_CACHE_STORAGE_MAXSIZE
@@ -196,6 +202,9 @@ class _NullTrace:
     def stage(self, name: str) -> Iterator[None]:
         yield
 
+    def add_timing(self, name: str, elapsed_ms: float) -> None:
+        pass
+
     def set_count(self, name: str, value: int) -> None:
         pass
 
@@ -204,6 +213,37 @@ class _NullTrace:
 
 
 NULL_TRACE: _NullTrace = _NullTrace()
+
+
+@dataclass
+class SharedFeatures:
+    """Classifier inputs that one rerank builds once and every interleaving
+    arm reuses: they depend on the votes, vectors and feature settings
+    (``key``, from ``feature_settings``), not on the classifier."""
+
+    key: tuple[object, ...]
+    model_space: tuple[NDArray[np.float32], NDArray[np.float32]] | None = None
+    cand_features: NDArray[np.float32] | None = None
+    centers: NDArray[np.float32] | None = None
+    fb_features: NDArray[np.float32] | None = None
+    cand_word_counts: csr_matrix | None = None
+
+
+def feature_settings(config: Config) -> tuple[object, ...]:
+    """Everything besides the votes and vectors that the classifier inputs
+    of ``_score_and_rank`` depend on."""
+    m = config.model
+    return (
+        m.knn_k,
+        m.positive_cluster_k,
+        m.side_embedding_enabled,
+        m.side_embedding_min_coverage,
+        config.side_embedding_model_version,
+        m.publication_affinity_enabled,
+        m.publication_prior_strength,
+        m.engagement_features_enabled,
+        m.deduplicate_training_feedback,
+    )
 
 
 @dataclass
@@ -277,15 +317,20 @@ HN_COMMENTS_CACHE_CHAR_LIMIT = 24_000
 HOT_MIN_SCORE = 20
 TOP_MIN_SCORE = 100
 TALK_MIN_COMMENTS = 50
-# A served view holds this many stories: the 12 the clients show (VIEW_LIMIT
-# in templates/index.html and the TUI) plus 4 that slide in as cards ahead
-# of them are voted.
-VIEW_SIZE = 16
+# A served view holds this many stories: the 8 the clients show (VIEW_LIMIT
+# in templates/index.html and the TUI; 12 before 2026-10-08, user's choice)
+# plus 4 that slide in as cards ahead of them are voted.
+VIEW_SIZE = 12
 # Explore serves this many each of Unsure, Novel and Interest.
-EXPLORE_PER_BADGE = 5
+EXPLORE_PER_BADGE = 3
 # Views are picked at this multiple of their served size, so that dedup,
 # votes and stories ageing out of a window between warms leave enough.
 SELECT_MARGIN = 2
+# The shared cold deck's margin (384 per view). Until a restart's first warm
+# lands, a voter is served the cold deck less their votes; a heavy voter has
+# voted most of its top stories (2026-10-08, profile 151: 0 of 1m Popular's
+# top 32 left, a full view needed depth 297).
+COLD_DECK_MARGIN = 32
 # Windows are nested by age; "archive" is everything older than 30 days.
 # Boundaries are inclusive: a story exactly 30 days old is in "1m".
 WINDOW_SECONDS: dict[Window, int] = {
@@ -295,15 +340,17 @@ WINDOW_SECONDS: dict[Window, int] = {
     "1m": 30 * 86400,
 }
 # Popular's gravity clock per window: age counts in units of this many hours,
-# a third of the window (archive: of a year). With HN's own clock (1 hour)
-# every window's Popular was the same few stories under a day old; on the
-# 2026-09-28 snapshot this clock gives 1w a median age of a day and 1m of a
-# week. Clients mirror this table for undo.
+# a third of the window (1m: half; archive: a third of a year). With HN's own
+# clock (1 hour) every window's Popular was the same few stories under a day
+# old; on the 2026-09-28 snapshot this clock gives 1w a median age of a day.
+# 1m at a third (240) still served mostly this week's stories once a user had
+# voted on the big older ones; 360 splits the 2026-10-06 top 16 about evenly
+# between this week and 3 weeks ago. Clients mirror this table for undo.
 GRAVITY_TIME_SCALE: dict[Window, float] = {
     "12h": 4.0,
     "1d": 8.0,
     "1w": 56.0,
-    "1m": 240.0,
+    "1m": 360.0,
     "archive": 2920.0,
 }
 SOURCE_CATEGORIES: tuple[str, ...] = ("hn_live", "archive", "reddit", "rss")
@@ -356,6 +403,14 @@ class RankedStory:
     is_high_engagement: bool = False
     is_hot: bool = False
     is_interest: bool = False
+    related_upvotes: tuple[tuple[str, float], ...] = ()
+    ranking_factors: tuple[str, ...] = ()
+    # Interleaved Recommended views only: the arm whose team-draft pick put
+    # this story there (pipeline/interleave.py); "" everywhere else.
+    arm: str = ""
+    svm_margin: float | None = field(default=None, compare=False)
+    # Per-window score provenance survives canonical story-ID replacement.
+    pool_rank: PoolRank | None = field(default=None, compare=False)
 
 
 def clean_text(raw_text: str, min_len: int = 0) -> str:
@@ -593,7 +648,17 @@ def compose_story_text(
 
 
 def story_embedding_text(story: Story) -> str:
-    """Return the exact text used for the current production embedding version."""
+    """Return the exact text used for the current production embedding version.
+
+    Codex Forum rows read through their effective view (legacy mixed
+    article bodies omitted, generated footer stripped), so embedding
+    hashes follow clean inputs whatever the caller passed.
+    """
+    # Local import: pipeline.codex_forum imports this module.
+    from .codex_forum import CODEX_FORUM_SOURCE, effective_codex_story
+
+    if story.source == CODEX_FORUM_SOURCE:
+        story = effective_codex_story(story)
     if story.text_content:
         return story.text_content
     return compose_story_text(
@@ -1158,18 +1223,45 @@ def _score_and_rank(
     user_id: int | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
     score_context: RankScoreContext | None = None,
+    shared: SharedFeatures | None = None,
+    training_feedback: tuple[list[Story], list[int], list[float]] | None = None,
 ) -> list[RankedStory]:
+    """*shared* carries classifier inputs between the arms of one rerank:
+    the first call with it fills it, later calls with the same feature
+    settings reuse it (a call that needs *score_context* still builds its
+    candidate features). *training_feedback* is a
+    ``db.get_feedback_for_training`` snapshot to train on instead of
+    reading the votes again; the arms of one rerank pass the same one."""
     if not candidates:
         return []
+    share = (
+        shared
+        if shared is not None and shared.key == feature_settings(config)
+        else None
+    )
 
     now = time.time()
+    svm_margins: NDArray[np.float64] | None = None
     scores = None
     probs = None
     linear_models: linear_blend.LinearBlendModels | None = None
     linear_dense_candidates: NDArray[np.float32] | None = None
-    feedback_stories, feedback_labels, _vote_times = db.get_feedback_for_training(
-        user_id=user_id
-    )
+    if training_feedback is not None:
+        feedback_stories, feedback_labels, _vote_times = (
+            list(training_feedback[0]),
+            list(training_feedback[1]),
+            list(training_feedback[2]),
+        )
+    else:
+        feedback_stories, feedback_labels, _vote_times = db.get_feedback_for_training(
+            user_id=user_id
+        )
+    # Stored Codex Forum rows train on their effective (clean) view, like
+    # every other read path; raw rows, votes, and identities are untouched.
+    # Local import: pipeline.codex_forum imports this module.
+    from .codex_forum import effective_codex_story
+
+    feedback_stories = [effective_codex_story(s) for s in feedback_stories]
 
     if config.model.deduplicate_training_feedback:
         from .feedback import deduplicate_feedback
@@ -1229,7 +1321,9 @@ def _score_and_rank(
             # stored + side model side by side. The score context (badges,
             # attribution) stays on the stored vectors either way.
             model_cand_emb, model_fb_emb = candidate_embeddings, fb_embeddings
-            if config.model.side_embedding_enabled:
+            if share is not None and share.model_space is not None:
+                model_cand_emb, model_fb_emb = share.model_space
+            elif config.model.side_embedding_enabled:
                 from .side_embeddings import model_space
 
                 with trace.stage("side_embeddings"):
@@ -1244,6 +1338,8 @@ def _score_and_rank(
                 trace.set_label("side_embeddings", "on" if space else "off")
                 if space is not None:
                     model_cand_emb, model_fb_emb = space.candidates, space.feedback
+            if share is not None:
+                share.model_space = (model_cand_emb, model_fb_emb)
 
             if fb_sig:
                 signature = hashlib.sha256(fb_sig.encode())
@@ -1293,153 +1389,180 @@ def _score_and_rank(
             k = config.model.knn_k
             emb_dim = model_cand_emb.shape[1]
 
-            with trace.stage("svm_candidate_feature_prep"):
-                # Fused (top-k mean, max) per class — one dot pass each instead
-                # of the two _knn_similarity/_chunked_max_dot recomputed the
-                # same candidate @ feedback matrix twice.
-                cand_sim_to_up, cand_closest_up, cand_closest_up_idx = (
-                    _knn_mean_and_max(model_cand_emb, fb_up_embs, k)
-                )
-                cand_sim_to_down, cand_closest_down, _ = _knn_mean_and_max(
-                    model_cand_emb, fb_down_embs, k
-                )
-                cand_closest_neutral = _chunked_max_dot(
-                    candidate_embeddings, fb_embeddings[neutral_mask]
-                )
-                # Cluster centers depend only on up-voted feedback, so reuse the
-                # cached ones on a model-cache hit instead of rerunning KMeans.
-                if cached_model is not None and cached_model[2] is not None:
-                    positive_cluster_centers = cached_model[2]
-                else:
-                    positive_cluster_centers = _positive_cluster_centers(
-                        fb_up_embs, config.model.positive_cluster_k
+            if (
+                share is not None
+                and share.cand_features is not None
+                and share.centers is not None
+                and score_context is None
+            ):
+                cand_features = share.cand_features
+                positive_cluster_centers = share.centers
+            else:
+                with trace.stage("svm_candidate_feature_prep"):
+                    # Fused (top-k mean, max) per class — one dot pass each instead
+                    # of the two _knn_similarity/_chunked_max_dot recomputed the
+                    # same candidate @ feedback matrix twice.
+                    cand_sim_to_up, cand_closest_up, cand_closest_up_idx = (
+                        _knn_mean_and_max(model_cand_emb, fb_up_embs, k)
                     )
-                cand_positive_cluster_sim = _similarity_to_positive_cluster_centers(
-                    model_cand_emb, positive_cluster_centers
-                )
-                cand_text_lengths = np.array([len(s.text_content) for s in candidates])
-                cand_source_onehot = source_category_stack(
-                    [s.source for s in candidates]
-                )
-                cand_is_hn_live = cand_source_onehot[:, 0]
-                cand_is_archive = cand_source_onehot[:, 1]
-                cand_is_reddit = cand_source_onehot[:, 2]
-                cand_is_rss = cand_source_onehot[:, 3]
+                    cand_sim_to_down, cand_closest_down, _ = _knn_mean_and_max(
+                        model_cand_emb, fb_down_embs, k
+                    )
+                    cand_closest_neutral = _chunked_max_dot(
+                        candidate_embeddings, fb_embeddings[neutral_mask]
+                    )
+                    # Cluster centers depend only on up-voted feedback, so reuse the
+                    # cached ones on a model-cache hit instead of rerunning KMeans.
+                    if cached_model is not None and cached_model[2] is not None:
+                        positive_cluster_centers = cached_model[2]
+                    else:
+                        positive_cluster_centers = _positive_cluster_centers(
+                            fb_up_embs, config.model.positive_cluster_k
+                        )
+                    cand_positive_cluster_sim = _similarity_to_positive_cluster_centers(
+                        model_cand_emb, positive_cluster_centers
+                    )
+                    cand_text_lengths = np.array(
+                        [len(s.text_content) for s in candidates]
+                    )
+                    cand_source_onehot = source_category_stack(
+                        [s.source for s in candidates]
+                    )
+                    cand_is_hn_live = cand_source_onehot[:, 0]
+                    cand_is_archive = cand_source_onehot[:, 1]
+                    cand_is_reddit = cand_source_onehot[:, 2]
+                    cand_is_rss = cand_source_onehot[:, 3]
 
-                cand_features = _svm_personalization_features(
-                    model_cand_emb,
-                    text_lengths=cand_text_lengths,
-                    sim_to_upvoted=cand_sim_to_up,
-                    sim_to_downvoted=cand_sim_to_down,
-                    closest_upvoted=cand_closest_up,
-                    closest_downvoted=cand_closest_down,
-                    positive_cluster_similarity=cand_positive_cluster_sim,
-                    is_hn_live=cand_is_hn_live,
-                    is_archive=cand_is_archive,
-                    is_reddit=cand_is_reddit,
-                    is_rss=cand_is_rss,
-                )
-            if publication_candidates is not None:
-                cand_features = np.concatenate(
-                    [cand_features, publication_candidates], axis=1
-                )
-            if config.model.engagement_features_enabled:
-                cand_features = np.concatenate(
-                    [cand_features, _engagement_features(candidates)], axis=1
-                )
-            if score_context is not None:
-                ctx_up_embs = fb_up_embs
-                ctx_closest_up, ctx_closest_up_idx = (
-                    cand_closest_up,
-                    cand_closest_up_idx,
-                )
-                ctx_closest_down = cand_closest_down
-                if model_cand_emb is not candidate_embeddings:
-                    # Side by side: badges and attribution thresholds are
-                    # tuned on the stored vectors, so measure them there.
-                    ctx_up_embs = fb_embeddings[up_mask]
-                    _, ctx_closest_up, ctx_closest_up_idx = _knn_mean_and_max(
-                        candidate_embeddings, ctx_up_embs, k
+                    cand_features = _svm_personalization_features(
+                        model_cand_emb,
+                        text_lengths=cand_text_lengths,
+                        sim_to_upvoted=cand_sim_to_up,
+                        sim_to_downvoted=cand_sim_to_down,
+                        closest_upvoted=cand_closest_up,
+                        closest_downvoted=cand_closest_down,
+                        positive_cluster_similarity=cand_positive_cluster_sim,
+                        is_hn_live=cand_is_hn_live,
+                        is_archive=cand_is_archive,
+                        is_reddit=cand_is_reddit,
+                        is_rss=cand_is_rss,
                     )
-                    _, ctx_closest_down, _ = _knn_mean_and_max(
-                        candidate_embeddings, fb_embeddings[down_mask], k
+                if publication_candidates is not None:
+                    cand_features = np.concatenate(
+                        [cand_features, publication_candidates], axis=1
                     )
-                score_context.cand_closest_up = ctx_closest_up.astype(np.float32)
-                score_context.cand_closest_up_idx = ctx_closest_up_idx
-                score_context.fb_up_titles = [
-                    feedback_stories[i].title for i in np.flatnonzero(up_mask)
-                ]
-                score_context.fb_up_embeddings = ctx_up_embs
-                score_context.cand_closest_down = ctx_closest_down.astype(np.float32)
-                score_context.cand_closest_neutral = cand_closest_neutral.astype(
-                    np.float32
-                )
+                if config.model.engagement_features_enabled:
+                    cand_features = np.concatenate(
+                        [cand_features, _engagement_features(candidates)], axis=1
+                    )
+                if score_context is not None:
+                    ctx_up_embs = fb_up_embs
+                    ctx_closest_up, ctx_closest_up_idx = (
+                        cand_closest_up,
+                        cand_closest_up_idx,
+                    )
+                    ctx_closest_down = cand_closest_down
+                    if model_cand_emb is not candidate_embeddings:
+                        # Side by side: badges and attribution thresholds are
+                        # tuned on the stored vectors, so measure them there.
+                        ctx_up_embs = fb_embeddings[up_mask]
+                        _, ctx_closest_up, ctx_closest_up_idx = _knn_mean_and_max(
+                            candidate_embeddings, ctx_up_embs, k
+                        )
+                        _, ctx_closest_down, _ = _knn_mean_and_max(
+                            candidate_embeddings, fb_embeddings[down_mask], k
+                        )
+                    score_context.cand_closest_up = ctx_closest_up.astype(np.float32)
+                    score_context.cand_closest_up_idx = ctx_closest_up_idx
+                    score_context.fb_up_titles = [
+                        feedback_stories[i].title for i in np.flatnonzero(up_mask)
+                    ]
+                    score_context.fb_up_embeddings = ctx_up_embs
+                    score_context.cand_closest_down = ctx_closest_down.astype(
+                        np.float32
+                    )
+                    score_context.cand_closest_neutral = cand_closest_neutral.astype(
+                        np.float32
+                    )
+                if share is not None:
+                    share.cand_features = cand_features
+                    share.centers = positive_cluster_centers
 
             if cached_model is not None:
                 trace.set_label("model_cache", "hit")
                 svm, scaler, _ = cached_model
             else:
                 trace.set_label("model_cache", "miss")
-                with trace.stage("svm_training_feature_prep"):
-                    # LOOCV k-NN for training: exclude self from reference set
-                    fb_sim_to_up = np.zeros(len(model_fb_emb), dtype=np.float32)
-                    fb_sim_to_down = np.zeros(len(model_fb_emb), dtype=np.float32)
-                    if n_up > 0:
-                        up_indices = np.where(up_mask)[0]
-                        fb_sim_to_up, fb_closest_up = _loocv_knn_features(
-                            model_fb_emb, fb_up_embs, up_indices, k
+                if share is not None and share.fb_features is not None:
+                    fb_features = share.fb_features
+                else:
+                    with trace.stage("svm_training_feature_prep"):
+                        # LOOCV k-NN for training: exclude self from reference set
+                        fb_sim_to_up = np.zeros(len(model_fb_emb), dtype=np.float32)
+                        fb_sim_to_down = np.zeros(len(model_fb_emb), dtype=np.float32)
+                        if n_up > 0:
+                            up_indices = np.where(up_mask)[0]
+                            fb_sim_to_up, fb_closest_up = _loocv_knn_features(
+                                model_fb_emb, fb_up_embs, up_indices, k
+                            )
+                        else:
+                            fb_closest_up = np.zeros(
+                                len(model_fb_emb), dtype=np.float32
+                            )
+
+                        if n_down > 0:
+                            down_indices = np.where(down_mask)[0]
+                            fb_sim_to_down, fb_closest_down = _loocv_knn_features(
+                                model_fb_emb, fb_down_embs, down_indices, k
+                            )
+                        else:
+                            fb_closest_down = np.zeros(
+                                len(model_fb_emb), dtype=np.float32
+                            )
+
+                        fb_positive_cluster_sim = (
+                            _similarity_to_positive_cluster_centers(
+                                model_fb_emb, positive_cluster_centers
+                            )
                         )
-                    else:
-                        fb_closest_up = np.zeros(len(model_fb_emb), dtype=np.float32)
 
-                    if n_down > 0:
-                        down_indices = np.where(down_mask)[0]
-                        fb_sim_to_down, fb_closest_down = _loocv_knn_features(
-                            model_fb_emb, fb_down_embs, down_indices, k
+                        fb_text_lengths = np.array(
+                            [len(s.text_content) for s in feedback_stories]
                         )
-                    else:
-                        fb_closest_down = np.zeros(len(model_fb_emb), dtype=np.float32)
 
-                    fb_positive_cluster_sim = _similarity_to_positive_cluster_centers(
-                        model_fb_emb, positive_cluster_centers
-                    )
+                        # 4-binary source category one-hot per feedback story.
+                        fb_source_onehot = source_category_stack(
+                            [s.source for s in feedback_stories]
+                        )
+                        fb_is_hn_live = fb_source_onehot[:, 0]
+                        fb_is_archive = fb_source_onehot[:, 1]
+                        fb_is_reddit = fb_source_onehot[:, 2]
+                        fb_is_rss = fb_source_onehot[:, 3]
 
-                    fb_text_lengths = np.array(
-                        [len(s.text_content) for s in feedback_stories]
-                    )
+                        fb_features = _svm_personalization_features(
+                            model_fb_emb,
+                            text_lengths=fb_text_lengths,
+                            sim_to_upvoted=fb_sim_to_up,
+                            sim_to_downvoted=fb_sim_to_down,
+                            closest_upvoted=fb_closest_up,
+                            closest_downvoted=fb_closest_down,
+                            positive_cluster_similarity=fb_positive_cluster_sim,
+                            is_hn_live=fb_is_hn_live,
+                            is_archive=fb_is_archive,
+                            is_reddit=fb_is_reddit,
+                            is_rss=fb_is_rss,
+                        )
 
-                    # 4-binary source category one-hot per feedback story.
-                    fb_source_onehot = source_category_stack(
-                        [s.source for s in feedback_stories]
-                    )
-                    fb_is_hn_live = fb_source_onehot[:, 0]
-                    fb_is_archive = fb_source_onehot[:, 1]
-                    fb_is_reddit = fb_source_onehot[:, 2]
-                    fb_is_rss = fb_source_onehot[:, 3]
-
-                    fb_features = _svm_personalization_features(
-                        model_fb_emb,
-                        text_lengths=fb_text_lengths,
-                        sim_to_upvoted=fb_sim_to_up,
-                        sim_to_downvoted=fb_sim_to_down,
-                        closest_upvoted=fb_closest_up,
-                        closest_downvoted=fb_closest_down,
-                        positive_cluster_similarity=fb_positive_cluster_sim,
-                        is_hn_live=fb_is_hn_live,
-                        is_archive=fb_is_archive,
-                        is_reddit=fb_is_reddit,
-                        is_rss=fb_is_rss,
-                    )
-
-                if publication_train is not None:
-                    fb_features = np.concatenate(
-                        [fb_features, publication_train], axis=1
-                    )
-                if config.model.engagement_features_enabled:
-                    fb_features = np.concatenate(
-                        [fb_features, _engagement_features(feedback_stories)],
-                        axis=1,
-                    )
+                    if publication_train is not None:
+                        fb_features = np.concatenate(
+                            [fb_features, publication_train], axis=1
+                        )
+                    if config.model.engagement_features_enabled:
+                        fb_features = np.concatenate(
+                            [fb_features, _engagement_features(feedback_stories)],
+                            axis=1,
+                        )
+                    if share is not None:
+                        share.fb_features = fb_features
 
                 # Ensure all three classes (0, 1, 2) are present
                 missing = {0, 1, 2} - set(feedback_labels)
@@ -1475,12 +1598,22 @@ def _score_and_rank(
                 fb_features_scaled = np.hstack(
                     [fb_features[:, :emb_dim], fb_features_meta_scaled]
                 )
-                if config.model.svm_precomputed_enabled:
+                svm: _CachedClassifier
+                if config.model.classifier == "joined_logistic":
+                    svm = JoinedLogistic(
+                        c=config.model.joined_c,
+                        features=config.model.joined_features,
+                        embedding_dim=emb_dim,
+                        embedding_weight=config.model.joined_embedding_weight,
+                        numeric_scale=config.model.joined_numeric_scale,
+                        word_scale=config.model.joined_word_scale,
+                    )
+                elif config.model.svm_precomputed_enabled:
                     if config.model.svm_kernel != "rbf" or not isinstance(
                         config.model.svm_gamma, float
                     ):
                         raise ValueError("precomputed SVM requires a numeric RBF gamma")
-                    svm: _CachedClassifier = PrecomputedRbfSVC(
+                    svm = PrecomputedRbfSVC(
                         c=config.model.svm_c,
                         gamma=config.model.svm_gamma,
                         chunk_size=config.model.svm_precomputed_chunk_size,
@@ -1495,7 +1628,22 @@ def _score_and_rank(
                         decision_function_shape="ovr",
                     )
                 with trace.stage("svm_fit"):
-                    svm.fit(fb_features_scaled, labels, sample_weight=sample_weights)
+                    if isinstance(svm, JoinedLogistic):
+                        svm.fit(
+                            fb_features_scaled,
+                            labels,
+                            sample_weight=sample_weights,
+                            stories=feedback_stories,
+                            warm=joined_classifier.latest(user_id, svm.features)
+                            if user_id is not None
+                            else None,
+                        )
+                        if user_id is not None:
+                            joined_classifier.remember(user_id, svm.features, svm)
+                    else:
+                        svm.fit(
+                            fb_features_scaled, labels, sample_weight=sample_weights
+                        )
                 if config.model.linear_blend_enabled:
                     try:
                         with trace.stage("linear_blend_fit"):
@@ -1541,17 +1689,32 @@ def _score_and_rank(
             linear_dense_candidates = cand_features_scaled
             class_order = list(svm.classes_)
             idx_up = class_order.index(2)
-            with trace.stage("decision"):
-                decision = svm.decision_function(cand_features_scaled)
-            if decision.ndim == 1:
-                raw_scores = decision if class_order[-1] == 2 else -decision
-                probs = np.column_stack(
-                    [1 - _minmax01(raw_scores), _minmax01(raw_scores)]
-                )
+            if isinstance(svm, JoinedLogistic):
+                with trace.stage("decision"):
+                    counts = None
+                    if share is not None:
+                        if share.cand_word_counts is None:
+                            share.cand_word_counts = linear_blend.count_rows(candidates)
+                        counts = share.cand_word_counts
+                    probs = svm.predict_proba(
+                        cand_features_scaled, candidates, counts=counts
+                    )
+                # Rank by P(up) - P(down); the probabilities stay as fitted.
+                raw_scores = probs[:, idx_up] - probs[:, class_order.index(0)]
             else:
-                raw_scores = decision[:, idx_up]
-                probs = _softmax_rows(decision)
+                with trace.stage("decision"):
+                    decision = svm.decision_function(cand_features_scaled)
+                if decision.ndim == 1:
+                    raw_scores = decision if class_order[-1] == 2 else -decision
+                    probs = np.column_stack(
+                        [1 - _minmax01(raw_scores), _minmax01(raw_scores)]
+                    )
+                else:
+                    raw_scores = decision[:, idx_up]
+                    probs = _softmax_rows(decision)
             scores = _minmax01(raw_scores)
+            if not isinstance(svm, JoinedLogistic):
+                svm_margins = np.asarray(raw_scores, dtype=np.float64)
         except Exception as e:
             trace.set_label("svm_fit", "error")
             logging.error("Failed to fit feedback SVM: %r", e)
@@ -1644,6 +1807,7 @@ def _score_and_rank(
 
     assert scores is not None
 
+    blend_components: list[linear_blend.BlendComponent] = []
     blend_share = t3_weight if config.model.linear_blend_ramp else 1.0
     if (
         linear_models is not None
@@ -1660,10 +1824,12 @@ def _score_and_rank(
                     candidates,
                     dense_weight=config.model.linear_blend_dense_weight * blend_share,
                     tfidf_weight=config.model.linear_blend_tfidf_weight * blend_share,
+                    components=blend_components,
                 )
         except Exception as e:
             trace.set_label("linear_blend_score", "error")
             logging.error("Failed to score linear blend: %r", e)
+            blend_components.clear()
 
     ranked: list[RankedStory] = []
     if svm_probs is not None:
@@ -1680,6 +1846,9 @@ def _score_and_rank(
                         prob_down=float(svm_probs[idx, idx_down]),
                         prob_neutral=float(svm_probs[idx, idx_neutral]),
                         prob_up=float(svm_probs[idx, idx_up]),
+                        svm_margin=float(svm_margins[idx])
+                        if svm_margins is not None
+                        else None,
                     )
                 )
         except (ValueError, IndexError, NameError) as e:
@@ -1688,19 +1857,54 @@ def _score_and_rank(
             ranked = []
 
     if not ranked:
-        for s, score in zip(candidates, scores):
+        for idx, (s, score) in enumerate(zip(candidates, scores)):
             ranked.append(
                 RankedStory(
                     story=s,
                     score=float(score),
                     best_match_title="",
+                    svm_margin=float(svm_margins[idx])
+                    if svm_margins is not None
+                    else None,
                 )
             )
+
+    if blend_components:
+        ranked = [
+            replace(r, ranking_factors=ranking_factor_text(blend_components, i))
+            for i, r in enumerate(ranked)
+        ]
 
     if n_feedback == 0:
         return sorted(ranked, key=lambda x: x.story.score, reverse=True)
     else:
         return sorted(ranked, key=lambda x: x.score, reverse=True)
+
+
+def ranking_factor_text(
+    components: Sequence[linear_blend.BlendComponent],
+    row: int,
+) -> tuple[str, ...]:
+    """Actual blend terms compared with replacing each term by its midpoint.
+
+    The signed deviation is weight * (percentile - .5). This is a model-level
+    score decomposition, not an attribution to particular inputs or votes.
+    """
+    factors: list[tuple[float, str]] = []
+    for component in components:
+        percentile = float(component.percentiles[row])
+        if component.weight <= 0 or not np.isfinite(percentile):
+            continue
+        impact = component.weight * (percentile - 0.5)
+        direction = (
+            "Helped" if impact > 1e-6 else "Hurt" if impact < -1e-6 else "Neutral"
+        )
+        text = (
+            f"{direction}: {component.label} rated this at percentile {percentile * 100:.0f} "
+            f"among candidates ({component.weight * 100:.0f}% of the ranking blend)."
+        )
+        factors.append((abs(impact), text))
+    return tuple(text for _, text in sorted(factors, key=lambda item: -item[0]))
 
 
 # MMR
@@ -1769,6 +1973,45 @@ def in_window(posted: int, window: Window, now: float) -> bool:
 
 
 @dataclass(frozen=True)
+class PoolRank:
+    window_rank: int
+    global_rank: int
+
+
+@dataclass(frozen=True)
+class WindowPool:
+    """Production-score statistics before any view selection or deduplication.
+
+    Equal scores retain the stable input order used by deck assembly.
+    """
+
+    pool_size: int
+    candidates_total: int
+    quantiles: dict[str, ScoreQuantiles]
+    ranks: dict[int, PoolRank]
+
+
+def window_pool(
+    pool: Sequence[RankedStory],
+    by_score: Sequence[RankedStory],
+    global_ranks: Mapping[int, int],
+) -> WindowPool:
+    quantiles: dict[str, ScoreQuantiles] = {}
+    for metric in ("score", "svm_margin", "prob_up", "prob_down"):
+        values = [v for r in pool if (v := getattr(r, metric)) is not None]
+        if values:
+            quantiles[metric] = ScoreQuantiles(
+                *(float(v) for v in np.percentile(values, [50, 75, 90, 95, 99, 100]))
+            )
+    return WindowPool(
+        len(pool),
+        len(by_score),
+        quantiles,
+        {r.story.id: PoolRank(i, global_ranks[r.story.id]) for i, r in enumerate(pool)},
+    )
+
+
+@dataclass(frozen=True)
 class WindowViews:
     """The three views of one time window. Recommended is in model-score
     order and Popular in HN-gravity order. A cached deck's Explore is in
@@ -1779,6 +2022,7 @@ class WindowViews:
     recommended: tuple[RankedStory, ...] = ()
     popular: tuple[RankedStory, ...] = ()
     explore: tuple[RankedStory, ...] = ()
+    pool: WindowPool | None = field(default=None, compare=False)
 
     def view(self, name: View) -> tuple[RankedStory, ...]:
         if name == "recommended":
@@ -1847,6 +2091,7 @@ class WindowDeck:
                     tuple(fn(w, "recommended", views.recommended)),
                     tuple(fn(w, "popular", views.popular)),
                     tuple(fn(w, "explore", views.explore)),
+                    views.pool,
                 )
                 for w, views in self.windows.items()
             }
@@ -1856,6 +2101,10 @@ class WindowDeck:
         return self.map_views(
             lambda _w, _v, items: (r for r in items if r.story.id not in story_ids)
         )
+
+    def capped(self, n: int) -> WindowDeck:
+        """Each view's first *n* stories."""
+        return self.map_views(lambda _w, _v, items: items[:n])
 
 
 @dataclass(frozen=True)
@@ -1884,14 +2133,19 @@ def assemble_window_deck(
     explore: ExploreContext | None = None,
     is_feedback_match: Callable[[Story], bool] | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
+    arm_rankings: Mapping[str, Sequence[int]] | None = None,
+    margin: int = SELECT_MARGIN,
 ) -> WindowDeck:
     """Pick every window's three views from a fully scored candidate pool,
-    all at one *now*, each ``SELECT_MARGIN`` times its served size
+    all at one *now*, each *margin* times its served size
     (``serve_window`` caps them at request time).
 
     Per window (see ``in_window``):
 
-    - Recommended: the top stories by model score, no source quota.
+    - Recommended: the top stories by model score, no source quota. With
+      *arm_rankings* (challenger arm -> story IDs best first, over the same
+      candidates), every arm's top stories instead, in model-score order:
+      the pool ``draft_recommended`` interleaves after deduplication.
     - Popular: the top HN stories by ``hn_gravity`` on the window's clock
       (``GRAVITY_TIME_SCALE``). Each card independently gets every badge
       it qualifies for: 🔥 Hot when its velocity
@@ -1909,6 +2163,7 @@ def assemble_window_deck(
       dupes`` would drop them downstream anyway; see WORKLOG 2026-07-10).
     """
     by_score = sorted(ranked, key=lambda r: r.score, reverse=True)
+    global_ranks = {r.story.id: i for i, r in enumerate(by_score)}
     velocities = [
         r.story.score / max((now - r.story.time) / 3600.0, 0.1) for r in by_score
     ]
@@ -1993,7 +2248,7 @@ def assemble_window_deck(
                 queues[interest_of(r)].append(r)
         heads = dict.fromkeys(order, 0)
         out: list[RankedStory] = []
-        limit = EXPLORE_PER_BADGE * SELECT_MARGIN
+        limit = EXPLORE_PER_BADGE * margin
         while len(out) < limit:
             took = False
             for c in order:
@@ -2015,14 +2270,21 @@ def assemble_window_deck(
     for window in WINDOWS:
         pool = [r for r in by_score if in_window(r.story.time, window, now)]
         trace.set_count(f"window_pool_{window}", len(pool))
-        recommended = pool[: VIEW_SIZE * SELECT_MARGIN]
+        recommended = pool[: VIEW_SIZE * margin]
+        if arm_rankings:
+            in_pool = {r.story.id for r in pool}
+            tops = {r.story.id for r in recommended}
+            for ranking in arm_rankings.values():
+                own = (sid for sid in ranking if sid in in_pool)
+                tops.update(itertools.islice(own, VIEW_SIZE * margin))
+            recommended = [r for r in pool if r.story.id in tops]
         popular = sorted(
             (r for r in pool if is_hn_source(r.story.source)),
             key=lambda r: hn_gravity(
                 r.story.score, r.story.time, now, GRAVITY_TIME_SCALE[window]
             ),
             reverse=True,
-        )[: VIEW_SIZE * SELECT_MARGIN]
+        )[: VIEW_SIZE * margin]
         picked = {r.story.id for r in recommended}
         explore_view: list[RankedStory] = []
         for key, mark, needs_probs in explore_passes:
@@ -2033,15 +2295,49 @@ def assemble_window_deck(
                 and (not needs_probs or r.prob_down is not None)
             ]
             eligible.sort(key=key, reverse=True)
-            for r in take_unmatched(eligible, EXPLORE_PER_BADGE * SELECT_MARGIN):
+            for r in take_unmatched(eligible, EXPLORE_PER_BADGE * margin):
                 picked.add(r.story.id)
                 explore_view.append(mark(r))
         explore_view.extend(interest_picks(pool, recommended[:VIEW_SIZE], picked))
+        stats = window_pool(pool, by_score, global_ranks)
+
+        def with_rank(r: RankedStory) -> RankedStory:
+            return replace(r, pool_rank=stats.ranks[r.story.id])
+
         windows[window] = WindowViews(
-            tuple(recommended),
-            tuple(popular_card(r) for r in popular),
-            tuple(explore_view),
+            tuple(with_rank(r) for r in recommended),
+            tuple(with_rank(popular_card(r)) for r in popular),
+            tuple(with_rank(r) for r in explore_view),
+            stats,
         )
+    return WindowDeck(windows)
+
+
+def draft_recommended(
+    deck: WindowDeck,
+    arm_rankings: Mapping[str, Sequence[int]],
+    rng: np.random.Generator,
+) -> WindowDeck:
+    """Interleave each window's Recommended view of a finalized deck built
+    with *arm_rankings*: its stories (every arm's top stories that survived
+    deduplication and HN-dupe canonicalization, in model-score order) are
+    team-drafted from production's order and each challenger's, every card
+    tagged with its arm. Drafting after the drops keeps the arms' turns
+    balanced in what is served. A story canonicalized to another ID keeps
+    its production rank; the challengers see that ID at their own rank."""
+    arms = [PRODUCTION_ARM, *arm_rankings]
+    windows: dict[Window, WindowViews] = {}
+    for window, views in deck.windows.items():
+        by_id = {r.story.id: r for r in views.recommended}
+        orders = [list(by_id)] + [
+            [sid for sid in ranking if sid in by_id]
+            for ranking in arm_rankings.values()
+        ]
+        drafted = tuple(
+            replace(by_id[pick.item], arm=arms[pick.arm])
+            for pick in team_draft(orders, VIEW_SIZE * SELECT_MARGIN, rng)
+        )
+        windows[window] = replace(views, recommended=drafted)
     return WindowDeck(windows)
 
 
@@ -2064,6 +2360,7 @@ def serve_window(views: WindowViews, window: Window, now: float) -> WindowViews:
         tuple(current(views.recommended)[:VIEW_SIZE]),
         tuple(current(views.popular)[:VIEW_SIZE]),
         tuple(explore),
+        views.pool,
     )
 
 
@@ -2076,13 +2373,20 @@ def rerank_candidates(
     user_id: int | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
     is_feedback_match: Callable[[Story], bool] | None = None,
+    challengers: Sequence[tuple[str, Config]] = (),
+    arm_rankings_out: dict[str, list[int]] | None = None,
 ) -> WindowDeck:
     """Score candidates and pick every window's views.
 
     This wraps :func:`_score_and_rank` (tier blend + sort) and
     :func:`assemble_ranked_deck` (window views, badges, attribution).
     *is_feedback_match* is passed on to the Explore picks (see
-    :func:`assemble_window_deck`).
+    :func:`assemble_window_deck`). Each of *challengers* (arm name, its
+    config) scores the same candidates too: Recommended then holds every
+    arm's top stories, and *arm_rankings_out* receives each challenger's
+    order for ``draft_recommended``. If any challenger's classifier fails
+    to fit, the deck is production's alone and *arm_rankings_out* stays
+    empty.
 
     Use this in production; the private ``_score_and_rank`` is intended for
     tier-blend tests that need to assert on ranking without badge side effects.
@@ -2096,6 +2400,13 @@ def rerank_candidates(
             cand_embeddings = get_or_compute_embeddings(candidates, embedder, db)
 
     score_context = RankScoreContext()
+    shared = SharedFeatures(feature_settings(config)) if challengers else None
+    # One vote snapshot for every arm: a vote landing between arms made the
+    # shared vote features one row short of a later arm's labels, and that
+    # arm failed to fit (2026-10-08).
+    training_feedback = (
+        db.get_feedback_for_training(user_id=user_id) if challengers else None
+    )
     ranked = _score_and_rank(
         candidates,
         cand_embeddings,
@@ -2105,7 +2416,43 @@ def rerank_candidates(
         user_id=user_id,
         trace=trace,
         score_context=score_context,
+        shared=shared,
+        training_feedback=training_feedback,
     )
+
+    arm_rankings: dict[str, list[int]] = {}
+    for arm, challenger_config in challengers:
+        arm_trace = RankTrace()
+        with trace.stage(f"challenger_{arm}"):
+            challenger = _score_and_rank(
+                candidates,
+                cand_embeddings,
+                db,
+                challenger_config,
+                embedder,
+                user_id=user_id,
+                trace=arm_trace,
+                shared=shared,
+                training_feedback=training_feedback,
+            )
+        fitted = arm_trace.labels.get("model_cache") in {"hit", "miss"}
+        if not fitted or "svm_fit" in arm_trace.labels:
+            # A fallback ranking is gravity/centroid, not the challenger.
+            logging.error(
+                "interleave arm=%s user_id=%s did not fit (%s); serving production",
+                arm,
+                user_id,
+                arm_trace.labels,
+            )
+            arm_rankings = {}
+            break
+        trace.set_label(f"challenger_{arm}_cache", arm_trace.labels["model_cache"])
+        for stage, elapsed_ms in arm_trace.timings_ms.items():
+            trace.add_timing(f"challenger_{arm}_{stage}", elapsed_ms)
+        arm_rankings[arm] = [r.story.id for r in challenger]
+    trace.set_label("interleave", ",".join(arm_rankings) or "off")
+    if arm_rankings_out is not None:
+        arm_rankings_out.update(arm_rankings)
 
     return assemble_ranked_deck(
         ranked,
@@ -2118,6 +2465,7 @@ def rerank_candidates(
         score_context=score_context,
         trace=trace,
         is_feedback_match=is_feedback_match,
+        arm_rankings=arm_rankings,
     )
 
 
@@ -2233,20 +2581,53 @@ def _fill_best_match_titles(
         return deck
     rows = np.array([row for row, _, _ in raw.values()])
     fb_rows = np.array([fb_row for _, fb_row, _ in raw.values()])
+    # Only the served deck needs extra evidence. Reuse one centering pass
+    # for its top three neighbours, rather than scoring the whole pool again.
+    evidence: dict[int, tuple[tuple[str, float], ...]] = {}
+    similarities = cand_embeddings[rows] @ up_embeddings.T
+    nearest = np.argsort(-similarities, axis=1, kind="stable")[:, :3]
+    pair_rows = np.repeat(rows, nearest.shape[1])
+    pair_up = nearest.ravel()
     centered = centered_pair_similarity(
-        cand_embeddings, cand_embeddings[rows], up_embeddings[fb_rows]
+        cand_embeddings,
+        cand_embeddings[np.concatenate([rows, pair_rows])],
+        up_embeddings[np.concatenate([fb_rows, pair_up])],
     )
     matches = {
         story_id: (titles[fb_row], sim)
-        for (story_id, (_, fb_row, sim)), close in zip(raw.items(), centered)
+        for (story_id, (_, fb_row, sim)), close in zip(
+            raw.items(), centered[: len(rows)]
+        )
         if close >= ATTRIBUTION_CENTERED_MIN_SIM
     }
+    pair_centered = centered[len(rows) :].reshape(nearest.shape)
+    for i, story_id in enumerate(raw):
+        related: list[tuple[str, float]] = []
+        seen: set[str] = set()
+        for j, fb_row in enumerate(nearest[i]):
+            title = titles[fb_row]
+            sim = float(similarities[i, fb_row])
+            if (
+                title
+                and title not in seen
+                and np.isfinite(sim)
+                and sim >= ATTRIBUTION_MIN_SIM
+                and pair_centered[i, j] >= ATTRIBUTION_CENTERED_MIN_SIM
+            ):
+                related.append((title, sim))
+                seen.add(title)
+        evidence[story_id] = tuple(related)
 
     def fill(r: RankedStory) -> RankedStory:
         match = matches.get(r.story.id)
         if match is None:
-            return r
-        return replace(r, best_match_title=match[0], best_match_sim=match[1])
+            return replace(r, related_upvotes=evidence.get(r.story.id, ()))
+        return replace(
+            r,
+            best_match_title=match[0],
+            best_match_sim=match[1],
+            related_upvotes=evidence.get(r.story.id, ()),
+        )
 
     return deck.map_views(lambda _w, _v, items: (fill(r) for r in items))
 
@@ -2263,6 +2644,7 @@ def assemble_ranked_deck(
     score_context: RankScoreContext | None = None,
     trace: RankTrace | _NullTrace = NULL_TRACE,
     is_feedback_match: Callable[[Story], bool] | None = None,
+    arm_rankings: Mapping[str, Sequence[int]] | None = None,
 ) -> WindowDeck:
     """Pick the window views (with Explore) from an existing ranking."""
     if not candidates:
@@ -2281,6 +2663,10 @@ def assemble_ranked_deck(
             feedback_stories, feedback_labels, _ = db.get_feedback_for_training(
                 user_id=user_id
             )
+            # Effective Codex view, as in the training path above.
+            from .codex_forum import effective_codex_story
+
+            feedback_stories = [effective_codex_story(s) for s in feedback_stories]
             fb_labels_arr = np.array(feedback_labels)
             up_mask = fb_labels_arr == 2
             down_mask = fb_labels_arr == 0
@@ -2335,6 +2721,7 @@ def assemble_ranked_deck(
             ),
             is_feedback_match=is_feedback_match,
             trace=trace,
+            arm_rankings=arm_rankings,
         )
     with trace.stage("attribution"):
         return _fill_best_match_titles(deck, candidates, score_context, cand_embeddings)

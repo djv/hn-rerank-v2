@@ -428,6 +428,35 @@ def test_holdout_splits_cover_held_votes_with_prior_training(
     assert set(splits[0].train_pos) == set(np.flatnonzero(vote_times < after))
 
 
+@given(
+    times=st.lists(st.integers(0, 40), min_size=2, max_size=60),
+    after=st.integers(1, 40),
+    blocks=st.integers(1, 4),
+    limit=st.integers(1, 30),
+)
+def test_recent_training_keeps_only_the_latest_prior_votes(
+    times: list[int], after: int, blocks: int, limit: int
+) -> None:
+    from scripts.eval_ranker_variants import _holdout_splits, _recent_training
+
+    vote_times = np.array(times, dtype=np.float64)
+    if not 1 <= blocks <= len(np.unique(vote_times[vote_times >= after])):
+        return
+    splits = _holdout_splits(vote_times, after, blocks=blocks)
+
+    for full, short in zip(
+        splits, _recent_training(splits, vote_times, limit), strict=True
+    ):
+        assert short.fold_no == full.fold_no
+        np.testing.assert_array_equal(short.test_pos, full.test_pos)
+        assert len(short.train_pos) == min(limit, len(full.train_pos))
+        assert set(short.train_pos) <= set(full.train_pos)
+        dropped = sorted(set(full.train_pos) - set(short.train_pos))
+        if dropped and len(short.train_pos):
+            # Nothing dropped is newer than anything kept.
+            assert vote_times[dropped].max() <= vote_times[short.train_pos].min()
+
+
 def test_report_aggregation_shape_includes_new_metrics_and_baselines() -> None:
     from scripts.eval_ranker_variants import _aggregate_results
 

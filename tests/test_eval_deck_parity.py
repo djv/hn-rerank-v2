@@ -11,6 +11,8 @@ import pytest
 from database import Story
 from pipeline import Config, finalize_ranked_deck
 from pipeline.ranking import (
+    SELECT_MARGIN,
+    VIEW_SIZE,
     RankedStory,
     RankScoreContext,
     WindowDeck,
@@ -160,7 +162,7 @@ def test_production_interest_crosspost_suppresses_recommended_duplicate(
     views = _production_deck(deck_scenario).window("1w")
     assert any(r.is_interest and r.story.id == 999 for r in views.explore)
     assert not any(r.story.id == 1 for r in views.recommended)
-    assert len(views.recommended) == 31
+    assert len(views.recommended) == VIEW_SIZE * SELECT_MARGIN - 1
 
 
 def test_evaluation_preserves_interest_with_cached_similarities(

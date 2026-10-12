@@ -131,12 +131,12 @@ async def test_neighbour_prefetch_is_serial_and_once_per_version() -> None:
         assert sorted(fake.feed_requests()) == ["1d", "1m", "1w"]
         assert fake.peak == 1
         fake.requests.clear()
-        app.reload(manual=False)  # same version: nothing refetched
+        app.reload()  # same version: nothing refetched
         await settle(pilot)
         assert fake.feed_requests() == ["1w"]
         fake.requests.clear()
         fake.feed = sample_feed(1, 1)  # a new deck: its neighbours again
-        app.reload(manual=False)
+        app.reload()
         await settle(pilot)
         assert sorted(fake.feed_requests()) == ["1d", "1m", "1w"]
         assert {w: f.version for w, f in app.feeds.items()} == {

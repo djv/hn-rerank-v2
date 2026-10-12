@@ -105,6 +105,20 @@ class FakeServer:
             if self.counts_version is not None:
                 ready["counts_version"] = self.counts_version
             return httpx.Response(200, json=ready)
+        if path.endswith("/api/story-stats"):
+            story_id = int(request.url.params.get("story_id", "0"))
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "story_id": story_id,
+                    "points": 100,
+                    "points_live": False,
+                    "comments": 10,
+                    "comments_live": False,
+                    "reason": "unsupported_source",
+                },
+            )
         return httpx.Response(404)
 
     def feed_for(self, window: Window) -> Feed:
@@ -313,15 +327,17 @@ class FailSummaryServer(FakeServer):
         if request.url.path.endswith("/api/tldr-detail"):
             story_id = json.loads(request.content)["story_id"]
             if story_id in self.fail_ids:
-                return httpx.Response(500)
+                return httpx.Response(404)
         if "/api/tldr-cache/" in request.url.path:
             return httpx.Response(204)
         return await super().__call__(request)
 
 
-async def test_summary_failure_hides_story_until_refresh(
+async def test_summary_failure_stays_hidden_on_r(
     tmp_path: Path,
 ) -> None:
+    """r regenerates only the selected summary: a hidden story stays hidden
+    instead of being restored."""
     fake = FailSummaryServer({1})
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
@@ -339,12 +355,12 @@ async def test_summary_failure_hides_story_until_refresh(
             if asyncio.get_running_loop().time() > deadline:
                 raise AssertionError("story 2 summary did not load")
             await pilot.pause(0.05)
+        fake.requests.clear()
         app.action_refresh()
-        deadline = asyncio.get_running_loop().time() + 5.0
-        while [s.id for s in app.stories] != [1, 2]:
-            if asyncio.get_running_loop().time() > deadline:
-                raise AssertionError("refresh did not restore story 1")
-            await pilot.pause(0.05)
+        await settle(pilot)
+        assert [s.id for s in app.stories] == [2]
+        assert 1 in app.unavailable
+        assert not [r for r in fake.requests if r.url.path.endswith("/api/feed")]
 
 
 class EmptySummaryServer(FakeServer):
@@ -373,9 +389,11 @@ class EmptySummaryServer(FakeServer):
         return await super().__call__(request)
 
 
-async def test_empty_summary_hides_story_until_refresh(
+async def test_empty_summary_stays_hidden_on_r(
     tmp_path: Path,
 ) -> None:
+    """r regenerates only the selected summary: an empty story stays hidden
+    instead of being restored."""
     fake = EmptySummaryServer({1})
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
@@ -387,12 +405,13 @@ async def test_empty_summary_hides_story_until_refresh(
         assert [s.id for s in app.stories] == [2]
         assert 1 not in app.summaries  # placeholder never cached
         assert "Skipped story 1" in str(app.query_one("#status", Static).content)
+        fake.requests.clear()
         app.action_refresh()
-        deadline = asyncio.get_running_loop().time() + 5.0
-        while [s.id for s in app.stories] != [1, 2]:
-            if asyncio.get_running_loop().time() > deadline:
-                raise AssertionError("refresh did not restore story 1")
-            await pilot.pause(0.05)
+        await settle(pilot)
+        assert [s.id for s in app.stories] == [2]
+        assert 1 in app.unavailable
+        assert 1 not in app.summaries
+        assert not [r for r in fake.requests if r.url.path.endswith("/api/feed")]
 
 
 def test_open_in_browser_opens_a_tab(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -547,7 +566,7 @@ async def test_refresh_forces_only_selected_summary(tmp_path: Path) -> None:
         ]
         assert forced == [{"story_id": 1, "force_refresh": True}]
         fake.requests.clear()
-        app.reload(manual=False)
+        app.reload()
         await pilot.pause(0.8)
         assert not any(
             json.loads(r.content).get("force_refresh")
@@ -722,12 +741,22 @@ async def test_version_poll_keeps_hidden_stories_hidden(tmp_path: Path) -> None:
     async with app.run_test(size=(120, 35)) as pilot:
         await settle(pilot)
         app.unavailable.add(1)
-        app.reload(manual=False)
+        app.reload()
         await settle(pilot)
         assert [s.id for s in app.stories] == [2]
+        # r regenerates only the selected summary now: no feed refetch and
+        # hidden rows stay hidden.
+        fake.requests.clear()
         app.action_refresh()
         await settle(pilot)
-        assert [s.id for s in app.stories] == [1, 2]
+        assert [s.id for s in app.stories] == [2]
+        assert not [r for r in fake.requests if r.url.path.endswith("/api/feed")]
+        forced = [
+            json.loads(r.content)
+            for r in fake.requests
+            if r.url.path.endswith("/api/tldr-detail")
+        ]
+        assert forced == [{"story_id": 2, "force_refresh": True}]
 
 
 def test_open_in_browser_falls_back_on_launch_error(
@@ -869,6 +898,9 @@ async def test_a_opens_claude_with_story_links_else_copies_prompt(
         assert "Article: https://example.org/1" in prompt
         assert "Discussion: https://news.ycombinator.com/item?id=1" in prompt
         assert copied == []
+        assert f"Opened Claude on: {story.title}" in str(
+            app.query_one("#status", Static).content
+        )
         # No usable comments link: the prompt carries the article alone.
         bare = dataclasses.replace(story, comments_url="javascript:x")
         monkeypatch.setattr(app, "selected", lambda: bare)
@@ -931,7 +963,7 @@ async def test_failed_refresh_does_not_force_a_later_regeneration(
         app.action_refresh()
         await settle(pilot)
         fake.fail_feed = False
-        app.reload(manual=False)
+        app.reload()
         await settle(pilot)
         app.query_one(OptionList).focus()
         await pilot.press("j", "k")

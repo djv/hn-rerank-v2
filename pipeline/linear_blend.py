@@ -22,6 +22,8 @@ from sklearn.linear_model import LogisticRegression
 
 from database import Story
 
+from . import warm_store
+
 TFIDF_TEXT_CHARS = 5000
 UP, DOWN = 2, 0
 
@@ -163,6 +165,13 @@ def fit_linear_blend(
     return LinearBlendModels(dense=dense, keep=keep, idf=idf, tfidf=tfidf)
 
 
+@dataclass(frozen=True)
+class BlendComponent:
+    label: str
+    weight: float
+    percentiles: NDArray[np.float32]
+
+
 def blend_scores(
     models: LinearBlendModels,
     production: NDArray[np.floating],
@@ -171,14 +180,29 @@ def blend_scores(
     *,
     dense_weight: float,
     tfidf_weight: float,
+    components: list[BlendComponent] | None = None,
 ) -> NDArray[np.float32]:
     """Percentile-rank blend; production keeps the remaining weight."""
     x_cand = models.idf.transform(count_rows(candidates)[:, models.keep])
+    production_ranks = percentile_scores(production)
+    dense_ranks = percentile_scores(up_minus_down(models.dense, dense_candidates))
+    word_ranks = percentile_scores(up_minus_down(models.tfidf, x_cand))
+    if components is not None:
+        components.extend(
+            [
+                BlendComponent(
+                    "Nonlinear preference model",
+                    1.0 - dense_weight - tfidf_weight,
+                    production_ranks,
+                ),
+                BlendComponent("Linear preference model", dense_weight, dense_ranks),
+                BlendComponent("Word preference model", tfidf_weight, word_ranks),
+            ]
+        )
     return (
-        (1.0 - dense_weight - tfidf_weight) * percentile_scores(production)
-        + dense_weight
-        * percentile_scores(up_minus_down(models.dense, dense_candidates))
-        + tfidf_weight * percentile_scores(up_minus_down(models.tfidf, x_cand))
+        (1.0 - dense_weight - tfidf_weight) * production_ranks
+        + dense_weight * dense_ranks
+        + tfidf_weight * word_ranks
     ).astype(np.float32)
 
 
@@ -199,9 +223,55 @@ def get_cached(key: tuple[int, str, int]) -> LinearBlendModels | None:
 _LATEST: dict[int, LinearBlendModels] = {}
 
 
+def _store_name(user_id: int) -> str:
+    return f"linear_blend_{user_id}"
+
+
+def _logistic(arrays: warm_store.Arrays, prefix: str) -> LogisticRegression:
+    clf = LogisticRegression()
+    clf.coef_ = np.asarray(arrays[f"{prefix}_coef"], dtype=np.float64)
+    clf.intercept_ = np.asarray(arrays[f"{prefix}_intercept"], dtype=np.float64)
+    clf.classes_ = np.asarray(arrays[f"{prefix}_classes"])
+    return clf
+
+
+def _warm_start_arrays(models: LinearBlendModels) -> warm_store.Arrays:
+    arrays: warm_store.Arrays = {
+        "keep_size": np.array(models.keep.size),
+        "keep_index": np.flatnonzero(models.keep).astype(np.int32),
+    }
+    for prefix, clf in (("dense", models.dense), ("tfidf", models.tfidf)):
+        arrays[f"{prefix}_coef"] = clf.coef_.astype(np.float32)
+        arrays[f"{prefix}_intercept"] = clf.intercept_.astype(np.float64)
+        arrays[f"{prefix}_classes"] = clf.classes_
+    return arrays
+
+
+def _warm_start_from_arrays(arrays: warm_store.Arrays) -> LinearBlendModels | None:
+    """A fit restored only to warm-start the next one: its IDF is unfitted,
+    so it cannot score."""
+    try:
+        keep = np.zeros(int(arrays["keep_size"]), dtype=bool)
+        keep[arrays["keep_index"]] = True
+        dense, tfidf = _logistic(arrays, "dense"), _logistic(arrays, "tfidf")
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if tfidf.coef_.ndim != 2 or tfidf.coef_.shape[1] != int(keep.sum()):
+        return None
+    return LinearBlendModels(
+        dense=dense, keep=keep, idf=TfidfTransformer(), tfidf=tfidf
+    )
+
+
 def latest(user_id: int) -> LinearBlendModels | None:
+    """The user's previous fit, for warm starts only: after a restart it is
+    the saved one (:mod:`warm_store`), which cannot score."""
     with _LOCK:
-        return _LATEST.get(user_id)
+        models = _LATEST.get(user_id)
+    if models is not None:
+        return models
+    arrays = warm_store.load(_store_name(user_id))
+    return None if arrays is None else _warm_start_from_arrays(arrays)
 
 
 def set_cached(
@@ -212,6 +282,9 @@ def set_cached(
             del _CACHE[old]
         _CACHE[key] = models
         _LATEST[key[0]] = models
+    if warm_store.enabled():
+        warm_store.save(_store_name(key[0]), _warm_start_arrays(models))
+    with _LOCK:
         while len(_CACHE) > maxsize:
             evicted, _ = _CACHE.popitem()
             _LATEST.pop(evicted[0], None)

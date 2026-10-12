@@ -2251,6 +2251,20 @@ def _holdout_splits(
     ]
 
 
+def _recent_training(
+    splits: list[FoldSplit], vote_times: np.ndarray, limit: int
+) -> list[FoldSplit]:
+    """Each split trained on only its *limit* most recent training votes
+    (ties at the cutoff broken by feedback order), to see how a ranker does
+    with a short vote history; test votes are unchanged."""
+    out = []
+    for split in splits:
+        order = np.lexsort((split.train_pos, vote_times[split.train_pos]))
+        kept = np.sort(split.train_pos[order][-limit:])
+        out.append(FoldSplit(split.fold_no, kept, split.test_pos))
+    return out
+
+
 def _variant_requires_all_labels(name: str) -> bool:
     all_label_prefixes = (
         "margin3",
@@ -2332,6 +2346,15 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", help="Configuration file; defaults to config.toml")
     parser.add_argument("--output", default="eval_ranker_variants.json")
+    parser.add_argument(
+        "--dump-scores",
+        type=Path,
+        help=(
+            "Also write each fold's candidate IDs, vote labels (-1 = unjudged) "
+            "and every variant's scores here (JSON), for paired story-level "
+            "tests (scripts/compare_eval_scores.py)."
+        ),
+    )
     parser.add_argument(
         "--embeddings-file",
         help=(
@@ -2443,6 +2466,14 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             "time blocks, each trained on every vote before it"
         ),
     )
+    parser.add_argument(
+        "--train-recent",
+        type=int,
+        help=(
+            "Train each split on only its N most recent training votes "
+            "(short-history check; test votes unchanged)"
+        ),
+    )
     parser.add_argument("--now", type=float, help="Frozen evaluation Unix timestamp")
     parser.add_argument(
         "--candidate-cap-seed",
@@ -2463,6 +2494,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
         "max_candidates",
         "max_feedback_per_class",
         "window_days",
+        "train_recent",
     ):
         value = getattr(args, option)
         if value is not None and value <= 0:
@@ -2889,6 +2921,8 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             )
             for i, block in enumerate(np.array_split(reserved, args.folds), 1)
         ]
+    if args.train_recent is not None:
+        splits = _recent_training(splits, fb_vote_times, args.train_recent)
     _validate_splits(
         splits,
         y,
@@ -2917,6 +2951,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     }
 
     fold_audit: list[dict[str, int]] = []
+    score_dumps: list[dict[str, Any]] = []
 
     def _run_scorers(
         scorers: dict[str, Any],
@@ -2958,6 +2993,19 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                         "candidate_rows_after_group_isolation": len(fold.candidates),
                     }
                 )
+            dump: dict[str, Any] | None = None
+            if args.dump_scores and not label:
+                judged = {
+                    s.id: int(a)
+                    for s, a in zip(fold.test_stories, fold.test_actions, strict=True)
+                }
+                dump = {
+                    "fold": split.fold_no,
+                    "ids": [s.id for s in fold.candidates],
+                    "labels": [judged.get(s.id, -1) for s in fold.candidates],
+                    "scores": {},
+                }
+                score_dumps.append(dump)
             with _fold_database(fold, config, db) as fold_db:
                 fold = replace(fold, runtime_db=fold_db, slices=feed_slices)
                 with _reuse_preprocessing():
@@ -2965,6 +3013,8 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
                         scores, probs = (
                             scorer(fold) if fold.candidates else (np.empty(0), None)
                         )
+                        if dump is not None:
+                            dump["scores"][name] = [float(v) for v in scores]
                         results[name].append(
                             _metrics(
                                 scores,
@@ -3032,6 +3082,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             "confirmation_start": float(confirmation_start),
             "holdout_after": args.holdout_after,
             "holdout_blocks": args.holdout_blocks,
+            "train_recent": args.train_recent,
             "sampling": {
                 "max_candidates": args.max_candidates,
                 "max_feedback_per_class": args.max_feedback_per_class,
@@ -3106,6 +3157,13 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
     report["paired_differences_against_production"] = _paired_differences(combined)
     Path(args.output).write_text(json.dumps(report, indent=2, allow_nan=False))
     print(f"wrote {args.output}")
+    if args.dump_scores:
+        args.dump_scores.write_text(
+            json.dumps(
+                {"config": report["config"], "folds": score_dumps}, allow_nan=False
+            )
+        )
+        print(f"wrote {args.dump_scores}")
     for name, data in report["variants"].items():
         print(name, json.dumps(data["mean"]["raw"]))
 

@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23171717'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='monospace' font-size='22' fill='%23ff914d'%3EH%3C/text%3E%3C/svg%3E">
+  <title>HN Rerank · Reader concepts</title>
+  <style>
+    :root {
+      --bg: #171717; --panel: #1c1c1b; --lift: #232321; --hover: #2a2926;
+      --fg: #eee8dd; --muted: #aaa399; --faint: #858078; --rule: #35322e;
+      --accent: #ff914d; --selected: #33281e; --good: #a8c7a0; --blue: #8ab4f8;
+      --warn: #e5c07b; --bad: #ffb4a6; --shadow: 0 22px 90px #0008;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--fg); background: var(--bg); font-synthesis: none;
+    }
+    :root[data-theme="light"] {
+      --bg: #faf7f2; --panel: #f2ede5; --lift: #fffdf9; --hover: #e9e2d7;
+      --fg: #25221d; --muted: #665e54; --faint: #7a7369; --rule: #d9d0c3;
+      --accent: #b94c0c; --selected: #f6e6d5; --good: #39713c; --blue: #285e9e;
+      --warn: #8c6615; --bad: #aa3426; --shadow: 0 22px 90px #47341f26;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    button, input, select { font: inherit; }
+    button { color: inherit; cursor: pointer; }
+    button:disabled { opacity: .4; cursor: default; }
+    button, select, input { outline-offset: 4px; }
+    :focus-visible { outline: 2px solid var(--accent); }
+    [hidden] { display: none !important; }
+    button { border: 0; background: transparent; }
+    svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.6; vertical-align: middle; }
+    kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--rule); border-radius: 3px; padding: 3px 5px; }
+    .mono { font-family: var(--mono); }
+    .eyebrow { font: 10px var(--mono); letter-spacing: .13em; text-transform: uppercase; color: var(--faint); }
+    .app { height: 100dvh; min-height: 350px; display: grid; grid-template-rows: 62px auto auto minmax(0, 1fr) 37px; }
+    .topbar { display: flex; align-items: center; gap: 25px; padding: 0 26px; border-bottom: 1px solid var(--rule); }
+    .brand { white-space: nowrap; font-size: 18px; font-weight: 650; letter-spacing: -.5px; }
+    .brand span { color: var(--accent); }
+    .brand small { color: var(--faint); font-weight: 400; margin: 0 7px; }
+    .command-launch { max-width: 440px; flex: 1; height: 34px; border: 1px solid var(--rule); border-radius: 5px; display: flex; align-items: center; gap: 9px; padding: 0 10px; color: var(--muted); font-size: 12px; text-align: left; }
+    .command-launch kbd { margin-left: auto; padding: 1px 4px; }
+    .top-right { display: flex; align-items: center; gap: 16px; margin-left: auto; }
+    .sample-label { font: 10px var(--mono); color: var(--faint); letter-spacing: .08em; white-space: nowrap; }
+    .icon-button { width: 29px; height: 29px; color: var(--muted); border-radius: 4px; }
+    .icon-button:hover { background: var(--hover); color: var(--fg); }
+    .workspace-bar { display: flex; align-items: center; gap: 21px; min-height: 57px; padding: 0 26px; border-bottom: 1px solid var(--rule); background: var(--panel); }
+    .workspace-tabs { display: flex; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; align-self: stretch; gap: 20px; }
+    .workspace-button { position: relative; padding: 0; font-size: 12px; color: var(--muted); white-space: nowrap; }
+    .workspace-button[aria-pressed="true"] { color: var(--fg); }
+    .workspace-button[aria-pressed="true"]::after { content: ""; height: 2px; background: var(--accent); position: absolute; inset: auto 0 0; }
+    .workspace-button span { display: block; font: 10px var(--mono); color: var(--faint); margin-top: 4px; }
+    .save-view { color: var(--faint); font-size: 11px; padding: 6px 0; white-space: nowrap; }
+    .workspace-end { display: flex; gap: 13px; align-items: center; margin-left: auto; }
+    .updates-button { font-size: 11px; color: var(--good); display: flex; gap: 7px; align-items: center; white-space: nowrap; padding: 7px 9px; border: 1px solid var(--rule); border-radius: 4px; }
+    .dot { width: 5px; height: 5px; background: var(--good); border-radius: 50%; display: inline-block; }
+    .layout-switch { display: flex; padding: 3px; border: 1px solid var(--rule); border-radius: 4px; }
+    .layout-switch button { padding: 5px 8px; color: var(--faint); font-size: 10px; }
+    .layout-switch button[aria-pressed="true"] { background: var(--hover); color: var(--fg); border-radius: 2px; }
+    .filterbar { display: flex; align-items: center; gap: 16px; min-height: 43px; padding: 0 26px; border-bottom: 1px solid var(--rule); }
+    .filterbar label { color: var(--faint); font: 10px var(--mono); display: flex; align-items: center; gap: 7px; }
+    select { background: var(--bg); border: 0; color: var(--muted); font: 11px var(--mono); padding: 5px 3px; }
+    .feed-note { margin-left: auto; font: 10px var(--mono); color: var(--faint); }
+    .content { min-height: 0; display: grid; grid-template-columns: minmax(285px, 32%) minmax(0, 1fr); }
+    .story-list { overflow-y: auto; border-right: 1px solid var(--rule); scrollbar-width: thin; scrollbar-color: var(--rule) transparent; }
+    .list-heading { padding: 17px 23px 12px; display: flex; align-items: center; justify-content: space-between; }
+    .list-heading span:last-child { font: 10px var(--mono); color: var(--faint); }
+    .story-row { width: 100%; display: block; text-align: left; padding: 16px 23px 15px; border-bottom: 1px solid var(--rule); position: relative; }
+    .story-row:hover { background: var(--panel); }
+    .story-row[aria-current="true"] { background: var(--selected); }
+    .story-row[aria-current="true"]::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--accent); }
+    .story-topline { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 8px; font: 9px var(--mono); text-transform: uppercase; letter-spacing: .07em; color: var(--faint); }
+    .story-kind { color: var(--accent); }
+    .story-title { display: block; font-size: 14px; line-height: 1.4; font-weight: 550; letter-spacing: -.15px; }
+    .story-row[aria-current="true"] .story-title { color: var(--fg); }
+    .story-meta { display: grid; grid-template-columns: minmax(0, 1fr) 58px 57px; gap: 6px; margin-top: 9px; color: var(--faint); font: 10px var(--mono); font-variant-numeric: tabular-nums; }
+    .story-meta .source { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .story-meta .number { text-align: right; }
+    .row-delta { color: var(--good); font: 10px var(--mono); display: block; margin-top: 9px; }
+    .reading { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+    .reading-scroll { overflow-y: auto; padding: 32px clamp(25px, 4.4vw, 68px) 50px; scrollbar-width: thin; scrollbar-color: var(--rule) transparent; }
+    .reading-inner { max-width: 750px; margin: 0 auto; }
+    .reading-context { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 19px; }
+    .reading-context .eyebrow { color: var(--accent); }
+    .back-button { font: 10px var(--mono); color: var(--blue); padding: 0; }
+    h1 { font-size: clamp(25px, 2.45vw, 36px); line-height: 1.17; letter-spacing: -.95px; font-weight: 600; margin: 0 0 17px; }
+    .reader-meta { color: var(--muted); font: 11px var(--mono); line-height: 1.8; display: flex; gap: 13px; flex-wrap: wrap; }
+    .reader-meta .separator { color: var(--rule); }
+    .attribution { font-size: 11px; color: var(--faint); margin-top: 16px; padding: 12px 0; border-top: 1px solid var(--rule); }
+    .attribution span { color: var(--muted); }
+    .activity-strip { display: flex; gap: 11px; align-items: center; flex-wrap: wrap; padding: 10px 12px; margin: 14px 0 23px; border: 1px solid #a8c7a033; background: #a8c7a006; border-radius: 3px; font: 10px var(--mono); color: var(--good); }
+    .activity-strip .checked { color: var(--faint); margin-left: auto; }
+    .activity-strip button { color: var(--good); padding: 0; text-decoration: underline; text-underline-offset: 3px; font-size: 10px; }
+    .research-tabs { display: flex; gap: 25px; border-bottom: 1px solid var(--rule); margin-bottom: 24px; }
+    .research-tabs button { padding: 0 0 13px; color: var(--faint); font-size: 12px; border-bottom: 2px solid transparent; }
+    .research-tabs button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+    .research-tabs small { font: 9px var(--mono); margin-left: 4px; color: var(--faint); }
+    .lede { font-size: 16px; line-height: 1.7; color: var(--fg); margin: 0 0 23px; }
+    .section-label { margin: 24px 0 13px; color: var(--faint); font: 10px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .summary-points { list-style: none; margin: 0; padding: 0; }
+    .summary-points li { font-size: 14px; line-height: 1.8; margin-bottom: 15px; padding-left: 17px; position: relative; color: var(--muted); }
+    .summary-points li::before { content: "—"; color: var(--faint); position: absolute; left: 0; }
+    .summary-points strong { color: var(--fg); font-weight: 550; }
+    .takeaway { border-left: 2px solid var(--accent); padding: 4px 0 4px 17px; margin: 26px 0; color: var(--fg); font-size: 14px; line-height: 1.7; }
+    .read-time { font: 10px var(--mono); color: var(--faint); margin-top: 28px; }
+    .reading-actions { margin-top: auto; display: flex; align-items: center; padding: 13px clamp(25px, 4.4vw, 68px); border-top: 1px solid var(--rule); gap: 8px; background: var(--panel); }
+    .vote-button { font-size: 11px; padding: 9px 13px; border: 1px solid var(--rule); border-radius: 4px; white-space: nowrap; }
+    .vote-button:hover { background: var(--hover); }
+    .vote-button.positive { color: var(--good); }
+    .vote-button.negative { color: var(--bad); }
+    .vote-button kbd { border: 0; margin-left: 8px; padding: 0; }
+    .next-button { margin-left: auto; font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .next-button kbd { margin-left: 8px; }
+    .footer { border-top: 1px solid var(--rule); display: flex; align-items: center; gap: 17px; padding: 0 25px; font: 10px var(--mono); color: var(--faint); }
+    .footer .footer-right { margin-left: auto; display: flex; gap: 15px; align-items: center; }
+    .footer button { color: var(--muted); font: inherit; padding: 0; }
+    .footer b { font-weight: 400; color: var(--muted); }
+    .focus-layout .content { grid-template-columns: 1fr; }
+    .focus-layout .story-list { display: none; }
+    .focus-layout .reading-scroll { padding-top: 38px; }
+    .focus-layout .reading-actions { justify-content: center; }
+    .focus-layout .next-button { margin-left: 20px; }
+    .comment { padding: 19px 0; border-bottom: 1px solid var(--rule); }
+    .comment-header { font: 10px var(--mono); color: var(--faint); display: flex; align-items: center; gap: 9px; }
+    .comment-header .new { color: var(--good); }
+    .comment p { margin: 11px 0 0; font-size: 14px; color: var(--muted); line-height: 1.8; }
+    .new-summary { padding: 13px 15px; border: 1px solid #a8c7a033; background: #a8c7a007; border-radius: 3px; margin-bottom: 6px; font-size: 13px; line-height: 1.7; }
+    .new-summary .eyebrow { color: var(--good); display: block; margin-bottom: 7px; }
+    .related-card { display: block; width: 100%; border: 1px solid var(--rule); border-radius: 3px; padding: 17px 18px; text-align: left; margin: 12px 0; }
+    .related-card:hover { background: var(--panel); border-color: var(--faint); }
+    .related-card .eyebrow { color: var(--blue); }
+    .related-card strong { display: block; margin: 9px 0 7px; font-size: 15px; font-weight: 550; }
+    .related-card p { margin: 0; color: var(--faint); font-size: 12px; line-height: 1.6; }
+    .activity-view .reading-scroll { padding-top: 30px; }
+    .activity-intro { color: var(--muted); font-size: 14px; line-height: 1.7; }
+    .activity-overview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 24px 0; padding: 18px 0; border-block: 1px solid var(--rule); }
+    .activity-overview strong { font: 26px var(--mono); color: var(--fg); display: block; margin-bottom: 7px; }
+    .activity-overview span { font: 10px var(--mono); color: var(--faint); }
+    .activity-item { width: 100%; display: flex; text-align: left; align-items: center; gap: 17px; padding: 17px 0; border-bottom: 1px solid var(--rule); }
+    .activity-item:hover { background: var(--panel); }
+    .activity-item .activity-copy { flex: 1; }
+    .activity-item strong { font-size: 14px; font-weight: 500; line-height: 1.5; display: block; }
+    .activity-item small { color: var(--faint); font: 10px var(--mono); display: block; margin-top: 7px; }
+    .activity-item .delta { color: var(--good); font: 11px var(--mono); white-space: nowrap; }
+    .empty { padding: 30px 24px; color: var(--faint); font-size: 13px; line-height: 1.8; }
+    .overlay { position: fixed; inset: 0; z-index: 10; display: flex; justify-content: center; align-items: flex-start; padding: min(16vh, 120px) 20px 25px; background: #080808a6; backdrop-filter: blur(4px); }
+    .dialog { width: 590px; max-width: 100%; max-height: 80dvh; overflow-y: auto; background: var(--panel); border: 1px solid var(--rule); box-shadow: var(--shadow); border-radius: 7px; }
+    .palette-input-row { display: flex; align-items: center; gap: 12px; padding: 17px 18px; border-bottom: 1px solid var(--rule); color: var(--accent); }
+    .palette-input-row input { flex: 1; width: 0; background: transparent; border: 0; color: var(--fg); outline: 0; font-size: 16px; }
+    .palette-input-row input::placeholder { color: var(--faint); }
+    .palette-results { padding: 7px; max-height: 430px; overflow-y: auto; }
+    .palette-group { padding: 13px 11px 8px; }
+    .command-result { width: 100%; display: flex; align-items: center; text-align: left; gap: 14px; padding: 11px; border-radius: 4px; }
+    .command-result[aria-selected="true"] { background: var(--selected); }
+    .command-result:hover { background: var(--hover); }
+    .command-result .command-copy { min-width: 0; flex: 1; }
+    .command-result strong { display: block; font-size: 13px; font-weight: 500; line-height: 1.4; }
+    .command-result small { display: block; font-size: 11px; color: var(--faint); margin-top: 4px; }
+    .command-symbol { color: var(--accent); width: 20px; text-align: center; font: 15px var(--mono); }
+    .palette-footer { display: flex; gap: 13px; padding: 12px 18px; border-top: 1px solid var(--rule); font: 10px var(--mono); color: var(--faint); }
+    .palette-footer span:last-child { margin-left: auto; }
+    .plain-dialog { padding: 25px; width: 450px; }
+    .dialog-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+    .dialog-heading h2 { font-size: 20px; font-weight: 550; margin: 0; letter-spacing: -.4px; }
+    .plain-dialog p { font-size: 13px; color: var(--muted); line-height: 1.7; }
+    .plain-dialog label { display: block; font-size: 12px; color: var(--muted); margin: 20px 0 9px; }
+    .plain-dialog input { width: 100%; color: var(--fg); background: var(--bg); border: 1px solid var(--rule); border-radius: 4px; padding: 11px; }
+    .dialog-submit { background: var(--accent); color: var(--bg); padding: 10px 15px; font-size: 12px; font-weight: 600; border-radius: 4px; margin-top: 18px; }
+    .help-row { display: flex; justify-content: space-between; font-size: 12px; padding: 11px 0; border-bottom: 1px solid var(--rule); color: var(--muted); }
+    .toast { position: fixed; bottom: 52px; left: 50%; transform: translateX(-50%); background: var(--lift); color: var(--fg); font-size: 12px; padding: 12px 20px; border: 1px solid var(--rule); border-radius: 5px; box-shadow: var(--shadow); z-index: 20; max-width: calc(100% - 30px); text-align: center; }
+    @media (min-width: 1600px) { .content { grid-template-columns: 420px minmax(0, 1fr); } }
+    @media (max-width: 1050px) {
+      .sample-label { display: none; } .topbar { gap: 20px; }
+      .workspace-bar { gap: 15px; } .workspace-tabs { gap: 13px; }
+      .reading-scroll { padding-inline: 28px; } .reading-actions { padding-inline: 25px; }
+      .workspace-end { gap: 9px; } .updates-button { font-size: 10px; }
+      .content { grid-template-columns: 310px minmax(0, 1fr); }
+    }
+    @media (max-width: 760px) {
+      .app { grid-template-rows: 55px auto auto minmax(0, 1fr) 35px; }
+      .topbar { padding: 0 16px; gap: 15px; } .brand { font-size: 16px; }
+      .top-right { gap: 4px; } .command-launch span, .command-launch kbd { display: none; }
+      .command-launch { flex: 0 0 32px; padding: 5px; justify-content: center; margin-left: auto; }
+      .top-right { margin-left: 0; } .workspace-bar { padding: 9px 16px 0; flex-wrap: wrap; gap: 8px 16px; }
+      .workspace-tabs { min-height: 45px; gap: 18px; flex: 1; overflow-x: auto; }
+      .workspace-end { margin: 0; width: 100%; padding-bottom: 10px; justify-content: space-between; }
+      .save-view { font-size: 10px; } .filterbar { padding: 0 16px; gap: 8px; } .feed-note { display: none; }
+      .content { grid-template-columns: 1fr; grid-template-rows: 175px minmax(0, 1fr); }
+      .story-list { border-right: 0; border-bottom: 1px solid var(--rule); }
+      .list-heading { padding: 10px 17px 6px; }
+      .story-row { padding: 10px 17px; } .story-topline { margin-bottom: 4px; }
+      .story-title { font-size: 12px; } .story-meta { margin-top: 5px; } .row-delta { margin-top: 5px; }
+      .reading-scroll { padding: 23px 21px 30px; } h1 { font-size: 25px; }
+      .reading-context { margin-bottom: 13px; } .reading-context .eyebrow { font-size: 9px; }
+      .reader-meta { font-size: 10px; gap: 8px; } .attribution { font-size: 10px; }
+      .lede { font-size: 14px; } .summary-points li { font-size: 13px; }
+      .research-tabs { gap: 23px; } .reading-actions { padding: 10px 15px; gap: 6px; }
+      .vote-button { padding: 8px; font-size: 10px; } .vote-button kbd { margin-left: 4px; }
+      .next-button { font-size: 10px; } .next-button kbd { display: none; }
+      .footer { padding: 0 15px; gap: 9px; font-size: 9px; } .footer-right .footer-hint { display: none; }
+      .focus-layout .content { grid-template-rows: minmax(0, 1fr); }
+      .activity-view .content { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr); }
+      .activity-view .story-list { display: none; }
+      .activity-overview { gap: 8px; } .activity-overview strong { font-size: 21px; }
+      .activity-overview span { font-size: 9px; }
+      .activity-item { gap: 8px; } .activity-item strong { font-size: 12px; } .activity-item .delta { font-size: 9px; }
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      button { transition: background .13s, color .13s; }
+      .dialog { animation: appear .13s ease-out; }
+      @keyframes appear { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
+    }
+    @media (max-height: 650px) and (min-width: 761px) {
+      .app { grid-template-rows: 52px auto auto minmax(0, 1fr) 30px; }
+      .workspace-bar { min-height: 47px; }
+      .filterbar { min-height: 35px; }
+      .reading-scroll, .focus-layout .reading-scroll { padding-top: 18px; }
+      .reading-context { margin-bottom: 10px; }
+      h1 { font-size: 25px; margin-bottom: 11px; }
+      .attribution { display: none; }
+      .activity-strip { padding: 7px 10px; margin: 10px 0 14px; }
+      .activity-strip .checked { display: none; }
+      .research-tabs { margin-bottom: 15px; }
+      .research-tabs button { padding-bottom: 10px; }
+      .reading-actions { padding-block: 9px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <header class="topbar">
+      <div class="brand"><span>HN</span><small>/</small>Rerank</div>
+      <button class="command-launch" id="open-commands" aria-label="Search stories and commands">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+        <span>Find a story or jump to a view…</span><kbd>Ctrl K</kbd>
+      </button>
+      <div class="top-right">
+        <span class="sample-label">INTERACTIVE CONCEPT · SAMPLE DATA</span>
+        <button class="icon-button" id="toggle-theme" aria-label="Toggle light and dark theme"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg></button>
+        <button class="icon-button" id="open-help" aria-label="Keyboard shortcuts and mockup help">?</button>
+      </div>
+    </header>
+    <nav class="workspace-bar" aria-label="Saved views">
+      <div class="workspace-tabs" id="workspaces"></div>
+      <button class="save-view" id="open-save">+ Save view</button>
+      <div class="workspace-end">
+        <button class="updates-button" id="open-activity"><span class="dot"></span><span id="activity-button-label">What changed</span></button>
+        <div class="layout-switch" aria-label="Reading layout">
+          <button id="scan-layout" aria-pressed="true">Scan</button>
+          <button id="focus-layout" aria-pressed="false">Focus</button>
+        </div>
+      </div>
+    </nav>
+    <div class="filterbar">
+      <label>Sort <select id="sort"><option value="recommended">Recommended</option><option value="popular">Popular</option><option value="explore">Explore</option><option value="date">Newest</option></select></label>
+      <label>Window <select id="window"><option value="12h">12 hours</option><option value="1d" selected>24 hours</option><option value="1w">This week</option><option value="archive">Archive</option></select></label>
+      <span class="feed-note" id="feed-note">A little signal, less noise.</span>
+    </div>
+    <main class="content">
+      <aside class="story-list" aria-label="Story headlines">
+        <div class="list-heading"><span class="eyebrow" id="list-title">Your daily reading</span><span id="story-count"></span></div>
+        <div id="headlines"></div>
+      </aside>
+      <section class="reading" aria-label="Selected story" id="reading">
+        <div class="reading-scroll" id="reading-scroll"><div class="reading-inner" id="reader-content"></div></div>
+        <div class="reading-actions" id="reading-actions">
+          <button class="vote-button positive" data-vote="up">↑ Interesting <kbd>1</kbd></button>
+          <button class="vote-button" data-vote="neutral">Skip <kbd>2</kbd></button>
+          <button class="vote-button negative" data-vote="down">↓ Less like this <kbd>3</kbd></button>
+          <button class="next-button" id="next-story">Next story → <kbd>j</kbd></button>
+        </div>
+      </section>
+    </main>
+    <footer class="footer">
+      <span id="footer-status">8 stories · ready to read</span>
+      <div class="footer-right"><button id="undo-vote" hidden>Undo last vote <b>u</b></button><span class="footer-hint"><b>j / k</b> navigate</span><span class="footer-hint"><b>Enter</b> focus</span><button id="reset-demo">Reset demo</button></div>
+    </footer>
+  </div>
+  <div class="overlay" id="command-overlay" hidden>
+    <section class="dialog" role="dialog" aria-modal="true" aria-label="Stories and commands">
+      <div class="palette-input-row"><span class="mono">›</span><input id="command-input" aria-label="Find a story or command" placeholder="Where would you like to go?" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="true" aria-controls="command-results"><button id="close-commands" aria-label="Close commands"><kbd>esc</kbd></button></div>
+      <div class="palette-results" id="command-results" role="listbox"></div>
+      <div class="palette-footer"><span>↑ ↓ choose</span><span>↵ open</span><span>Try “Popular week” or “sync”</span></div>
+    </section>
+  </div>
+  <div class="overlay" id="save-overlay" hidden>
+    <form class="dialog plain-dialog" id="save-form" role="dialog" aria-modal="true" aria-labelledby="save-title">
+      <div class="dialog-heading"><h2 id="save-title">Keep this view</h2><button type="button" id="close-save" aria-label="Close save view">×</button></div>
+      <p id="save-description"></p><label for="view-name">View name</label><input id="view-name" maxlength="24" placeholder="e.g. Sunday reading" required autocomplete="off"><button class="dialog-submit" type="submit">Save view</button>
+    </form>
+  </div>
+  <div class="overlay" id="help-overlay" hidden>
+    <section class="dialog plain-dialog" role="dialog" aria-modal="true" aria-labelledby="help-title">
+      <div class="dialog-heading"><h2 id="help-title">A faster reading desk</h2><button id="close-help" aria-label="Close help">×</button></div>
+      <p>Try the command box, Daily / Weekend presets, What changed, and the Related tab. Scan keeps the headlines beside your reading; Focus gives the story the whole screen.</p>
+      <div class="help-row"><span>Stories & commands</span><kbd>Ctrl / ⌘ K</kbd></div>
+      <div class="help-row"><span>Next / previous story</span><kbd>j / k</kbd></div>
+      <div class="help-row"><span>Interesting / skip / less like this</span><kbd>1 / 2 / 3</kbd></div>
+      <div class="help-row"><span>Undo last vote</span><kbd>u</kbd></div>
+      <div class="help-row"><span>Scan / Focus</span><kbd>Enter</kbd></div>
+      <div class="help-row"><span>Article / discussion / related</span><kbd>a / c / t</kbd></div>
+      <div class="help-row"><span>What changed / return</span><kbd>w / Esc</kbd></div>
+      <p>All stories, comments and counts are illustrative. Saved views and demo votes stay in this browser; this concept does not connect to your HN profile.</p>
+    </section>
+  </div>
+  <div class="toast" role="status" id="toast" hidden></div>
+  <script>
+    'use strict';
+    const STORIES = [
+      {
+        id: 'undo', title: 'AI agents need an undo button', source: 'example.org', hours: 3,
+        points: 462, comments: 128, newComments: 24, newPoints: 96, rank: 99, kind: 'Interest',
+        match: 'Making software safe to experiment with', related: ['local', 'small', 'sqlite'],
+        lede: 'An agent that can act on your behalf should make it just as easy to inspect, reverse and learn from those actions.',
+        bullets: [
+          ['Reversibility is a product feature.', 'A reliable undo path lets people explore instead of treating every action as a permanent commitment.'],
+          ['Show the proposed change first.', 'A small, readable preview often gives the user more control than another confirmation dialog.'],
+          ['Keep a useful action history.', 'Record what changed and why, with enough context to recover the earlier state.'],
+          ['Different actions need different boundaries.', 'Editing a local draft and sending a message deserve different levels of user involvement.']
+        ],
+        takeaway: 'Trust grows when the user can understand what happened and get back to where they started.',
+        discussion: 'The newer comments move the conversation from confirmation prompts to recovery: can you actually undo a multi-step action?',
+        commentsText: [
+          ['state_machine', 'The missing piece is often the transaction boundary. If an agent edits three files, I want to undo the intent, not click undo three times.'],
+          ['small_tools', 'A preview is useful only if it shows the effect in the language the user understands. A diff works for code; it is less helpful for a calendar.'],
+          ['papertrail', 'An action log should help me recover, not just tell me which API was called. “Moved these five notes” is much more useful.']
+        ]
+      },
+      {
+        id: 'local', title: 'The surprisingly hard problem of keeping local data in sync', source: 'localfirst.example', hours: 5,
+        points: 318, comments: 89, newComments: 18, newPoints: 54, rank: 95, kind: 'Hot',
+        match: 'SQLite as an application file format', related: ['sqlite', 'undo', 'distributed'],
+        lede: 'Offline access is easy to promise. Resolving two valid edits without silently losing either one is the harder part.',
+        bullets: [
+          ['Local data should remain useful.', 'Reading and writing must work even when the network cannot be reached.'],
+          ['Conflicts are part of the interface.', 'The system needs a way to explain incompatible edits rather than pretending they never happen.'],
+          ['History is cheaper than regret.', 'Keeping earlier versions can turn a difficult merge into a recoverable decision.'],
+          ['Sync status should be specific.', '“Saved on this device” and “available on your other devices” communicate different promises.']
+        ],
+        takeaway: 'Treat synchronization as an ongoing conversation about state, with clear evidence of what is saved where.',
+        discussion: 'New replies compare automatic merging with an explicit conflict inbox. Several favor a small recovery history over a complicated merge interface.',
+        commentsText: [
+          ['offline_first', 'The scary failure is an edit that looks saved but gets overwritten two hours later. Make the recovery path obvious.'],
+          ['merge_queue', 'For a personal app, a clear conflict inbox can be better than trying to resolve every conflict invisibly.'],
+          ['version_note', 'I would trade some storage for a week of recoverable versions every time.']
+        ]
+      },
+      {
+        id: 'sqlite', title: 'Show HN: A tiny SQLite workbench in a single file', source: 'github.example', hours: 7,
+        points: 214, comments: 42, newComments: 9, newPoints: 37, rank: 92, kind: 'Novel',
+        match: 'Small tools that do one thing well', related: ['local', 'undo', 'numbers'],
+        lede: 'A small database browser focuses on the everyday loop: open a file, inspect the schema, run a query and save the useful result.',
+        bullets: [
+          ['Start from the file.', 'The workbench opens an existing database without importing it into a separate service.'],
+          ['Keep the query and result together.', 'A stable split view makes it easier to adjust a query without losing context.'],
+          ['Make changes explicit.', 'A read-only default and a visible pending-change list help distinguish exploration from editing.'],
+          ['Save the useful paths.', 'Named queries let a tiny tool become familiar without growing a large navigation system.']
+        ],
+        takeaway: 'A small, predictable tool can make a familiar workflow faster without adding another system to maintain.',
+        discussion: 'The newer comments ask for query history and a clear way to distinguish read-only exploration from updates.',
+        commentsText: [
+          ['single_binary', 'Saved queries would cover most of what I need. I do not need another dashboard builder.'],
+          ['careful_write', 'Please put the connection mode somewhere I can always see it. Read-only should look different from editing.'],
+          ['row_reader', 'Column alignment and keyboard selection matter more to me than a charting tab.']
+        ]
+      },
+      {
+        id: 'small', title: 'Small language models, large engineering trade-offs', source: 'research.example', hours: 9,
+        points: 286, comments: 76, newComments: 12, newPoints: 62, rank: 90, kind: 'Interest',
+        match: 'Running useful models on ordinary hardware', related: ['undo', 'local', 'distributed'],
+        lede: 'A smaller model can be the right choice when the task, latency budget and recovery path are all well defined.',
+        bullets: [
+          ['Measure the complete task.', 'Model quality on a benchmark is only one part of the experience.'],
+          ['Latency changes how people work.', 'A slightly weaker response that arrives immediately can support a more useful iteration loop.'],
+          ['Use the right constraints.', 'Structured inputs and a narrow output contract can make a small model easier to validate.'],
+          ['Keep a fallback path.', 'Uncertain cases should have a clear way to ask for more context or a stronger model.']
+        ],
+        takeaway: 'Match the model to a measurable job, then evaluate the whole workflow rather than the model in isolation.',
+        discussion: 'The newer replies discuss the gap between token speed and time to a usable answer, including validation and retries.',
+        commentsText: [
+          ['latency_budget', 'The number I care about is time until I can take the next step, including retries.'],
+          ['narrow_scope', 'Small models become much more useful when the job has a clear contract.'],
+          ['eval_loop', 'Test on actual failures from your own workflow before optimizing the benchmark number.']
+        ]
+      },
+      {
+        id: 'cities', title: 'What happens when a city removes parking minimums?', source: 'urbanism.example', hours: 18,
+        points: 246, comments: 91, newComments: 7, newPoints: 21, rank: 83, kind: 'Explore',
+        match: 'The hidden rules that shape a neighborhood', related: ['street', 'numbers', 'local'],
+        lede: 'A change in a zoning rule can alter which buildings are possible, long before the streets look different.',
+        bullets: [
+          ['Requirements affect project economics.', 'Mandatory parking can change the cost and feasible size of a building.'],
+          ['Removing a minimum is not a ban.', 'Builders and residents can still choose parking where it makes sense.'],
+          ['Effects take time.', 'Small infill projects and adaptive reuse can reveal the change before larger developments do.'],
+          ['Context matters.', 'Transit access, street design and local demand all influence the outcome.']
+        ],
+        takeaway: 'Look at which useful projects become possible, and follow their outcomes over time.',
+        discussion: 'New comments separate removing mandatory parking from eliminating parking altogether, and point to small projects as an early signal.',
+        commentsText: [
+          ['side_street', 'The most interesting examples are small renovations that previously could not satisfy the parking requirement.'],
+          ['walkable_blocks', 'The transit and street network still determine whether the new flexibility works well.'],
+          ['slow_change', 'A changed rule is the start of an experiment, not an immediate transformation.']
+        ]
+      },
+      {
+        id: 'numbers', title: 'Designing a typeface for a screen full of numbers', source: 'type.example', hours: 22,
+        points: 165, comments: 33, newComments: 0, newPoints: 8, rank: 80, kind: 'Novel',
+        match: 'Interfaces that make dense information readable', related: ['sqlite', 'distributed', 'street'],
+        lede: 'Reading a table is a different activity from reading a paragraph. Typography can make comparisons noticeably easier.',
+        bullets: [
+          ['Aligned figures support comparison.', 'Tabular numerals keep columns stable as values change.'],
+          ['Distinguish similar characters.', 'A clear difference between zero, O, one and lowercase l reduces small errors.'],
+          ['Use hierarchy sparingly.', 'One consistent emphasis system works better than several competing signals.'],
+          ['Density has a limit.', 'More rows help only while people can reliably read and act on them.']
+        ],
+        takeaway: 'A good dense interface lowers the work of comparison without shrinking everything on the screen.',
+        discussion: 'The discussion favors predictable column widths and quiet labels over decorative styling.',
+        commentsText: [
+          ['tabular_figures', 'Stable columns do more for scan speed than another bright color.'],
+          ['optical_size', 'Try it at the real display size. A beautiful specimen does not tell you whether a table is legible.'],
+          ['quiet_ui', 'The selected row should be obvious even when the screen is in grayscale.']
+        ]
+      },
+      {
+        id: 'distributed', title: 'Debugging distributed systems with a notebook and a timeline', source: 'systems.example', hours: 20,
+        points: 198, comments: 54, newComments: 5, newPoints: 16, rank: 78, kind: 'Interest',
+        match: 'Logs are not the same thing as a useful history', related: ['local', 'undo', 'sqlite'],
+        lede: 'A useful incident timeline connects events to decisions, rather than asking the reader to reconstruct everything from raw logs.',
+        bullets: [
+          ['Start with the visible failure.', 'Write down what the user observed before jumping to infrastructure explanations.'],
+          ['Keep the sequence explicit.', 'Clock skew and delayed delivery can make a log order misleading.'],
+          ['Separate evidence from hypotheses.', 'Each proposed explanation should point to a testable observation.'],
+          ['Preserve the path to recovery.', 'The steps that restored service can become a practical runbook.']
+        ],
+        takeaway: 'The best timeline explains what happened, what remains uncertain and which action changed the outcome.',
+        discussion: 'The newer comments discuss how much context to preserve when a transient failure disappears before it can be reproduced.',
+        commentsText: [
+          ['trace_note', 'A timeline is often the point where the team finally agrees on what actually happened.'],
+          ['causal_order', 'Delivery order is not causal order. Put that distinction directly in the investigation notes.'],
+          ['incident_reader', 'A future reader needs the recovery step, not only the root-cause theory.']
+        ]
+      },
+      {
+        id: 'street', title: 'The best streets make room for doing nothing', source: 'Design notes', hours: 23,
+        points: null, comments: null, newComments: 0, newPoints: 0, rank: 75, kind: 'Explore',
+        match: 'Public places worth spending time in', related: ['cities', 'numbers', 'local'],
+        lede: 'A street can be more than a route. Places to pause, meet and watch make it part of everyday public life.',
+        bullets: [
+          ['Small comforts add up.', 'A bench in shade can change how a person experiences an otherwise ordinary block.'],
+          ['Edges support activity.', 'Doorsteps, small shops and seating connect buildings to the public space around them.'],
+          ['Observe before redesigning.', 'Where people already pause can reveal what the street needs.'],
+          ['Make lingering welcome.', 'Comfort and accessibility matter as much as movement.']
+        ],
+        takeaway: 'Evaluate a street by what people can enjoy there, as well as how quickly they pass through.',
+        discussion: 'This sample feed story has no HN discussion. Related reading provides another path into the topic.', commentsText: []
+      },
+      {
+        id: 'archive', title: 'A field guide to software that lasts', source: 'archive.example', hours: 240,
+        points: 527, comments: 144, newComments: 0, newPoints: 0, rank: 94, kind: 'Interest',
+        match: 'Boring technology, useful products', related: ['sqlite', 'local', 'undo'],
+        lede: 'Long-lived software tends to make its assumptions, data and recovery paths understandable to the next person.',
+        bullets: [
+          ['Choose understandable foundations.', 'A familiar format can outlive the tool that originally wrote it.'],
+          ['Keep ownership clear.', 'The user should know where their data lives and how to take it elsewhere.'],
+          ['Document decisions.', 'The reason behind a constraint is often more valuable than a description of the code.'],
+          ['Design for maintenance.', 'Small, inspectable components give future changes somewhere safe to begin.']
+        ],
+        takeaway: 'Durability is a collection of practical decisions that preserve understanding and control.',
+        discussion: 'The archived conversation focuses on data ownership and keeping recovery possible.',
+        commentsText: [['file_keeper', 'A file I can open in ten years is a surprisingly strong feature.'], ['maintenance_mode', 'Leave the next person enough context to make a safe change.'], ['stable_tools', 'Simple foundations buy you room to experiment at the edges.']]
+      }
+    ];
+    const BUILTIN_VIEWS = [
+      { id: 'daily', name: 'Daily', sort: 'recommended', window: '1d', layout: 'scan' },
+      { id: 'weekend', name: 'Weekend', sort: 'popular', window: '1w', layout: 'scan' },
+      { id: 'deep', name: 'Deep dive', sort: 'explore', window: 'archive', layout: 'focus' }
+    ];
+    const STORAGE_KEY = 'hn-reader-concept-v1';
+    const SORT_LABELS = { recommended: 'Recommended', popular: 'Popular', explore: 'Explore', date: 'Newest' };
+    const WINDOW_LABELS = { '12h': '12h', '1d': '1d', '1w': '1w', archive: 'Archive' };
+    const $ = (selector) => document.querySelector(selector);
+    const escapeHTML = (value) => String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+    function readStorage() {
+      try {
+        const value = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+        return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+      } catch { return {}; }
+    }
+    const saved = readStorage();
+    const storedViews = Array.isArray(saved.views) ? saved.views.filter((view) => view && typeof view.name === 'string' && typeof view.id === 'string' && view.id.startsWith('custom-') && view.name.length <= 24 && Object.hasOwn(SORT_LABELS, view.sort) && Object.hasOwn(WINDOW_LABELS, view.window) && ['scan', 'focus'].includes(view.layout)).slice(0, 3) : [];
+    const state = {
+      selected: 'undo', sort: 'recommended', window: '1d', layout: 'scan', tab: 'article',
+      workspace: 'daily', activity: false, history: [], visited: new Set(), votes: [],
+      views: [...BUILTIN_VIEWS, ...storedViews], scroll: new Map()
+    };
+    if (saved.theme === 'light') document.documentElement.dataset.theme = 'light';
+    let toastTimer;
+    let commandEntries = [];
+    let commandIndex = 0;
+    let returnFocus = null;
+    function persist() {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ views: state.views.filter((view) => view.id.startsWith('custom-')), theme: document.documentElement.dataset.theme })); } catch { /* The mock works when storage is unavailable. */ }
+    }
+    function toast(message) {
+      clearTimeout(toastTimer); $('#toast').textContent = message; $('#toast').hidden = false;
+      toastTimer = setTimeout(() => { $('#toast').hidden = true; }, 3000);
+    }
+    function age(story) { return story.hours < 24 ? `${story.hours}h ago` : `${Math.floor(story.hours / 24)}d ago`; }
+    function currentStory() { return STORIES.find((story) => story.id === state.selected); }
+    function visibleStories() {
+      const limit = { '12h': 12, '1d': 24, '1w': 168, archive: Infinity }[state.window];
+      const voted = new Set(state.votes.map((vote) => vote.id));
+      const stories = STORIES.filter((story) => story.hours <= limit && !voted.has(story.id));
+      if (state.sort === 'popular') stories.sort((a, b) => (b.points ?? -1) - (a.points ?? -1));
+      else if (state.sort === 'date') stories.sort((a, b) => a.hours - b.hours);
+      else if (state.sort === 'explore') stories.sort((a, b) => ((a.rank * 13) % 29) - ((b.rank * 13) % 29));
+      else stories.sort((a, b) => b.rank - a.rank);
+      return stories;
+    }
+    function updates() { return STORIES.filter((story) => story.newComments > 0 && !state.visited.has(story.id)).sort((a, b) => b.newComments - a.newComments); }
+    function saveScroll() { if (!state.activity && state.selected) state.scroll.set(`${state.selected}:${state.tab}`, $('#reading-scroll').scrollTop); }
+    function setTab(tab) { saveScroll(); state.tab = tab; state.activity = false; renderReader(); $('#reading-scroll').scrollTop = state.scroll.get(`${state.selected}:${tab}`) || 0; syncChrome(); }
+    function selectStory(id, options = {}) {
+      saveScroll();
+      if (options.related && state.selected && state.selected !== id) state.history.push({ id: state.selected, tab: state.tab });
+      else if (!options.keepHistory) state.history = [];
+      state.selected = id; state.tab = options.tab || 'article'; state.activity = false;
+      render(); $('#reading-scroll').scrollTop = state.scroll.get(`${id}:${state.tab}`) || 0;
+    }
+    function returnToStory() {
+      const previous = state.history.pop();
+      if (previous) selectStory(previous.id, { tab: previous.tab, keepHistory: true });
+    }
+    function move(delta) {
+      const stories = visibleStories(); if (!stories.length) return;
+      const index = stories.findIndex((story) => story.id === state.selected);
+      const next = index < 0 ? (delta > 0 ? 0 : stories.length - 1) : (index + delta + stories.length) % stories.length;
+      selectStory(stories[next].id);
+      $(`.story-row[data-story="${state.selected}"]`)?.scrollIntoView({ block: 'nearest' });
+    }
+    function setLayout(layout) {
+      state.layout = layout; syncChrome();
+      if (state.workspace && state.views.find((view) => view.id === state.workspace)?.layout !== layout) state.workspace = null;
+      renderWorkspaces();
+    }
+    function applyView(view) {
+      saveScroll(); state.sort = view.sort; state.window = view.window; state.layout = view.layout;
+      state.workspace = view.id; state.activity = false; state.history = [];
+      if (!visibleStories().some((story) => story.id === state.selected)) state.selected = visibleStories()[0]?.id || null;
+      render(); $('#reading-scroll').scrollTop = state.scroll.get(`${state.selected}:${state.tab}`) || 0;
+    }
+    function changeFilters() {
+      saveScroll(); state.sort = $('#sort').value; state.window = $('#window').value; state.workspace = null; state.activity = false; state.history = [];
+      if (!visibleStories().some((story) => story.id === state.selected)) state.selected = visibleStories()[0]?.id || null;
+      render(); $('#reading-scroll').scrollTop = 0;
+    }
+    function renderWorkspaces() {
+      $('#workspaces').innerHTML = state.views.map((view) => `<button class="workspace-button" data-view="${escapeHTML(view.id)}" aria-pressed="${state.workspace === view.id}">${escapeHTML(view.name)}<span>${SORT_LABELS[view.sort]} · ${WINDOW_LABELS[view.window]}</span></button>`).join('');
+    }
+    function syncChrome() {
+      $('#app').classList.toggle('focus-layout', state.layout === 'focus'); $('#app').classList.toggle('activity-view', state.activity);
+      $('#scan-layout').setAttribute('aria-pressed', String(state.layout === 'scan')); $('#focus-layout').setAttribute('aria-pressed', String(state.layout === 'focus'));
+      $('#sort').value = state.sort; $('#window').value = state.window;
+      const count = updates().length;
+      $('#activity-button-label').textContent = count ? `What changed · ${count}` : 'What changed';
+      $('#open-activity').setAttribute('aria-pressed', String(state.activity));
+      $('#footer-status').textContent = `${visibleStories().length} stories · ${state.votes.length ? `${state.votes.length} demo vote${state.votes.length === 1 ? '' : 's'}` : 'ready to read'}`;
+      $('#undo-vote').hidden = !state.votes.length;
+      $('#list-title').textContent = state.workspace === 'weekend' ? 'Your weekend reading' : state.workspace === 'deep' ? 'A little further afield' : 'Your reading queue';
+      $('#story-count').textContent = String(visibleStories().length).padStart(2, '0');
+      $('#reading-actions').hidden = state.activity || !currentStory();
+      $('#feed-note').textContent = state.activity ? 'Since your last visit · sample updates' : 'A little signal, less noise.';
+    }
+    function renderList() {
+      const stories = visibleStories();
+      $('#headlines').innerHTML = stories.length ? stories.map((story) => {
+        const delta = story.newComments && !state.visited.has(story.id);
+        return `<button class="story-row" data-story="${story.id}" aria-current="${story.id === state.selected && !state.activity}">
+          <span class="story-topline"><span class="story-kind">${story.kind}</span><span>${age(story)}</span></span>
+          <span class="story-title">${escapeHTML(story.title)}</span>
+          <span class="story-meta"><span class="source">${escapeHTML(story.source)}</span><span class="number">${story.points === null ? '' : `↑ ${story.points}`}</span><span class="number">${story.comments === null ? '' : `◇ ${story.comments}`}</span></span>
+          ${delta ? `<span class="row-delta">+${story.newComments} comments since you read</span>` : ''}</button>`;
+      }).join('') : '<div class="empty">You’ve reached the end of this view.<br>Try another time window or undo a vote.</div>';
+    }
+    function articleHTML(story) {
+      return `<p class="lede">${escapeHTML(story.lede)}</p><div class="section-label">The useful parts</div><ul class="summary-points">${story.bullets.map(([heading, text]) => `<li><strong>${escapeHTML(heading)}</strong> ${escapeHTML(text)}</li>`).join('')}</ul><div class="takeaway">${escapeHTML(story.takeaway)}</div><div class="read-time">About a minute to read · illustrative summary</div>`;
+    }
+    function discussionHTML(story) {
+      const hasChanges = story.newComments && !state.visited.has(story.id);
+      return `<div class="new-summary"><span class="eyebrow">${hasChanges ? 'What’s new in the conversation' : 'The conversation'}</span>${escapeHTML(story.discussion)}</div>${story.commentsText.map(([name, text], index) => `<div class="comment"><div class="comment-header"><span>${escapeHTML(name)}</span><span>·</span><span>${index + 1}h ago</span>${hasChanges && index < 2 ? '<span class="new">new since your visit</span>' : ''}</div><p>${escapeHTML(text)}</p></div>`).join('')}<div class="read-time">Illustrative comments · these are sample conversations</div>`;
+    }
+    function relatedHTML(story) {
+      return `<p class="activity-intro">A few paths into the same ideas. Open a story and come back to exactly where you left off.</p>${story.related.map((id, index) => {
+        const related = STORIES.find((item) => item.id === id);
+        return `<button class="related-card" data-related="${id}"><span class="eyebrow">${index === 0 ? 'A closer look' : index === 1 ? 'Another perspective' : 'From your wider reading'}</span><strong>${escapeHTML(related.title)} ↗</strong><p>${escapeHTML(related.source)} · ${age(related)}<br>${escapeHTML(related.lede)}</p></button>`;
+      }).join('')}`;
+    }
+    function renderReader() {
+      if (state.activity) { renderActivity(); return; }
+      const story = currentStory();
+      if (!story) { $('#reader-content').innerHTML = '<div class="empty"><h1>A little room to breathe.</h1>No stories left in this view. Try another window or reset the demo.</div>'; return; }
+      const hasChanges = story.newComments && !state.visited.has(story.id);
+      $('#reader-content').innerHTML = `
+        <div class="reading-context"><span class="eyebrow">${story.kind} · ${escapeHTML(story.source)}</span>${state.history.length ? '<button class="back-button" id="back-to-story">← Back to your story</button>' : '<span class="eyebrow" style="color:var(--faint)">01 / reading desk</span>'}</div>
+        <h1>${escapeHTML(story.title)}</h1>
+        <div class="reader-meta">${story.points === null ? '' : `<span>${story.points} points</span><span class="separator">/</span>`}${story.comments === null ? '' : `<span>${story.comments} comments</span><span class="separator">/</span>`}<span>${age(story)}</span></div>
+        <div class="attribution">Because you upvoted <span>“${escapeHTML(story.match)}”</span></div>
+        ${hasChanges ? `<div class="activity-strip"><span>+${story.newComments} comments</span><span>+${story.newPoints} points since your visit</span><button id="inspect-changes">See discussion →</button><span class="checked">Checked just now · sample</span></div>` : '<div class="read-time" style="margin: 13px 0 23px">No unread discussion changes · sample counts</div>'}
+        <nav class="research-tabs" role="tablist" aria-label="Story research">
+          <button id="tab-article" role="tab" aria-controls="tab-content" aria-selected="${state.tab === 'article'}" data-tab="article">Article</button>
+          <button id="tab-discussion" role="tab" aria-controls="tab-content" aria-selected="${state.tab === 'discussion'}" data-tab="discussion">Discussion${hasChanges ? `<small>+${story.newComments}</small>` : ''}</button>
+          <button id="tab-related" role="tab" aria-controls="tab-content" aria-selected="${state.tab === 'related'}" data-tab="related">Related<small>3</small></button>
+        </nav>
+        <div id="tab-content" role="tabpanel" aria-labelledby="tab-${state.tab}" tabindex="0">${state.tab === 'discussion' ? discussionHTML(story) : state.tab === 'related' ? relatedHTML(story) : articleHTML(story)}</div>
+        ${state.tab === 'discussion' && hasChanges ? '<button class="save-view" id="mark-reviewed" style="color:var(--good);margin-top:20px">✓ Mark these changes as read</button>' : ''}`;
+    }
+    function showActivity() { saveScroll(); state.activity = true; render(); $('#reading-scroll').scrollTop = 0; }
+    function renderActivity() {
+      const changed = updates(); const comments = changed.reduce((total, story) => total + story.newComments, 0);
+      const points = changed.reduce((total, story) => total + story.newPoints, 0);
+      $('#reader-content').innerHTML = `<div class="reading-context"><span class="eyebrow">Since your last visit</span><button class="back-button" id="close-activity">← Back to reading</button></div><h1>The conversation<br>kept going.</h1><p class="activity-intro">Catch up on the stories you’ve already read. The useful change is the new conversation, not just a bigger number.</p><div class="activity-overview"><div><strong>${changed.length}</strong><span>discussions updated</span></div><div><strong>+${comments}</strong><span>unread comments</span></div><div><strong>+${points}</strong><span>points since your visit</span></div></div><div class="section-label">Worth another look</div>${changed.map((story) => `<button class="activity-item" data-activity-story="${story.id}"><span class="activity-copy"><strong>${escapeHTML(story.title)}</strong><small>${escapeHTML(story.source)} · ${story.comments} comments total</small></span><span class="delta">+${story.newComments} new →</span></button>`).join('') || '<p class="activity-intro">You’re caught up. Reset the demo to bring the sample changes back.</p>'}<div class="read-time">Illustrative changes · counts checked just now</div>`;
+    }
+    function render() { renderWorkspaces(); renderList(); renderReader(); syncChrome(); }
+    function vote(action) {
+      if (state.activity || !state.selected) return;
+      const id = state.selected; const title = currentStory().title;
+      const stories = visibleStories(); const index = stories.findIndex((story) => story.id === id);
+      const next = stories[(index + 1) % stories.length]?.id;
+      state.votes.push({ id, action }); state.history = [];
+      state.selected = next !== id ? next : visibleStories()[0]?.id || null; state.tab = 'article';
+      render(); $('#reading-scroll').scrollTop = 0;
+      toast(`${action === 'up' ? 'Interesting' : action === 'down' ? 'Less like this' : 'Skipped'} · demo vote only`);
+      $('#undo-vote').title = `Undo: ${title}`;
+    }
+    function undo() {
+      const last = state.votes.pop(); if (!last) return;
+      selectStory(last.id); toast('Demo vote undone');
+    }
+    function openOverlay(id) {
+      returnFocus = document.activeElement;
+      document.querySelectorAll('.overlay').forEach((overlay) => { overlay.hidden = true; });
+      $(id).hidden = false; $('#app').inert = true;
+    }
+    function closeOverlays() {
+      document.querySelectorAll('.overlay').forEach((overlay) => { overlay.hidden = true; }); $('#app').inert = false;
+      if (returnFocus?.isConnected) returnFocus.focus(); else $('#open-commands').focus();
+    }
+    function openCommands() {
+      openOverlay('#command-overlay'); $('#command-input').value = ''; commandIndex = 0; renderCommands(); $('#command-input').focus();
+    }
+    function commands() {
+      const entries = [
+        { group: 'Jump to a view', title: 'Recommended · today', hint: 'Daily · 24 hours', keywords: 'daily recommended today day 1d', symbol: '↗', run: () => applyView(BUILTIN_VIEWS[0]) },
+        { group: 'Jump to a view', title: 'Popular · this week', hint: 'Weekend · 7 days', keywords: 'popular week weekend 1w', symbol: '↗', run: () => applyView(BUILTIN_VIEWS[1]) },
+        { group: 'Jump to a view', title: 'Explore the archive', hint: 'Deep dive · focus mode', keywords: 'explore archive deep dive', symbol: '↗', run: () => applyView(BUILTIN_VIEWS[2]) },
+        { group: 'Jump to a view', title: 'What changed since your last visit', hint: `${updates().length} discussions with unread changes`, keywords: 'activity updates new changed comments since visit', symbol: '◷', key: 'w', run: showActivity },
+        { group: 'Selected story', title: 'Read the article summary', hint: 'Keep this story selected', keywords: 'article summary read', symbol: '≡', key: 'a', run: () => setTab('article') },
+        { group: 'Selected story', title: 'Read the discussion', hint: 'Catch up on the conversation', keywords: 'comments discussion thread', symbol: '◇', key: 'c', run: () => setTab('discussion') },
+        { group: 'Selected story', title: 'Find related stories', hint: 'Follow an idea without losing your place', keywords: 'related similar research context', symbol: '↔', key: 't', run: () => setTab('related') },
+        { group: 'Reader', title: 'Switch to focus mode', hint: 'Give the story the whole screen', keywords: 'focus zoom full screen', symbol: '□', run: () => setLayout('focus') },
+        { group: 'Reader', title: 'Switch to scan mode', hint: 'Headlines and reading, side by side', keywords: 'scan layout list split', symbol: '▥', run: () => setLayout('scan') },
+        { group: 'Reader', title: 'Save the current view', hint: 'Keep your sort, window and layout', keywords: 'save workspace preset view', symbol: '+', run: openSave }
+      ];
+      state.views.filter((view) => view.id.startsWith('custom-')).forEach((view) => entries.push({ group: 'Jump to a view', title: view.name, hint: `${SORT_LABELS[view.sort]} · ${WINDOW_LABELS[view.window]}`, keywords: view.name.toLowerCase(), symbol: '↗', run: () => applyView(view) }));
+      STORIES.forEach((story) => entries.push({ group: 'Find a story', title: story.title, hint: `${story.source} · ${age(story)}`, keywords: `${story.title} ${story.source}`.toLowerCase(), symbol: '→', run: () => { if (state.votes.some((vote) => vote.id === story.id)) state.votes = state.votes.filter((vote) => vote.id !== story.id); if (story.hours > ({ '12h': 12, '1d': 24, '1w': 168, archive: Infinity }[state.window])) { state.window = 'archive'; state.workspace = null; } selectStory(story.id); } }));
+      return entries;
+    }
+    function renderCommands() {
+      const terms = $('#command-input').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const all = commands(); commandEntries = terms.length ? all.filter((entry) => terms.every((term) => `${entry.title} ${entry.keywords} ${entry.hint}`.toLowerCase().includes(term))) : all.filter((entry) => entry.group !== 'Find a story');
+      if (commandIndex >= commandEntries.length) commandIndex = Math.max(0, commandEntries.length - 1);
+      let lastGroup = '';
+      $('#command-results').innerHTML = commandEntries.length ? commandEntries.map((entry, index) => {
+        const heading = entry.group !== lastGroup ? `<div class="palette-group eyebrow">${entry.group}</div>` : ''; lastGroup = entry.group;
+        return `${heading}<button class="command-result" id="command-${index}" role="option" tabindex="-1" aria-selected="${index === commandIndex}" data-command="${index}"><span class="command-symbol">${entry.symbol}</span><span class="command-copy"><strong>${escapeHTML(entry.title)}</strong><small>${escapeHTML(entry.hint)}</small></span>${entry.key ? `<kbd>${entry.key}</kbd>` : ''}</button>`;
+      }).join('') : '<div class="empty">No matches. Try “Popular week,” “discussion,” or part of a headline.</div>';
+      if (commandEntries.length) $('#command-input').setAttribute('aria-activedescendant', `command-${commandIndex}`); else $('#command-input').removeAttribute('aria-activedescendant');
+    }
+    function runCommand(index) { const entry = commandEntries[index]; if (!entry) return; closeOverlays(); entry.run(); }
+    function openSave() {
+      if (state.views.filter((view) => view.id.startsWith('custom-')).length >= 3) { toast('Three custom views saved. Reset the demo to start fresh.'); return; }
+      openOverlay('#save-overlay'); $('#save-description').textContent = `${SORT_LABELS[state.sort]} · ${WINDOW_LABELS[state.window]} · ${state.layout === 'scan' ? 'Scan layout' : 'Focus layout'}`;
+      $('#view-name').value = ''; $('#view-name').focus();
+    }
+    $('#open-commands').addEventListener('click', openCommands);
+    $('#close-commands').addEventListener('click', closeOverlays);
+    $('#command-input').addEventListener('input', () => { commandIndex = 0; renderCommands(); });
+    $('#command-results').addEventListener('click', (event) => { const result = event.target.closest('[data-command]'); if (result) runCommand(Number(result.dataset.command)); });
+    $('#workspaces').addEventListener('click', (event) => { const view = event.target.closest('[data-view]'); if (view) applyView(state.views.find((item) => item.id === view.dataset.view)); });
+    $('#headlines').addEventListener('click', (event) => { const story = event.target.closest('[data-story]'); if (story) selectStory(story.dataset.story); });
+    $('#reader-content').addEventListener('click', (event) => {
+      const tab = event.target.closest('[data-tab]'); if (tab) { setTab(tab.dataset.tab); $(`#tab-${tab.dataset.tab}`)?.focus(); return; }
+      const related = event.target.closest('[data-related]'); if (related) { selectStory(related.dataset.related, { related: true }); return; }
+      const activityStory = event.target.closest('[data-activity-story]'); if (activityStory) { selectStory(activityStory.dataset.activityStory, { tab: 'discussion' }); return; }
+      if (event.target.closest('#back-to-story')) returnToStory();
+      if (event.target.closest('#inspect-changes')) setTab('discussion');
+      if (event.target.closest('#close-activity')) { state.activity = false; render(); $('#reading-scroll').scrollTop = state.scroll.get(`${state.selected}:${state.tab}`) || 0; }
+      if (event.target.closest('#mark-reviewed')) { state.visited.add(state.selected); const position = $('#reading-scroll').scrollTop; render(); $('#reading-scroll').scrollTop = position; toast('Discussion changes marked as read'); }
+    });
+    $('#sort').addEventListener('change', changeFilters); $('#window').addEventListener('change', changeFilters);
+    $('#scan-layout').addEventListener('click', () => setLayout('scan')); $('#focus-layout').addEventListener('click', () => setLayout('focus'));
+    $('#open-activity').addEventListener('click', showActivity); $('#open-save').addEventListener('click', openSave);
+    $('#close-save').addEventListener('click', closeOverlays); $('#close-help').addEventListener('click', closeOverlays);
+    $('#open-help').addEventListener('click', () => { openOverlay('#help-overlay'); $('#close-help').focus(); });
+    $('#next-story').addEventListener('click', () => move(1)); $('#undo-vote').addEventListener('click', undo);
+    document.querySelectorAll('[data-vote]').forEach((button) => button.addEventListener('click', () => vote(button.dataset.vote)));
+    $('#toggle-theme').addEventListener('click', () => { document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; persist(); });
+    $('#save-form').addEventListener('submit', (event) => {
+      event.preventDefault(); const name = $('#view-name').value.trim(); if (!name) { $('#view-name').focus(); return; }
+      const view = { id: `custom-${Date.now()}`, name, sort: state.sort, window: state.window, layout: state.layout };
+      state.views.push(view); state.workspace = view.id; persist(); closeOverlays(); renderWorkspaces(); toast(`Saved “${name}”`);
+    });
+    $('#reset-demo').addEventListener('click', () => {
+      state.votes = []; state.visited.clear(); state.history = []; state.scroll.clear(); state.views = [...BUILTIN_VIEWS]; state.selected = 'undo'; state.tab = 'article';
+      persist(); applyView(BUILTIN_VIEWS[0]); state.scroll.clear(); $('#reading-scroll').scrollTop = 0; toast('Sample stories and views reset');
+    });
+    document.querySelectorAll('.overlay').forEach((overlay) => overlay.addEventListener('click', (event) => { if (event.target === overlay) closeOverlays(); }));
+    document.addEventListener('keydown', (event) => {
+      const open = [...document.querySelectorAll('.overlay')].find((overlay) => !overlay.hidden);
+      if (open) {
+        if (event.key === 'Escape') { event.preventDefault(); closeOverlays(); return; }
+        if (event.key === 'Tab') {
+          const focusable = [...open.querySelectorAll('button:not([disabled]), input, [tabindex="0"]')].filter((element) => element.tabIndex >= 0);
+          const first = focusable[0]; const last = focusable.at(-1);
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+          return;
+        }
+        if (open.id === 'command-overlay') {
+          if (['ArrowDown', 'ArrowUp'].includes(event.key) && commandEntries.length) { event.preventDefault(); commandIndex = (commandIndex + (event.key === 'ArrowDown' ? 1 : -1) + commandEntries.length) % commandEntries.length; renderCommands(); $(`#command-${commandIndex}`)?.scrollIntoView({ block: 'nearest' }); }
+          if (event.key === 'Enter' && document.activeElement === $('#command-input')) { event.preventDefault(); runCommand(commandIndex); }
+        }
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); openCommands(); return; }
+      if (event.ctrlKey || event.metaKey || event.altKey || event.repeat || event.target.closest('input, select, textarea, [contenteditable="true"]')) return;
+      const focusedTab = event.target.closest('[role="tab"]');
+      if (focusedTab && ['ArrowLeft', 'ArrowRight'].includes(event.key)) {
+        event.preventDefault(); const tabs = ['article', 'discussion', 'related'];
+        const tab = tabs[(tabs.indexOf(state.tab) + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
+        setTab(tab); $(`#tab-${tab}`)?.focus(); return;
+      }
+      if (['Enter', ' '].includes(event.key) && event.target.closest('button, [role="tabpanel"]')) return;
+      const actions = { j: () => move(1), k: () => move(-1), '1': () => vote('up'), '2': () => vote('neutral'), '3': () => vote('down'), u: undo, a: () => setTab('article'), c: () => setTab('discussion'), t: () => setTab('related'), w: showActivity, '/': openCommands, '?': () => { openOverlay('#help-overlay'); $('#close-help').focus(); }, Enter: () => setLayout(state.layout === 'scan' ? 'focus' : 'scan'), Escape: () => { if (state.activity) { state.activity = false; render(); $('#reading-scroll').scrollTop = state.scroll.get(`${state.selected}:${state.tab}`) || 0; } else if (state.history.length) returnToStory(); else setLayout('scan'); } };
+      if (actions[event.key]) { event.preventDefault(); actions[event.key](); }
+    });
+    render();
+  </script>
+</body>
+</html>

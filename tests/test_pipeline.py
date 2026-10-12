@@ -62,6 +62,8 @@ from pipeline.ranking import (
     serve_window,
 )
 from pipeline.hn_dupes import HnDupeResolver
+from pipeline.config import RedditSource
+from reddit_fetch_queue import CoroFactory
 from clients.tui.src.hn_rerank.models import WINDOWS, Window
 
 # Recommended picks kept per window before serving caps them at VIEW_SIZE:
@@ -1063,9 +1065,19 @@ async def test_rss_feed_retains_full_content_body(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fallback_error",
+    [
+        "url_error",
+        # urllib's read timeout escapes as a bare TimeoutError (2026-10-08).
+        "read_timeout",
+    ],
+)
 async def test_fetch_and_parse_feed_transport_error_logs_warning_not_error(
-    monkeypatch, caplog
-):
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fallback_error: str,
+) -> None:
     """A transport error that survives the urllib fallback too (genuine
     network-down) is expected/transient -- logged at WARNING with no
     traceback, not ERROR. Regression for the 2026-08-27 fix: previously
@@ -1096,8 +1108,13 @@ async def test_fetch_and_parse_feed_transport_error_logs_warning_not_error(
             raise httpx.RemoteProtocolError("peer closed connection")
 
     monkeypatch.setattr("pipeline.enrichment.httpx.AsyncClient", MockClient)
+    error: Exception = (
+        URLError("down")
+        if fallback_error == "url_error"
+        else TimeoutError("The read operation timed out")
+    )
     monkeypatch.setattr(
-        "http_fetch.urlopen", lambda *a, **k: (_ for _ in ()).throw(URLError("down"))
+        "http_fetch.urlopen", lambda *a, **k: (_ for _ in ()).throw(error)
     )
 
     stories = await _fetch_and_parse_feed(
@@ -4629,7 +4646,8 @@ def test_hot_badge_requires_minimum_score(db, embedder):
             source="hn",
             comment_count=0,
         )
-        for i in range(1, 26)
+        # Fewer than a Popular view's picks, so story 99 is always kept.
+        for i in range(1, RECOMMENDED_PICKS - 3)
     ]
     candidates.append(
         Story(
@@ -5495,7 +5513,13 @@ def test_fetch_candidates_only_persists_topfeed_before_prewarm(
             comment_count=0,
         )
 
-        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_topfeed_factories(
+            feeds: list[str],
+            per_feed: int,
+            days: int,
+            exclude_urls: set[str],
+            reddit_source: RedditSource = "rss",
+        ) -> tuple[list[CoroFactory], list[str]]:
             from reddit_feed_cache import cache as reddit_feed_cache
 
             # The real topfeed factory writes to the cache when called by
@@ -5511,7 +5535,9 @@ def test_fetch_candidates_only_persists_topfeed_before_prewarm(
 
         captured_factory_ids: list[list[int]] = []
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(
+            story_ids: list[int], db_: Database, reddit_source: RedditSource = "rss"
+        ) -> tuple[list[CoroFactory], list[int]]:
             captured_factory_ids.append(list(story_ids))
 
             async def noop() -> None:
@@ -5604,7 +5630,13 @@ def test_fetch_candidates_only_caps_reddit_prewarm(monkeypatch) -> None:
             for i in range(3)
         ]
 
-        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_topfeed_factories(
+            feeds: list[str],
+            per_feed: int,
+            days: int,
+            exclude_urls: set[str],
+            reddit_source: RedditSource = "rss",
+        ) -> tuple[list[CoroFactory], list[str]]:
             from reddit_feed_cache import cache as reddit_feed_cache
 
             for feed_url, story_set in zip(feeds, (stories_a, stories_b)):
@@ -5617,7 +5649,9 @@ def test_fetch_candidates_only_caps_reddit_prewarm(monkeypatch) -> None:
 
         captured_factory_ids: list[list[int]] = []
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(
+            story_ids: list[int], db_: Database, reddit_source: RedditSource = "rss"
+        ) -> tuple[list[CoroFactory], list[int]]:
             captured_factory_ids.append(list(story_ids))
 
             async def noop() -> None:
@@ -5700,7 +5734,13 @@ def test_fetch_candidates_only_skips_already_hydrated_reddit(monkeypatch) -> Non
         )
         db.upsert_story(already_hydrated)
 
-        def fake_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_topfeed_factories(
+            feeds: list[str],
+            per_feed: int,
+            days: int,
+            exclude_urls: set[str],
+            reddit_source: RedditSource = "rss",
+        ) -> tuple[list[CoroFactory], list[str]]:
             from reddit_feed_cache import cache as reddit_feed_cache
 
             reddit_feed_cache.set(feeds[0], [already_hydrated, new_story])
@@ -5712,7 +5752,9 @@ def test_fetch_candidates_only_skips_already_hydrated_reddit(monkeypatch) -> Non
 
         captured_factory_ids: list[list[int]] = []
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(
+            story_ids: list[int], db_: Database, reddit_source: RedditSource = "rss"
+        ) -> tuple[list[CoroFactory], list[int]]:
             captured_factory_ids.append(list(story_ids))
 
             async def noop() -> None:
@@ -6050,12 +6092,20 @@ def test_fetch_candidates_only_prewarms_top_n_per_sub_from_cache(
 
         captured_ids: list[list[int]] = []
 
-        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_build_reddit_topfeed_factories(
+            feeds: list[str],
+            per_feed: int,
+            days: int,
+            exclude_urls: set[str],
+            reddit_source: RedditSource = "rss",
+        ) -> tuple[list[CoroFactory], list[str]]:
             # Return no factories (we use the cache directly), but
             # return the feed URLs so the prewarm phase can read them.
             return [], feed_urls
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(
+            story_ids: list[int], db_: Database, reddit_source: RedditSource = "rss"
+        ) -> tuple[list[CoroFactory], list[int]]:
             captured_ids.append(list(story_ids))
             return [], []
 
@@ -6134,10 +6184,18 @@ def test_fetch_candidates_only_skips_reddit_prewarm_when_disabled(
 
         captured_ids: list[list[int]] = []
 
-        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_build_reddit_topfeed_factories(
+            feeds: list[str],
+            per_feed: int,
+            days: int,
+            exclude_urls: set[str],
+            reddit_source: RedditSource = "rss",
+        ) -> tuple[list[CoroFactory], list[str]]:
             return [], feed_urls
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(
+            story_ids: list[int], db_: Database, reddit_source: RedditSource = "rss"
+        ) -> tuple[list[CoroFactory], list[int]]:
             captured_ids.append(list(story_ids))
             return [], []
 
@@ -6198,10 +6256,18 @@ def test_fetch_candidates_only_skips_reddit_prewarm_with_empty_cache(
 
         captured_ids: list[list[int]] = []
 
-        def fake_build_reddit_topfeed_factories(feeds, per_feed, days, exclude_urls):
+        def fake_build_reddit_topfeed_factories(
+            feeds: list[str],
+            per_feed: int,
+            days: int,
+            exclude_urls: set[str],
+            reddit_source: RedditSource = "rss",
+        ) -> tuple[list[CoroFactory], list[str]]:
             return [], feed_urls
 
-        def fake_build_reddit_prewarm_factories(story_ids, db_):
+        def fake_build_reddit_prewarm_factories(
+            story_ids: list[int], db_: Database, reddit_source: RedditSource = "rss"
+        ) -> tuple[list[CoroFactory], list[int]]:
             captured_ids.append(list(story_ids))
             return [], []
 
@@ -7314,6 +7380,42 @@ def test_fill_best_match_titles_happy_path() -> None:
     assert [r.best_match_sim for r in out] == pytest.approx([0.9, 0.8, 0.9])
 
 
+def test_related_upvotes_are_bounded_distinct_and_centered() -> None:
+    rng = np.random.default_rng(42)
+    pool = _f2_unit(rng, 80)
+    candidate = pool[0]
+    ups = np.vstack([candidate, candidate, candidate, -candidate]).astype(np.float32)
+    ctx = ranking.RankScoreContext(
+        cand_closest_up=np.ones(len(pool), dtype=np.float32),
+        cand_closest_up_idx=np.zeros(len(pool), dtype=np.int64),
+        fb_up_titles=["First", "First", "Second", "Unrelated"],
+        fb_up_embeddings=ups,
+    )
+    cands = [_f2_story(i + 10) for i in range(len(pool))]
+    deck = ranking._fill_best_match_titles(_f2_ranked([10]), cands, ctx, pool)
+    item = deck.window("1w").recommended[0]
+    assert [title for title, _ in item.related_upvotes] == ["First", "Second"]
+    assert all(sim == pytest.approx(1.0) for _, sim in item.related_upvotes)
+
+
+def test_ranking_factors_use_signed_weighted_midpoint_deviation() -> None:
+    from pipeline.linear_blend import BlendComponent
+
+    factors = ranking.ranking_factor_text(
+        [
+            BlendComponent("Base", 0.5, np.array([0.8], dtype=np.float32)),
+            BlendComponent("Content", 0.2, np.array([0.1], dtype=np.float32)),
+            BlendComponent("Words", 0.3, np.array([0.5], dtype=np.float32)),
+            BlendComponent("Disabled", 0.0, np.array([1.0], dtype=np.float32)),
+        ],
+        0,
+    )
+    assert len(factors) == 3
+    assert factors[0].startswith("Helped: Base") and "50%" in factors[0]
+    assert factors[1].startswith("Hurt: Content") and "20%" in factors[1]
+    assert factors[2].startswith("Neutral: Words")
+
+
 def test_attribution_skips_matches_that_only_share_the_pool_direction() -> None:
     """Long texts share a direction in the pool, so unrelated stories can
     match closely (a ghc-debug post and an AINews digest: 0.64). A card
@@ -7354,6 +7456,7 @@ def test_attribution_skips_matches_that_only_share_the_pool_direction() -> None:
     deck = ranking._fill_best_match_titles(_f2_ranked([10, 11]), cands, ctx, cand_emb)
     out = list(deck.window("1w").recommended)
     assert [r.best_match_title for r in out] == ["", "Related post"]
+    assert out[0].related_upvotes == ()
     # The named upvote and its similarity are the raw ones.
     assert out[1].best_match_sim == pytest.approx(raw[1])
 
@@ -7371,7 +7474,13 @@ def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
             score=1.0,
             best_match_title=f"Up {sid}",
             best_match_sim=sim,
-            **flags,
+            related_upvotes=((f"Up {sid}", sim),),
+            is_hot=flags.get("is_hot", False),
+            is_high_engagement=flags.get("is_high_engagement", False),
+            is_discussion_rich=flags.get("is_discussion_rich", False),
+            is_uncertain=flags.get("is_uncertain", False),
+            is_interest=flags.get("is_interest", False),
+            is_novel=flags.get("is_novel", False),
         )
 
     weak, close = 0.7, 0.9
@@ -7403,6 +7512,15 @@ def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
         5: "Up 5",
         6: "",
         7: "",
+    }
+    assert {story.id: story.related_upvotes for story in feed.stories} == {
+        1: [],
+        2: ["Up 2"],
+        3: ["Up 3"],
+        4: [],
+        5: ["Up 5"],
+        6: [],
+        7: [],
     }
 
 
@@ -7587,11 +7705,16 @@ async def test_probe_live_counts_parses_defensively(monkeypatch) -> None:
                 raise self._body
             return self._body
 
+    def item(sid: int, **fields: object) -> FakeResponse:
+        body: dict[str, object] = {"id": sid, "type": "story"}
+        body.update(fields)
+        return FakeResponse(200, body)
+
     payloads = {
-        1: FakeResponse(200, {"descendants": 120}),  # good
-        2: FakeResponse(200, {}),  # missing -> 0, not upward
+        1: item(1, score=10, descendants=120),  # good, upward
+        2: item(2, score=10),  # missing descendants -> 0, not upward
         3: FakeResponse(500, {}),  # status
-        4: FakeResponse(200, {"descendants": 50}),  # backwards
+        4: item(4, score=10, descendants=50),  # backwards
         5: FakeResponse(200, ValueError("nope")),  # unparseable
     }
 
@@ -7613,6 +7736,74 @@ async def test_probe_live_counts_parses_defensively(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
     assert await _probe_live_counts(stories, 10.0) == {1: 120}
+
+
+async def test_probe_live_items_rejects_malformed_bodies(monkeypatch) -> None:
+    """Strict Firebase validation: explicit null counts, removed items,
+    identity/type mismatches and non-integer counts are unavailable, never
+    live data. Unsupported targets (non-HN, non-positive ids) are never
+    even requested."""
+    import httpx
+    from pipeline import _probe_live_items
+
+    now = time.time()
+    good = _probe_story(11, now=now, count=80)
+    cases = {
+        12: {"id": 12, "type": "story", "score": 1, "descendants": None},
+        13: {"id": 13, "type": "story", "score": 1, "descendants": True},
+        14: {"id": 14, "type": "story", "score": "9", "descendants": 90},
+        15: {"id": 15, "type": "story", "score": 1, "descendants": -3},
+        16: {"id": 99, "type": "story", "score": 1, "descendants": 90},
+        17: {"id": 17, "type": "comment", "score": 1, "descendants": 90},
+        18: {"id": 18, "type": "story", "score": 1, "descendants": 90, "deleted": True},
+        19: {"id": 19, "type": "story", "score": 1, "descendants": 90, "dead": True},
+        20: {"id": 20, "type": "story", "score": 1, "descendants": 90},
+    }
+    stories = [good]
+    stories += [_probe_story(sid, now=now, count=80) for sid in cases]
+    stories.append(_probe_story(21, now=now, count=80, source="rss_x"))
+    stories.append(_probe_story(-4, now=now, count=80))
+
+    class FakeResponse:
+        def __init__(self, body: object):
+            self.status_code = 200
+            self._body = body
+
+        def json(self) -> object:
+            return self._body
+
+    requested: list[int] = []
+
+    class FakeClient:
+        def __init__(self, *, timeout: float):
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResponse:
+            sid = int(url.split("/item/")[1].split(".json")[0])
+            requested.append(sid)
+            if sid == 11:
+                return FakeResponse(
+                    {"id": 11, "type": "story", "score": 5, "descendants": 95}
+                )
+            if sid == 20:
+                return FakeResponse(
+                    {"id": 20, "type": "job", "score": 5, "descendants": 95}
+                )
+            return FakeResponse(cases[sid])
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    items = await _probe_live_items(stories, 10.0)
+    assert set(items) == {11, 20}
+    assert items[11].descendants == 95 and items[11].score == 5
+    assert items[20].descendants == 95
+    # Unsupported targets never reach Firebase.
+    assert 21 not in requested and -4 not in requested
 
 
 async def test_refresh_grown_threads_hot_bypass_ignores_memory(monkeypatch) -> None:
@@ -8016,17 +8207,29 @@ async def test_fetch_candidates_survives_ainews_failure(
 async def test_probe_live_items_reads_points_and_descendants(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The hot refresh needs live points as well as descendants; a deleted
-    item (null body) reads as no points and no comments, bad bodies skip."""
+    """Strict Firebase validation: matching id/type with integer counts read
+    live; null, empty, mismatched, mistyped and non-integer bodies are
+    omitted, never fabricated as live zero. A story item may omit
+    descendants at zero; a missing score stays unknown (None)."""
     import httpx
     from pipeline import LiveCounts, _probe_live_items
 
     now = time.time()
-    stories = [_probe_story(i, now=now) for i in (1, 2, 3)]
+    stories = [_probe_story(i, now=now) for i in range(1, 14)]
     bodies: dict[int, object] = {
-        1: {"score": 444, "descendants": 218},
-        2: None,
-        3: {"score": "many", "descendants": 5},
+        1: {"id": True, "type": "story", "score": 5, "descendants": 5},
+        2: {"id": 2, "type": "story", "score": 444, "descendants": 218},
+        3: None,
+        4: {},
+        5: {"id": 999, "type": "story", "score": 1, "descendants": 1},
+        6: {"id": 6, "type": "comment", "score": 1, "descendants": 1},
+        7: {"id": 7, "type": "story", "score": "many", "descendants": 5},
+        8: {"id": 8, "type": "story", "score": 10, "descendants": 2.5},
+        9: {"id": 9, "type": "story", "score": -3, "descendants": 5},
+        10: {"id": 10, "type": "story", "score": 10, "descendants": True},
+        11: {"id": 11, "type": "story", "score": 10},
+        12: {"id": 12, "type": "story", "descendants": 7},
+        13: {"id": 13, "type": "job", "score": 3},
     }
 
     class FakeResponse:
@@ -8053,8 +8256,10 @@ async def test_probe_live_items_reads_points_and_descendants(
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
     assert await _probe_live_items(stories, 5.0) == {
-        1: LiveCounts(score=444, descendants=218),
-        2: LiveCounts(score=None, descendants=0),
+        2: LiveCounts(score=444, descendants=218),
+        11: LiveCounts(score=10, descendants=0),
+        12: LiveCounts(score=None, descendants=7),
+        13: LiveCounts(score=3, descendants=0),
     }
 
 

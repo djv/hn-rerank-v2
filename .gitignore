@@ -25,3 +25,6 @@ hn_rewrite.db.*
 eval_report.json
 eval_gospark_bakeoff*.json
 smoke_report_*.json
+
+# Host-local diagnostic output
+kernel.errors.txt

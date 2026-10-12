@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
 
+RedditSource = Literal["rss", "arctic_shift"]
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     svm_c: float = 0.2
@@ -50,6 +53,16 @@ class ModelConfig:
     # feedback stories have a side vector; the rest get a zero side part.
     side_embedding_enabled: bool = False
     side_embedding_min_coverage: float = 0.98
+    # "joined_logistic" (evaluation, 2026-10-07; pipeline/joined_classifier.py)
+    # replaces the RBF SVM with one logistic regression over the same rows
+    # plus TF-IDF words; it ignores svm_* and needs linear_blend_enabled off.
+    # Live only as an interleaving challenger (Config.interleave_user_ids).
+    classifier: Literal["svm", "joined_logistic"] = "svm"
+    joined_features: Literal["all", "no_metadata"] = "all"
+    joined_c: float = 4.0
+    joined_embedding_weight: float = 16.0
+    joined_numeric_scale: float = 0.15811388300841897  # sqrt(0.1 / 4)
+    joined_word_scale: float = 1.0
     diversity_threshold: float = 0.75
     knn_k: int = 10
     positive_cluster_k: int = 4
@@ -126,6 +139,14 @@ class Config:
     server_port: int = 8765
     regen_interval_seconds: int = 3600
     regen_initial_delay_seconds: int = 30
+    # After that delay the first regen also waits (up to this long) for the
+    # startup warms to finish; overlapping them slowed a restart's first
+    # rerank (2026-10-08).
+    regen_startup_warm_wait_seconds: float = 180.0
+    # Where users' latest classifier fits are saved as warm starts across
+    # restarts (pipeline/warm_store.py); "" means
+    # $XDG_CACHE_HOME/hn-rewrite/warm_start (~/.cache by default).
+    warm_start_dir: str = ""
     regen_prewarm_top_n: int = 50
     prewarm_hn_full: bool = True
     prewarm_reddit_full: bool = True
@@ -146,6 +167,17 @@ class Config:
     # barely change; a request inside the window waits for it to end.
     # 0 disables the throttle.
     reddit_refresh_min_interval_seconds: float = 7200.0
+    # Where subreddit top lists and comment threads come from: Reddit RSS
+    # (retired 2026-11-13) or the Arctic Shift archive (arctic_shift.py).
+    # Feed URLs in rss.feeds name the subreddits either way.
+    reddit_source: RedditSource = "rss"
+    # Task spacing on the Reddit fetch queue when reddit_source is
+    # arctic_shift (its operator asks for at most a couple of requests/s).
+    reddit_arctic_stride_seconds: float = 2.0
+    # Pause before one more pass over the Arctic Shift feeds that failed in a
+    # refresh (the archive's overload spells lasted minutes on 2026-10-08,
+    # refreshes are 2 h apart). 0 disables the second pass.
+    reddit_arctic_retry_delay_seconds: float = 120.0
     article_fetch_max_per_run: int = 50
     # Regen-time article fetches for new RSS snippet stories regardless of
     # rank (the warm path only reaches stories already near the top). 0 off.
@@ -158,6 +190,15 @@ class Config:
     article_fetch_concurrency: int = 10
     article_fetch_max_age_days: int = 30
     max_cached_models: int = 20
+    # Team-draft interleaving (ROADMAP B2, pipeline/interleave.py): these
+    # users' Recommended views mix production with each challenger arm,
+    # and every served deck's arm per story is stored (interleave_decks).
+    # Empty: off. Each arm adds a full model fit to the user's warm.
+    interleave_user_ids: tuple[int, ...] = ()
+    interleave_arms: tuple[Literal["joined_all", "joined_no_metadata"], ...] = (
+        "joined_all",
+        "joined_no_metadata",
+    )
     # Two-leg candidate cap: the HN recent query uses tier-1 gravity
     # (score/age^1.8) so top-scoring stories are fetched first; the RSS
     # recent query uses pure recency because RSS sources have no
@@ -269,6 +310,32 @@ class Config:
             raise ValueError("warm_pool_size must be >= 1")
         if self.model.svm_precomputed_chunk_size <= 0:
             raise ValueError("svm_precomputed_chunk_size must be positive")
+        if self.model.classifier == "joined_logistic" and (
+            self.model.linear_blend_enabled
+        ):
+            raise ValueError("joined_logistic replaces the linear blend; disable it")
+        if not all(
+            v > 0
+            for v in (
+                self.model.joined_c,
+                self.model.joined_embedding_weight,
+                self.model.joined_numeric_scale,
+                self.model.joined_word_scale,
+            )
+        ):
+            raise ValueError("joined_* settings must be positive")
+        if len(set(self.interleave_arms)) != len(self.interleave_arms):
+            raise ValueError("interleave_arms must not repeat an arm")
+        if self.interleave_user_ids and not self.interleave_arms:
+            raise ValueError("interleave_user_ids needs at least one arm")
+        if self.reddit_source not in {"rss", "arctic_shift"}:
+            raise ValueError("reddit_source must be one of: rss, arctic_shift")
+        if self.reddit_arctic_stride_seconds < 0:
+            raise ValueError("reddit_arctic_stride_seconds must be >= 0")
+        if self.regen_startup_warm_wait_seconds < 0:
+            raise ValueError("regen_startup_warm_wait_seconds must be >= 0")
+        if self.reddit_arctic_retry_delay_seconds < 0:
+            raise ValueError("reddit_arctic_retry_delay_seconds must be >= 0")
         if self.embedding_ort_variant not in {
             "current",
             "spin_off",

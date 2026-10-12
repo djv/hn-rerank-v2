@@ -6,6 +6,29 @@ This document outlines the architecture, core design decisions, database schema,
 
 ## 1. System Overview
 
+The web card's **Why this story** expander and the TUI's `w` panel show
+the active feed's ordering rule, badge signals, and up to three distinct
+related upvote titles. Extra neighbours are computed only for deck stories
+during attribution; all pairs share the existing centering pass. Both raw
+and centered similarity floors apply, and popularity/exploration badges
+retain the stricter raw floor. The optional `FeedStory.related_upvotes`
+field defaults to an empty list for older servers; older clients ignore it.
+Optional `ranking_factors` describes each active linear-blend component's
+candidate-pool percentile and actual weight. Display names are **Nonlinear
+preference model** (base/RBF SVM), **Linear preference model** (dense logistic
+regression), and **Word preference model** (TF-IDF logistic regression).
+The first two share feature inputs and differ in how they learn.
+Helped/hurt is the sign of
+`weight * (percentile - 0.5)`, ordered by its absolute value; disabled terms
+are omitted. These are effects relative to a middle-of-pool component,
+before deck discovery and Explore shuffle, not feature-level causal claims.
+Popular hides the preference decomposition because its order uses gravity.
+Decks without an active blend have no component breakdown.
+The original single attribution stays available. Similarities are evidence,
+not causal explanations of the complete model score. Opening the panel
+does not fetch content or call an LLM; cold or weak matches are explicitly
+reported as unavailable. Ranking, votes, and database schema are unchanged.
+
 `hn-rewrite` is a unified, resource-efficient rewrite of the original reranking system. It functions as a local-first web application that fetches stories from Hacker News and multiple RSS feeds, semantic-ranks them using a locally run sentence-embedding model and SVM, and presents them in a clean web dashboard.
 
 ```mermaid
@@ -178,10 +201,56 @@ $$\alpha = \text{clip}\left(\frac{n_{\min} - 20}{60},\ 0,\ 1\right)$$
 
 The blend starts when both classes have at least 20 feedback entries and reaches full SVM influence when both classes have at least 80 entries. A user with 50 upvotes but only 5 downvotes sees pure tier-2 (centroid-diff) regardless of total feedback count.
 
+#### Joined Classifier Challenger and Live Interleaving (opt-in)
+
+`model.classifier = "joined_logistic"` (`pipeline/joined_classifier.py`)
+replaces the RBF SVM and the linear blend with one logistic regression
+(C `joined_c` = 4) on the SVM's scaled training rows, the embedding block
+weighted by sqrt(`joined_embedding_weight` = 16), all numeric columns times
+`joined_numeric_scale` = sqrt(0.1/4), joined to hashed TF-IDF words (terms
+in at least two training stories). It ranks by min-max P(up) - P(down) and
+keeps the fitted probabilities for Explore's Unsure entropy. A vote set
+missing a class fails the fit and falls back to tiers 1-2.
+`joined_features = "no_metadata"` drops the ten meta columns. These are
+shortlist candidates #2 and #4 of the 2026-10-07 offline study
+(docs/evaluations/model-ablation-20261007/FEATURE-REMOVALS.md); the
+probabilities equal the offline adapter's exactly
+(`tests/test_joined_classifier.py`). The tier blend is unchanged.
+
+Live, the classifier serves only as an interleaving challenger. For users
+in `interleave_user_ids` (empty by default), each warm also scores the
+candidates with every arm in `interleave_arms` (`joined_all`,
+`joined_no_metadata`), each in its own model-cache entry, reusing
+production's feature build (`SharedFeatures`) and warm-starting from its
+previous fit (one vote snapshot for all arms, `training_feedback`).
+Each window's Recommended view first holds every arm's top
+`VIEW_SIZE * SELECT_MARGIN` (24) stories; after deduplication and HN-dupe canonicalization,
+`draft_recommended` team-drafts the survivors (`pipeline/interleave.py`):
+every round visits production and the challengers in a fresh random order,
+and each adds its best story not already listed. Drafting after those drops
+keeps the served turns balanced (drafting before them left 3/2/7 splits in
+the first live deck). Cards keep production's score, probabilities and
+explanation; only `RankedStory.arm` records who drafted them, and clients
+never see it. Popular and Explore are unchanged, apart from Explore
+excluding the interleaved Recommended stories. If any challenger fails to
+fit, that deck is production's alone (`interleave=off` in the rank trace).
+Each challenger adds a full feature build and fit to the warm
+(`challenger_<arm>_ms`).
+
+Before the deck can be served, the warm stores each window's Recommended
+story IDs and arms under the deck version in the additive STRICT
+`interleave_decks` table. `scripts/interleave_report.py` credits a vote to
+an arm when the user's last impression of the story before the vote
+(`interaction_events`) was in a Recommended view of a stored version and
+window. It then compares each challenger with production: a sign test of
+upvotes per deck version and a two-proportion test of credited upvote
+rates, Bonferroni-adjusted. `scripts/simulate_interleaving.py` replays the
+same procedure on judged offline blocks to estimate power.
+
 ### 3.4 Selection & Surfacing Passes
 The default dashboard selection is direct relevance order: `rerank_candidates` takes the top ranked stories after `_score_and_rank` and does not remove near-duplicates. MMR remains available behind `config.model.enable_mmr`; when enabled, `mmr_filter` iterates through candidates in SVM-rank order and discards subsequent candidates with cosine similarity above `config.model.diversity_threshold` (default 0.75).
 
-**Linear blend (`config.model.linear_blend_enabled`; code default off, `config.toml` on since 2026-09-29).** `pipeline/linear_blend.py`: after `_score_and_rank` computes the tier-blended score for a voter whose SVM fit, the final score becomes 0.5 x production + 0.2 x dense logistic regression (`linear_blend_dense_weight`; fit on the SVM's scaled feature rows, C `linear_blend_dense_c` 0.1) + 0.3 x TF-IDF logistic regression (`linear_blend_tfidf_weight`; word 1-2 grams over domain/source tokens, title and the first 5,000 characters of `text_content`, C `linear_blend_tfidf_c` 4), each as an average-rank percentile of P(up) - P(down). The dense and TF-IDF weights are multiplied by the SVM tier's weight (`alpha_2 * alpha_3`, `linear_blend_ramp`), so the blend ramps in with the SVM past the 20 up / 20 down gate instead of taking half the ranking there; a heavy voter gets the full weights. The models are fit with the SVM on a cache miss and cached in `linear_blend._CACHE`, one fit per user under its latest feedback signature (a missing entry forces the SVM refit too); that fit is also the next fit's warm start (`_LATEST`, dropped with the cache entry). Hashed TF-IDF count rows are cached per (story, text) in `_ROWS` (32k rows, ~110 MB; sized above the candidate caps plus the voters' training stories). A failed fit or score logs and keeps the production score. `scripts/eval_ranker_variants.py` shares `percentile_scores`, `tfidf_text` and the vectorizer with it. Its `production` variant runs whatever the config says (the blend, from `config.toml`); `prodlr`, `produd`, `stack` and the SVM sweeps use production without the blend, and `prodlr`'s default dense logreg is the live one (a production run with all blend weight on it, `linear_blend_ramp=false`), so `prodlr[svm_c=4;lr_weight=0.2;tfidf_weight=0.3]` equals the live blend for a heavy voter (`tests/test_eval_ranker_variants.py`). Other `lr_target`s, half-lives and skipped votes use the eval's own logreg (fewer meta columns, C `linear_blend_dense_c`).
+**Linear blend (`config.model.linear_blend_enabled`; code default off, `config.toml` on since 2026-09-29).** `pipeline/linear_blend.py`: after `_score_and_rank` computes the tier-blended score for a voter whose SVM fit, the final score becomes 0.5 x production + 0.2 x dense logistic regression (`linear_blend_dense_weight`; fit on the SVM's scaled feature rows, C `linear_blend_dense_c` 0.1) + 0.3 x TF-IDF logistic regression (`linear_blend_tfidf_weight`; word 1-2 grams over domain/source tokens, title and the first 5,000 characters of `text_content`, C `linear_blend_tfidf_c` 4), each as an average-rank percentile of P(up) - P(down). The dense and TF-IDF weights are multiplied by the SVM tier's weight (`alpha_2 * alpha_3`, `linear_blend_ramp`), so the blend ramps in with the SVM past the 20 up / 20 down gate instead of taking half the ranking there; a heavy voter gets the full weights. The models are fit with the SVM on a cache miss and cached in `linear_blend._CACHE`, one fit per user under its latest feedback signature (a missing entry forces the SVM refit too); that fit is also the next fit's warm start (`_LATEST`, dropped with the cache entry). **Warm starts across restarts** (`pipeline/warm_store.py`): the joined classifier's and the linear blend's latest coefficients per user are also saved as `.npz` (float32, kept-column indices; ~5-12 MB per profile) under `warm_start_dir` (default `$XDG_CACHE_HOME/hn-rewrite/warm_start`), written by a background thread at most every 30 s, atomically. After a restart `latest()` falls back to them; a restored fit only seeds the solver (its IDF is unfitted) and never scores. Cold fits had taken ~60 s of a restart's 92 s first rerank (2026-10-08). The store is off until the server's startup configures it, so tests and scripts write nothing. The first regen also waits (after `regen_initial_delay_seconds`) for the startup warms to finish, up to `regen_startup_warm_wait_seconds` (180 s), so the two no longer overlap. Hashed TF-IDF count rows are cached per (story, text) in `_ROWS` (32k rows, ~110 MB; sized above the candidate caps plus the voters' training stories). A failed fit or score logs and keeps the production score. `scripts/eval_ranker_variants.py` shares `percentile_scores`, `tfidf_text` and the vectorizer with it. Its `production` variant runs whatever the config says (the blend, from `config.toml`); `prodlr`, `produd`, `stack` and the SVM sweeps use production without the blend, and `prodlr`'s default dense logreg is the live one (a production run with all blend weight on it, `linear_blend_ramp=false`), so `prodlr[svm_c=4;lr_weight=0.2;tfidf_weight=0.3]` equals the live blend for a heavy voter (`tests/test_eval_ranker_variants.py`). Other `lr_target`s, half-lives and skipped votes use the eval's own logreg (fewer meta columns, C `linear_blend_dense_c`).
 
 **Side-by-side embeddings (`config.model.side_embedding_enabled`; default off, on in `config.toml` and live since 2026-10-02).** `pipeline/side_embeddings.py`: when on, `_score_and_rank` trains and scores the SVM and the linear blend on each story's stored vector joined with a second model's vector (embeddinggemma-300m, 128 tokens, task prefix `task: classification | query: `), each part scaled 1/sqrt(2), the layout the evaluation replay used (2026-10-02: AUC +0.011, top-12 upvotes +0.056 over 12 time blocks; FINDINGS.md). The score context (closest upvote and its index, closest down/neutral, upvote vectors) stays on the stored vectors, so "Because you upvoted", Explore and dedup thresholds keep their meaning. Side vectors live in the additive `side_embeddings` table (`story_id, model_version` key, matched on the same text hash as `embeddings`), are read through an in-process cache (`SideVectorCache`, one DB read per story text) and are written only by `scripts/embed_side_vectors.py` (voted stories first, then candidates newest first; 0.22 s/story on the VPS on 2 niced threads). A story without one gets a zero side part; below `side_embedding_min_coverage` (0.98) of candidates plus feedback the rerank uses the stored vectors alone (trace label `side_embeddings=off`, warning `side_embeddings_low_coverage`). The model directory is a Hugging Face snapshot (`side_embedding_model_dir`, tokenizer files plus `onnx/model.onnx`).
 
@@ -263,6 +332,62 @@ called from `prewarm_reddit_top_stories`) does NOT use the cache — each
 story's comment RSS is fetched at most once per lifetime (prewarm filter
 is `not s.top_comments`), so a cache would have near-zero hit rate.
 
+#### 3.4.4 Arctic Shift as the Reddit source
+
+Reddit retires RSS on 2026-11-13 and already answers anonymous `.json`
+and HTML with 403. `reddit_source = "arctic_shift"` (code default `"rss"`;
+config.toml sets it since 2026-10-08) reads both Reddit paths from the
+Arctic Shift archive instead
+(`arctic_shift.py`; free, no key, at most a couple of requests/s). The
+subreddit list is still the `/r/<sub>/top/.rss?t=…&limit=…` URLs in
+`rss.feeds`; `reddit_top_query` reads the subreddit, window and limit
+from them. Hot/new listings and `t=all` are unsupported (Reddit picks
+all-time leaders before the age cutoff, which a windowed search cannot
+reproduce).
+
+* **Top feeds** (`_fetch_arctic_topfeed`): search returns every post in
+  the window sorted by time, paged on `created_utc`; a search that cannot
+  be paged to the end (60-page cap, or a full page inside one second)
+  raises, so the feed keeps its previous stories rather than ranking only
+  the oldest posts. `top_posts` ranks by archived score locally and loads
+  full records in score order, `2 × limit` at a time (at most 5 batches),
+  until `limit` posts survive the removal check. Stories are keyed by permalink exactly as RSS entries
+  are (`rss_story_id`), so ids, votes and caches carry over, and keep
+  score/comment count 0 as on the RSS path. Arctic Shift scores a post
+  only after ~36 h (score 1 before), so a post joins the list about
+  1.5 days late. `removed_by_category` is ignored: it is a snapshot from
+  archiving time, and r/ClaudeAI's AutoModerator holds nearly every post
+  that moderators then approve; only `[removed]`/`[deleted]` text drops a
+  post. The archive does not learn of later removals, so a subreddit with
+  fewer than `limit` visible posts a week gets a few score-0/1 posts that
+  Reddit hid (r/ExpatFIRE: RSS 16, Arctic Shift 25).
+* **Threads** (`server._fetch_reddit_arctic_context`, used by prewarm and
+  tldr-detail): the post's text plus its comment tree, fetched in
+  parallel within `ARCTIC_THREAD_DEADLINE_SECONDS` (30 s, retries
+  included; clients give up after 150 s), top-level comments by score
+  first, then replies, with the RSS path's filters and caps.
+* **Pacing**: these factories skip `reddit_limiter` (it paces reddit.com
+  only); `arctic_shift` spaces requests 0.5 s apart process-wide and the
+  queue strides by `reddit_arctic_stride_seconds` (2 s). Overload answers
+  (422 "Timeout. Maybe slow down a bit", 429, 5xx) are retried after the
+  server's `x-ratelimit-reset`. The archive sheds load for every client
+  until its per-minute window resets, so top lists (background) wait up to
+  65 s over 4 attempts with 60 s requests (`TOP_POSTS_RETRY`); threads,
+  which serve card taps, wait at most 10 s over 2 attempts with 15 s
+  requests (`THREAD_RETRY`). Feeds still failing after the refresh's
+  pass get one more pass after `reddit_arctic_retry_delay_seconds`
+  (120 s; 0 disables); a feed failing both keeps its stored stories and
+  is retried on the next refresh. Each refresh logs `elapsed_s` and a
+  `reddit_refresh_arctic` line (failed feeds; archive requests, overload
+  answers and transport errors since the previous refresh, card taps
+  included).
+* **Check before switching**: `scripts/compare_reddit_sources.py` fetches
+  each feed both ways and counts matching story ids.
+
+Arctic Shift reads the official Reddit API, so it is expected to stop by
+March 2027 (Reddit's public API closure) or sooner. Evidence:
+FINDINGS.md "Reddit after the RSS shutdown".
+
 The live dashboard path applies a **two-leg recent candidate cap** to bound the work the ranker does on each request. The recent candidate fetch is split:
 - **HN leg** (`source='hn'`): ordered by tier-1 gravity `score / age^1.8` (mirrors the cold-start blend in `_score_and_rank`), capped at `recent_candidate_hn_limit` (default 10,000 since 2026-09-29; 5000 had started cutting live stories). This keeps the highest-scoring HN candidates in the pool.
 - **RSS leg** (`source != 'hn' AND NOT IN archive`): ordered by `time DESC` only. RSS sources carry no engagement score in the DB, so tier-1 is uninformative there; recency is the most honest SQL-only signal and preserves representation for the `is_non_hn` discovery pass. Capped at `recent_candidate_rss_limit` (default 5000, same as the HN leg since 2026-08-30 — the old 500 cap starved the RSS pool and the oldest RSS row was 93h out).
@@ -282,8 +407,8 @@ the fully scored pool at one `now` for all five windows:
   serving `enable_mmr` branch was dropped; `mmr_filter` stays for the eval).
 * **Popular**: the top HN stories (`is_hn_source`) in the window by HN gravity
   on the window's clock, `points / (age_h / scale + 2) ** 1.8` (`hn_gravity`,
-  `scale = GRAVITY_TIME_SCALE[window]`, a third of the window in hours: 12h 4,
-  1d 8, 1w 56, 1m 240, archive 2920; with HN's own 1-hour clock every window
+  `scale = GRAVITY_TIME_SCALE[window]`, a third of the window in hours (1m:
+  half): 12h 4, 1d 8, 1w 56, 1m 360, archive 2920; with HN's own 1-hour clock every window
   showed the same under-a-day-old stories). No Hot/Top/Talk selection cascade.
   Badges are independent: each card gets every one it qualifies for,
   🔥 Hot when its velocity
@@ -298,18 +423,21 @@ the fully scored pool at one `now` for all five windows:
   excluding earlier picks and the window's Recommended picks (spares
   included, since they refill Recommended), skipping (and
   backfilling past) stories that duplicate a voted one (`is_feedback_match`,
-  WORKLOG 2026-07-10). Served 5 each (`EXPLORE_PER_BADGE`), in model-score
+  WORKLOG 2026-07-10). Served 3 each (`EXPLORE_PER_BADGE`), in model-score
   order. Interest (replaced 🎯 Similar, 2026-09-30): `interest_centers`
   clusters the user's upvote embeddings (KMeans, `interest_cluster_k=10`,
   cached per user and warm-started from the last centers when upvotes
   change); each candidate belongs to its nearest center. `interest_picks`
   goes round-robin over the interests, those the served Recommended (first
   `VIEW_SIZE`) covers least first, then bigger ones, taking each interest's
-  best-scoring unpicked story per round, so the served five show interests
+  best-scoring unpicked story per round, so the served three show interests
   Recommended misses. `scripts/preview_explore.py` prints a profile's picks
   from a snapshot.
 
-Views are picked at `SELECT_MARGIN = 2` times their served size, then
+Views are picked at `SELECT_MARGIN = 2` times their served size (the shared
+cold deck at `COLD_DECK_MARGIN = 32`, so a voter served it less their votes
+after a restart still gets full views; its background article fetch and TLDR
+prefetch cover only the first `SELECT_MARGIN` multiple), then
 `finalize_ranked_deck` runs URL/embedding dedup and `canonicalize_deck`
 (`canonicalize_hn_dupes` via `canonical_outcomes`) once over every story of the
 deck, in score order, and applies the result to each view: a dropped story
@@ -317,8 +445,8 @@ leaves every view, a canonical replacement takes its source's place and leaves
 any view whose window it falls outside, and Popular is re-sorted by gravity.
 `serve_window` then caps each view at request time: stories that aged out of
 the window since the warm are dropped, Recommended and Popular are cut to
-`VIEW_SIZE = 16` (12 shown plus 4 that slide in as cards are voted), Explore to
-5 per badge. The spare picks refill views after dedup, votes and ageing; a short
+`VIEW_SIZE = 12` (8 shown plus 4 that slide in as cards are voted; 12 shown
+before 2026-10-08), Explore to 3 per badge. The spare picks refill views after dedup, votes and ageing; a short
 window is served short, never widened. A card's badges are OR'd across the
 views of its window only (`WindowViews.stories`); the view orders are
 authoritative, nothing is derived from badge flags.
@@ -347,7 +475,7 @@ ones, and ranking, badges and Explore never see centered vectors. The
 ### 3.5 Swipe Deck & Warm Refill
 The dashboard has a **Sort** (Recommended/Popular/Explore, side-rail tabs) and a **time window** (a dropdown: 12 hours, 1 day, 1 week, 1 month, Archive) that applies to all three sorts; each client reopens on the window last picked (web: `localStorage` `hnWindow`, switched to right after the embedded 1-week feed loads; terminal: a `window` file next to its `profile.json`), 1 week when nothing is saved; the Date sort and the Recent/Archive tabs were removed on 2026-09-28. Only one story card is visible at a time, and its TLDR opens automatically. The first few TLDRs for the active mode are prefetched immediately so advancing is usually instant. Keys match the terminal client (since 2026-09-26): `j`/`k` next/previous story, `1`/`2`/`3` upvote/neutral/downvote, `u` undo, `o`/`c` open article/comments, `y` copy the comments link (article link if none), `r` refresh (reload the deck and regenerate the open summary), `s`/`l` next sort, `h` previous sort, `?` the key overview, `d`/`D` (Shift+D) the next/previous time window; web-only `b` the side panel and `f` fullscreen. Arrow keys scroll inside the open TLDR. The global `keydown` guard only blocks text-input controls (`input`, `textarea`, `select`, `[contenteditable]`) and modifier-accelerated keys (`Ctrl`/`Cmd`/`Alt`); `<button>` and `<a>` focus does not suppress shortcuts. There is no source filter (the `Mixed`/`HN`/`Non-HN` selector stays disabled; interaction events record `source_filter=mixed`).
 
-**Web client model (since 2026-09-26, matching the terminal client).** The page embeds the default window (1w) as the same JSON `/api/feed?window=1w` serves (`<script type="application/json" id="feed-data">`, Jinja `tojson`, so a title can't close the element), and every card is built from it by `feedCard` with text nodes only; there are no server-rendered cards. A view is `feed.orders[sort]` of the selected window's feed minus this session's votes, capped at 12 (`VIEW_LIMIT`); Explore is shuffled client-side per window, keeping placed stories where they are. Switching sort re-renders locally and starts at the view's first story. Switching window (the dropdown, `d` or `D`) shows that window's cached feed when one of the current deck version is cached, else an empty "Loading…" view while `reload()` fetches it. After a window is shown, `prefetchWindows` fetches its neighbours (±1 in the window list) in the background: one request at a time, each window once per deck version (`windowsTried`), never summaries. The cache (`feeds`) holds one deck version: a feed of a newer version replaces it all, an older one is ignored, and a background answer is dropped when a newer deck or a saved vote (`feedGeneration`) arrived after it was asked, or when its window is the one on screen, so a late prefetch can't overwrite the selected window or bring back pre-vote data (a cached feed never resets the vote counts either). `reload()` is the one path to the selected window's feed (`GET /api/feed?window=`): the poller calls it every 60s and when the tab becomes visible, if `ranking-ready` reports a newer version (a current deck waits for any new version; a stale one waits for its reranked deck), and `s` calls it manually (which also regenerates the open summary). A vote hides the card and moves to the next one at once; votes and undos go out one at a time in the order made (`submit`, one promise chain); a saved vote marks every cached window stale (`target_version`, `ready: false`); a failed one is reverted (the story comes back, counts undone) with an error and never retried. Voted stories are hidden in every window; undo brings the story back in each, and restores it into the window it was voted from where the server orders it (`restoreStory`: Popular by the window's gravity, the rest by rank score) until the reranked deck lands. Summaries: one request per story shared by the open card and prefetch (`summaryFor`); the next 3 cards may be generated and the next 10 are only looked up in the cache (`/api/tldr-cache`), at most 4 prefetch requests at once; misses and failures back off for 60s (or `Retry-After`), and a failed background generation pauses prefetch generation for a minute. Requests time out after 10s (150s for `tldr-detail`). Removed: server-rendered card markup (`components/story_card.html`, `badge.html`), the refill loop, the 30s warm-poll loop, the vote idle timer, the page-load version check, the localStorage voted-id list (the server no longer serves voted stories), per-story vote chains, and the inactive source filter code.
+**Web client model (since 2026-09-26, matching the terminal client).** The page embeds the default window (1w) as the same JSON `/api/feed?window=1w` serves (`<script type="application/json" id="feed-data">`, Jinja `tojson`, so a title can't close the element), and every card is built from it by `feedCard` with text nodes only; there are no server-rendered cards. A view is `feed.orders[sort]` of the selected window's feed minus this session's votes, capped at 8 (`VIEW_LIMIT`); Explore is shuffled client-side per window, keeping placed stories where they are. Switching sort re-renders locally and starts at the view's first story. Switching window (the dropdown, `d` or `D`) shows that window's cached feed when one of the current deck version is cached, else an empty "Loading…" view while `reload()` fetches it. After a window is shown, `prefetchWindows` fetches its neighbours (±1 in the window list) in the background: one request at a time, each window once per deck version (`windowsTried`), never summaries. The cache (`feeds`) holds one deck version: a feed of a newer version replaces it all, an older one is ignored, and a background answer is dropped when a newer deck or a saved vote (`feedGeneration`) arrived after it was asked, or when its window is the one on screen, so a late prefetch can't overwrite the selected window or bring back pre-vote data (a cached feed never resets the vote counts either). `reload()` is the one path to the selected window's feed (`GET /api/feed?window=`): the poller calls it every 60s and when the tab becomes visible, if `ranking-ready` reports a newer version (a current deck waits for any new version; a stale one waits for its reranked deck), and `s` calls it manually (which also regenerates the open summary). A vote hides the card and moves to the next one at once; votes and undos go out one at a time in the order made (`submit`, one promise chain); a saved vote marks every cached window stale (`target_version`, `ready: false`); a failed one is reverted (the story comes back, counts undone) with an error and never retried. Voted stories are hidden in every window; undo brings the story back in each, and restores it into the window it was voted from where the server orders it (`restoreStory`: Popular by the window's gravity, the rest by rank score) until the reranked deck lands. Summaries: one request per story shared by the open card and prefetch (`summaryFor`); the next 3 cards may be generated and the next 10 are only looked up in the cache (`/api/tldr-cache`), at most 4 prefetch requests at once; misses and failures back off for 60s (or `Retry-After`), and a failed background generation pauses prefetch generation for a minute. Requests time out after 10s (150s for `tldr-detail`). Removed: server-rendered card markup (`components/story_card.html`, `badge.html`), the refill loop, the 30s warm-poll loop, the vote idle timer, the page-load version check, the localStorage voted-id list (the server no longer serves voted stories), per-story vote chains, and the inactive source filter code.
 
 Votes never trigger a global regeneration (since 2026-09-26). A 300-second trailing timer used to start a full regen after the last vote from anyone; it dated from when a vote had to re-render one static page, and by then only re-fetched candidates early and re-ranked every cached user, while the per-user warm already covers the voter (`fetch_candidates` only uses feedback to skip refreshing voted stories, and per-user ranking excludes them itself).
 
@@ -495,6 +623,23 @@ The configured RSS candidate pool mixes community aggregators with curated exper
 
 Dashboard source badges use display labels derived from stored source IDs. Historical feed-host artifacts such as `rss_rss_slashdot_org` are rendered as readable labels like `Slashdot`, while new feeds hosted at `rss.*`, `feeds.*`, or `feed.*` strip that host prefix before storing the source ID.
 
+Kagi News World (`https://news.kagi.com/world.xml`) is included in the configured
+RSS feeds. Its items provide news summaries and source links through the existing
+generic RSS ingestion path.
+
+The Codex community category (`https://community.openai.com/c/codex/37.rss`)
+is included through the same generic RSS path, with source ID
+`rss_community_openai_com` and the display label "Codex Forum". Feed entries
+carry canonical topic URLs and the opening post; there is no separate
+Discourse reply hydration or engagement-score adapter. Topic pages are
+never fetched as articles (`_NO_ARTICLE_SOURCES` excludes it from RSS
+prewarm and warm article selection; `is_codex_source` excludes short-post
+taps), and the generated count/"Read full topic" RSS footer is
+stripped before text conversion. Rows stored before that policy read
+through an effective view (article omitted, footer stripped) for
+ranking, embeddings, and summaries; raw stored fields are preserved
+(see `pipeline/codex_forum.py`).
+
 ### 3.7 Comment Text Refetch on Growth
 The default regeneration interval is one hour after the previous run completes (`regen_interval_seconds=3600`, the `Config` dataclass default in `pipeline/config.py` since 2026-09-22; not overridden in `config.toml`); older references to 3- or 4-hour cycles describe superseded configuration.
 
@@ -598,6 +743,39 @@ source features cost ~−0.014/−0.007 NDCG@40, tier blend is neutral), and
 `tier2_centroid` plus the `gravity` / `candidate_order` baselines. `--svm-c` / `--svm-gamma` add an
 `svm_override` entry; `--sweep-svm` runs the C/γ grid through the same engine
 (replacing the deleted `scripts/svm_hparam_sweep.py` wrapper).
+
+`scripts/eval_single_preference_model.py` wraps that harness for one-classifier
+research: normalized linear/RBF kernels, an anchored additive linear term,
+optional continuous signed pairwise margins, and an additive TF-IDF word
+kernel (`--word-c`, effective word regularization strength). The word kernel
+uses production hashed 1-2 grams with retained columns and IDF learned only
+from training rows; lexical and numeric rows use the same serving DB order.
+It fits one SVM with both feature channels and disables both logistic
+classifiers. Only no-dense variants
+receive an experimental kernel/score form; full-blend controls stay original.
+`--feedback-cohort` filters training/held-out feedback in memory and rejects
+external `--embeddings-file` snapshots whose label reads bypass that filter.
+Explicit output reports record the kernel, exact cohort IDs/hash and driver
+hash. Only production metadata is standardized. The experimental
+`--embedding-weight` multiplies the entire embedding block by the square
+root of one scalar weight; it does not standardize individual dimensions.
+Fold reports also retain block norms and train/test title overlap IDs.
+These options do not change the serving ranker. The October 7 fixed plan and
+raw outputs live in `docs/evaluations/model-ablation-20261007/`.
+
+`scripts/eval_one_classifier.py` uses the same canonical fold/serving path
+with one joined logistic regression, LinearSVC, histogram gradient booster
+or small MLP. Feature subsets separate words, embeddings and metadata.
+Dense nonlinear estimators use training-only PCA64 for embeddings and
+SVD32 for words; sparse linear estimators retain the full inputs. Probability
+estimators can rank by P(up) or P(up)-P(down), while retaining their actual
+probabilities for diagnostic fields. Neither probability output nor the
+softmax proxy used for SVM margins establishes calibration. Feedback rows
+are frozen across lexical/numeric reads, including the production dedup
+step. Both offline drivers reuse only exact-input pure vector arithmetic
+through a bounded result cache; they never cache classifiers or labels.
+The full three-model control stays on its original estimator and scoring
+path. These experimental adapters have no production or preview effect.
 
 Deck assembly always receives the fold's training upvote embeddings, including
 when similarity features are cached. Interest selection and semantic deduplication
@@ -805,6 +983,10 @@ send them, older clients omit them), stored comma-joined in the added
 `badges` column (`''` for none or unknown), so per-badge outcomes can be read
 exactly. TLDR
 prefetches and automatic card enrichment do not generate interaction events.
+`ranker_arm` is the client's own label (`baseline` on the web,
+`tui_observed` in the terminal). Interleaving arms are recorded server-side
+in `interleave_decks` (section 3.3) and joined through the event's
+dashboard version and window.
 
 SQLite stores events indefinitely in the additive STRICT `interaction_events`
 table (schema version 2). Event UUIDs make retries idempotent; story IDs are
@@ -897,3 +1079,55 @@ successful vote can be cleared. Summaries are cached per session and the next
 few stories are prefetched sequentially after the selected one settles, with
 provisional responses excluded from the cache. See
 [terminal release instructions](docs/TUI_RELEASE.md).
+
+### Cached deck score ledger
+
+The additive STRICT `deck_scores` table has `(user_id, version)` as its
+primary key, `created_at`, and `windows_json`. Every trained warm writes one
+row immediately after the interleave ledger, before publishing the cache;
+repeating a version replaces its row. Cold/untrained decks (no `prob_up`)
+write nothing. Persistence errors log a full traceback and serving continues.
+This is logging only: ranking, view selection/order, badges, interleaving,
+impression APIs and clients are unchanged.
+
+`RankedStory.svm_margin` records the up-class SVM decision value before
+min-max normalization (including cached model scoring); it is absent when
+no SVM scored the story, including the alternative JoinedLogistic classifier.
+`WindowViews.pool` carries a typed `WindowPool`, computed in
+`assemble_window_deck` from each full in-window scored pool after view
+assembly. It stores pool size, total rerank candidates,
+p50/p75/p90/p95/p99/max of score, SVM margin, P(up), and P(down), omitting
+metrics with no values. Stable descending production-score ranks are zero
+based, globally and within the window. View mapping and serving retain this
+metadata without using it to select cards. Each card also carries its typed
+`RankedStory.pool_rank` so canonical story-ID replacements preserve the
+original scored candidate's ranks. Logging-only fields are excluded from
+dataclass equality so existing serving/evaluation card comparisons retain
+their semantics.
+
+`DeckScores` / `WindowScores` / `CardScore` become JSON only at the database
+boundary. Every cached view card has story ID, view, position, production
+score, SVM margin, all three class probabilities, and window/global ranks.
+Join impressions in `interaction_events` on `user_id`,
+`dashboard_version = deck_scores.version`, and `story_id`, also matching
+window/view when selecting a card entry. These are warm-time values for the
+cached version, not later rescoring with final points or comments. They enable
+short-window Recommended cap/threshold/fill replay after the trial ends on
+2026-11-05; no such policy is implemented here. At roughly 80 versions per
+day for the main profile and a few hundred cached cards each, expect tens of
+thousands of card entries daily. No retention job exists yet.
+
+Analyst notes:
+- `position` is the index in the cached view, not the served position
+  (served views are capped, Explore is re-sorted, voted stories are
+  stripped); replay by `window_rank`.
+- `score`, `svm_margin` and `prob_*` are production's for every card,
+  including challenger-arm picks; join `interleave_decks` for the arm.
+- `prob_*` are SVM probabilities before the linear blend; `score` is
+  after it.
+- A canonicalized HN duplicate carries the replaced story's values.
+- Pool statistics include stories later dropped by deduplication.
+- The last write wins for a re-warmed version.
+- Cold profiles write no row.
+- Join on `(user_id, version = dashboard_version, window, view,
+  story_id)`; `created_at` is warm time, not impression time.

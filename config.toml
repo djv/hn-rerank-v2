@@ -23,6 +23,15 @@ tldr_probe_max_threads_per_regen = 20
 # Tap-time Firebase probe budget per open (young HN threads only); the regen
 # probe above keeps its own 10s default. Miss/failure serves cached.
 tldr_tap_probe_timeout_seconds = 3.0
+# Live team-draft interleaving of production with the joined-classifier
+# challengers (shortlist #2/#4) in profile 151's Recommended views, 28 days
+# from the first interleaved deck (docs/evaluations/model-ablation-20261007/
+# INTERLEAVING.md). Remove the line to stop.
+interleave_user_ids = [151]
+# Reddit top lists and threads from the Arctic Shift archive instead of
+# Reddit RSS (retired 2026-11-13); user switched 2026-10-08. Remove the line
+# to go back to RSS while it lasts (ARCHITECTURE.md 3.4.4).
+reddit_source = "arctic_shift"
 
 [hn_rewrite.model]
 svm_c = 4.0
@@ -35,37 +44,37 @@ side_embedding_enabled = true
 
 [hn_rewrite.rss]
 feeds = [
+    "https://news.kagi.com/world.xml",
     "https://www.lesswrong.com/feed.xml?view=frontpage&karmaThreshold=20",
     "https://rss.slashdot.org/Slashdot/slashdotMain",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/all.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/python.xml",
     "https://mshibanami.github.io/GitHubTrendingRSS/weekly/haskell.xml",
-    "https://www.reddit.com/r/MachineLearning/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/mlscaling/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/haskell/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ocaml/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/Bogleheads/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/ExpatFIRE/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/transit/top/.rss?t=week&limit=25",
 
 
     # AI / coding agents
+    "https://community.openai.com/c/codex/37.rss",
     "https://www.reddit.com/r/AI_Agents/top/.rss?t=week&limit=25",
     # Subs covered by AINews's Reddit recap (2026-09-28)
     "https://www.reddit.com/r/singularity/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ClaudeAI/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/LocalLLM/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/ClaudeCode/top/.rss?t=week&limit=25",
-
-    # Finance / tax / nomad money
-    "https://www.reddit.com/r/financialindependence/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/fatFIRE/top/.rss?t=week&limit=25",
+    # Related AI subreddits
+    "https://www.reddit.com/r/accelerate/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/OpenAI/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/codex/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/agi/top/.rss?t=week&limit=25",
+    "https://www.reddit.com/r/Aging/top/.rss?t=week&limit=25",
 
     # Travel / gear / nomad logistics
     "https://www.reddit.com/r/onebag/top/.rss?t=week&limit=25",
     "https://www.reddit.com/r/digitalnomad/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/expats/top/.rss?t=week&limit=25",
-    "https://www.reddit.com/r/eupersonalfinance/top/.rss?t=week&limit=25",
 
     "https://simonwillison.net/atom/everything/",
     "https://www.interconnects.ai/feed",
@@ -98,7 +107,6 @@ feeds = [
     "https://e360.yale.edu/feed.xml",
     "https://www.sciencedaily.com/rss/top/science.xml",
     "https://aeon.co/feed.rss",
-    "https://discourse.haskell.org/latest.rss",
 
     # Software / systems / AI coding
     "https://jvns.ca/atom.xml",

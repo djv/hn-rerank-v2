@@ -14,7 +14,7 @@ import pytest
 from textual.pilot import Pilot
 from textual.widgets import Markdown, OptionList
 
-from hn_rerank.app import Reader
+from hn_rerank.app import VIEW_LIMIT, Reader
 
 from ._settle import settle
 from .test_client import FakeServer, sample_feed
@@ -236,9 +236,9 @@ async def test_navigation_prefetch_generates_nearby_and_other_sorts() -> None:
     async with app.run_test(size=(120, 35)) as pilot:
         await settle(pilot)
         assert app.summaries.keys() >= {1, 2, 3, 4, 26, 27, 28, 29, 30}
-        assert 12 in fake.cached
+        assert VIEW_LIMIT in fake.cached
         assert 5 not in fake.generated  # deeper cache misses wait until nearby
-        assert 13 not in fake.cached  # past the 12-story view cap
+        assert VIEW_LIMIT + 1 not in fake.cached  # past the view cap
         assert 1 < fake.peak <= 4
         await pilot.press("j")
         await settle(pilot)
@@ -281,22 +281,37 @@ async def test_passive_refresh_does_not_strand_a_joined_summary() -> None:
         await wait_for(pilot, lambda: 2 in fake.generated)
         await pilot.press("j")
         await pilot.pause(0.4)  # load_summary is now awaiting the prefetch.
-        app.reload(manual=False)
+        app.reload()
         await pilot.pause(0.2)
         fake.release.set()
         await wait_for(pilot, lambda: "Summary 2" in app.query_one(Markdown)._markdown)
 
 
-async def test_refresh_cancels_prefetch_generation() -> None:
+async def test_refresh_scopes_to_selected_summary() -> None:
+    """r regenerates only the selected summary: unrelated in-flight prefetch
+    keeps running instead of being cancelled, and only the selected story
+    gets a forced request."""
     fake = NavigationServer()
     fake.blocked = {2, 3, 4}
     app = Reader(api=fake.api())
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for(pilot, lambda: {2, 3, 4} <= set(fake.generated))
-        old = list(app.summary_requests.values())
+        old = dict(app.summary_requests)
+        assert old.keys() >= {2, 3, 4}
         app.action_refresh()
-        await pilot.pause(0.2)
-        assert all(task.done() for task in old)
+        await wait_for(
+            pilot,
+            lambda: (
+                [
+                    json.loads(r.content)["story_id"]
+                    for r in fake.requests
+                    if r.url.path.endswith("/api/tldr-detail")
+                    and json.loads(r.content).get("force_refresh")
+                ]
+                == [1]
+            ),
+        )
+        assert all(not old[sid].done() for sid in (2, 3, 4))
         fake.release.set()
         await wait_for(pilot, lambda: 2 in app.summaries)
 
@@ -325,15 +340,15 @@ async def test_prefetch_cancelled_in_the_same_tick_can_restart() -> None:
         await wait_for(pilot, lambda: app.summaries.keys() >= {2, 3})
 
 
-async def test_failed_background_cache_read_falls_back_to_generation() -> None:
-    """Selecting a story whose in-flight cache read then fails (500, or 404
-    on an older server) asks for the summary directly instead of hiding it."""
+@pytest.mark.parametrize("status", [404, 500])
+async def test_failed_background_cache_read_keeps_story(status: int) -> None:
+    """Older servers fall back to generation; 5xx waits for a manual retry."""
 
     class CacheFailServer(PrefetchServer):
         async def __call__(self, request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/api/tldr-cache/2"):
                 await asyncio.sleep(0.6)
-                return httpx.Response(500)
+                return httpx.Response(status)
             return await super().__call__(request)
 
     fake = CacheFailServer()
@@ -342,6 +357,26 @@ async def test_failed_background_cache_read_falls_back_to_generation() -> None:
         await wait_for(pilot, lambda: 2 in app.summary_requests)
         app.query_one(OptionList).focus()
         await pilot.press("j")
-        await wait_for(pilot, lambda: app.summaries.get(2) == "# Summary 2")
+        if status == 500:
+            await wait_for(
+                pilot,
+                lambda: "500" in app.query_one("#summary", Markdown)._markdown,
+            )
+            assert 2 not in app.unavailable
+            selected = app.selected()
+            assert selected is not None and selected.id == 2
+            assert not any(
+                json.loads(request.content)["story_id"] == 2
+                for request in fake.requests
+                if request.url.path.endswith("/api/tldr-detail")
+            )
+            app.action_refresh()
+        await wait_for(
+            pilot,
+            lambda: (
+                app.summaries.get(2) == "# Summary 2"
+                and "Summary 2" in app.query_one("#summary", Markdown)._markdown
+            ),
+        )
         assert 2 not in app.unavailable
         assert "Summary 2" in app.query_one(Markdown)._markdown

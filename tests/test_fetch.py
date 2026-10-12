@@ -216,6 +216,34 @@ async def test_fetch_empty_body():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("body", ["", " \n\t "])
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_fetch_blank_response(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    body: str,
+    fallback: bool,
+) -> None:
+    _patch_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            403 if fallback else 200,
+            text=body,
+            headers={"content-type": "text/html"},
+        ),
+    )
+    monkeypatch.setattr(http_fetch, "guarded_urllib_fetch", lambda *args: (200, body))
+
+    result = await _fetch_article_body_with_result("https://example.com/blank")
+
+    assert result.body is None
+    assert result.status == 200
+    assert result.error == "empty_extraction"
+    assert not result.permanent
+    assert not any(record.levelname == "ERROR" for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_fetch_strips_chrome_tags():
     body = _CHROME_HTML.encode()
     result, calls = await _serve("chrome", 200, body)

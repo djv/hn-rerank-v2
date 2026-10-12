@@ -35,6 +35,7 @@ from werkzeug.wrappers import Response as BaseResponse
 from flask.typing import ResponseReturnValue
 import httpx
 
+import arctic_shift
 from background_cadence import BackgroundCadence
 from clients.tui.src.hn_rerank.models import (
     DEFAULT_WINDOW,
@@ -44,9 +45,13 @@ from clients.tui.src.hn_rerank.models import (
     Window,
 )
 from database import (
+    CardScore,
     Database,
+    DeckScores,
+    WindowScores,
     InteractionEvent,
     InteractionEventType,
+    InterleaveDeck,
     RankPerfSample,
     Story,
     User,
@@ -59,8 +64,21 @@ from pipeline import (
     hn_thread_looks_active,
     is_hn_source,
 )
-from pipeline.ranking import serve_window
+from pipeline.interleave import PRODUCTION_ARM
+from pipeline.ranking import (
+    COLD_DECK_MARGIN,
+    SELECT_MARGIN,
+    VIEW_SIZE,
+    serve_window,
+)
 from pipeline.ainews import AINEWS_SOURCE
+from pipeline.codex_forum import (
+    CODEX_SUMMARY_INPUT_VERSION,
+    effective_codex_story,
+    is_codex_source,
+    strip_discourse_footer_text,
+)
+from pipeline.enrichment import reddit_post_self_text
 from pipeline.hn_dupes import pointer_thread_target
 from llm_limiter import limiter as llm_limiter
 from reddit_limiter import limiter as reddit_limiter
@@ -81,7 +99,7 @@ ARTICLE_SECTION_MIN_CHARS = 500
 REDDIT_COMMENTS_CACHE_CHAR_LIMIT = 10_000
 REDDIT_COMMENT_LIMIT = 40
 REDDIT_RSS_USER_AGENT = "hn-rewrite/1.0 personal RSS reader; contact: local dashboard"
-TLDR_PROMPT_VERSION = "detail-v14"
+TLDR_PROMPT_VERSION = "detail-v16"
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _PROMPT_CACHE: dict[str, str] = {}
 
@@ -230,10 +248,10 @@ def _cap_tldr_structure(
 
 
 def _shape_tldr(
-    text: str, *, source_chars: int = 5_000, single_section: bool = False
+    text: str, *, article_chars: int = 0, single_section: bool = False
 ) -> str:
-    """Normalize Markdown and preserve the fixed reading-pane allowance."""
-    _, max_bullets, _ = _section_limits(source_chars)
+    """Normalize Markdown and preserve the reading-pane allowance."""
+    _, max_bullets, _ = _section_limits(article_chars)
     if single_section:
         max_bullets *= 2
     return _cap_tldr_structure(_normalize_tldr_markdown(text), max_bullets=max_bullets)
@@ -411,6 +429,8 @@ def _extract_article_body(html: str) -> str | None:
     jusText (statistical boilerplate classification) → BS semantic
     (unclassed <article>/<main>) → trafilatura (precision mode) → raw body.
     """
+    if not html.strip():
+        return None
     for extractor in (
         _extract_with_justext,
         _extract_with_bs_semantic,
@@ -679,6 +699,84 @@ async def _fetch_reddit_rss_context(url: str | None) -> RedditRssContext | None:
         self_text=self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT],
         top_comments=" ".join(comments)[:REDDIT_COMMENTS_CACHE_CHAR_LIMIT],
         comment_count=len(comments),
+    )
+
+
+def _reddit_post_id(url: str | None) -> str | None:
+    """Base-36 post id from a reddit.com ``/comments/<id>/`` URL."""
+    if not url:
+        return None
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if host not in {"reddit.com", "old.reddit.com"}:
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if "comments" not in parts:
+        return None
+    index = parts.index("comments") + 1
+    if index >= len(parts) or not re.fullmatch(r"[a-z0-9]+", parts[index]):
+        return None
+    return parts[index]
+
+
+def _format_arctic_comments(comments: list[arctic_shift.ArcticComment]) -> list[str]:
+    """Reddit comments in prompt form, top-level by score first, then replies.
+
+    Same filtering, ``/u/`` labels and caps as the RSS thread path.
+    """
+    ordered = sorted(comments, key=lambda c: (c.depth > 0, -c.score, c.created_utc))
+    formatted_comments: list[str] = []
+    total_len = 0
+    for comment in ordered:
+        text = re.sub(r"\s+", " ", comment.body).strip()
+        author = comment.author.strip()
+        if author == "[deleted]" or _is_low_signal_reddit_comment(author, text):
+            continue
+        remaining = REDDIT_COMMENTS_CACHE_CHAR_LIMIT - total_len
+        if remaining <= 0 or len(formatted_comments) >= REDDIT_COMMENT_LIMIT:
+            break
+        formatted = (f"/u/{author}: {text}" if author else text)[:remaining]
+        formatted_comments.append(formatted)
+        total_len += len(formatted) + 1
+    return formatted_comments
+
+
+# Bound on one Arctic Shift thread fetch (post + comment tree, in parallel,
+# retries included): card taps wait on it, and clients give up after 150 s.
+ARCTIC_THREAD_DEADLINE_SECONDS = 30.0
+
+
+async def _fetch_reddit_arctic_context(url: str | None) -> RedditRssContext | None:
+    """Post text and top comments of a Reddit thread from Arctic Shift."""
+    post_id = _reddit_post_id(url)
+    if not post_id:
+        return None
+    try:
+        posts, comments = await asyncio.wait_for(
+            asyncio.gather(
+                arctic_shift.posts([post_id]), arctic_shift.comment_tree(post_id)
+            ),
+            timeout=ARCTIC_THREAD_DEADLINE_SECONDS,
+        )
+    except arctic_shift.ArcticShiftError as exc:
+        logging.warning("arctic_shift: thread %s failed: %s", post_id, exc)
+        return None
+    except TimeoutError:
+        logging.warning(
+            "arctic_shift: thread %s exceeded %.0f s",
+            post_id,
+            ARCTIC_THREAD_DEADLINE_SECONDS,
+        )
+        return None
+    post = posts[0] if posts else None
+    if post is None and not comments:
+        return None
+    self_text = reddit_post_self_text(post) if post is not None else ""
+    formatted = _format_arctic_comments(comments)
+    return RedditRssContext(
+        self_text=self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT],
+        top_comments=" ".join(formatted)[:REDDIT_COMMENTS_CACHE_CHAR_LIMIT],
+        comment_count=len(formatted),
     )
 
 
@@ -1208,14 +1306,26 @@ def _tldr_cache_key(
     self_text: str,
     top_comments: str,
     article_body: str,
+    source: str = "",
 ) -> str:
     if pointer_thread_target(top_comments, source_id=0) is not None:
         # Generation drops a pointer note (_generate_tldr), so the key does
         # too. Summaries cached under the note itself predate that and
         # invented a discussion (story 38507672); they no longer match.
         top_comments = ""
+    if is_codex_source(source):
+        # Legacy Codex rows cached summaries generated from mixed inputs
+        # (threaded topic HTML as article_body, generated footer in
+        # self_text). Normalize before hashing and mark the inputs so
+        # those keys never match again. Other sources hash exactly as
+        # before — no mass invalidation.
+        self_text = strip_discourse_footer_text(self_text)
+        article_body = ""
+        identity = f"{_llm_cache_identity()}:{CODEX_SUMMARY_INPUT_VERSION}"
+    else:
+        identity = _llm_cache_identity()
     payload = {
-        "identity": _llm_cache_identity(),
+        "identity": identity,
         "title": title,
         "self_text": self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT],
         "top_comments": top_comments[:COMMENT_PROMPT_CHAR_LIMIT],
@@ -1225,14 +1335,27 @@ def _tldr_cache_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _section_limits(source_chars: int) -> tuple[int, int, int]:
-    """Fixed half-pane allowance; source length does not set the budget."""
+def _section_limits(article_chars: int = 0) -> tuple[int, int, int]:
+    """Half-pane allowance: bullet range and word target for one section.
+
+    Long articles get slightly more room; discussions (``article_chars=0``)
+    always get the base allowance.
+    """
+    if article_chars >= 20_000:
+        return 5, 6, 180
+    if article_chars >= 10_000:
+        return 4, 5, 150
     return 3, 4, 120
 
 
-def _section_budget(source_chars: int, *, single_section: bool = False) -> str:
-    """Fixed reading-pane budget; never depends on client dimensions."""
-    minimum, maximum, words = _section_limits(source_chars)
+def _section_max_tokens(base: int, article_chars: int = 0) -> int:
+    """Scale an output-token ceiling with the section's word target."""
+    return base * _section_limits(article_chars)[2] // _section_limits()[2]
+
+
+def _section_budget(article_chars: int = 0, *, single_section: bool = False) -> str:
+    """Reading-pane budget; never depends on client dimensions."""
+    minimum, maximum, words = _section_limits(article_chars)
     if single_section:
         minimum, maximum, words = minimum * 2, maximum * 2, words * 2
     return (
@@ -1240,6 +1363,21 @@ def _section_budget(source_chars: int, *, single_section: bool = False) -> str:
         "Use concrete details and explanations, not just topic labels. "
         "Use fewer words and bullets if the source is thin; never pad or invent details"
     )
+
+
+def _is_feed_copy(text: str, body: str) -> bool:
+    """Whether ``text`` (an RSS feed's copy of the post) is already in ``body``.
+
+    Samples ten 8-word runs across the text and needs most of them in the
+    body, so a preface or list line the extractor dropped still counts.
+    """
+    words = text.split()
+    if len(words) < 16:
+        return False
+    haystack = " ".join(body.split())
+    step = max(1, (len(words) - 8) // 9)
+    runs = [" ".join(words[i : i + 8]) for i in range(0, len(words) - 8, step)][:10]
+    return sum(run in haystack for run in runs) * 2 > len(runs)
 
 
 async def generate_detailed_tldr(
@@ -1258,13 +1396,20 @@ async def generate_detailed_tldr(
             error_text="LLM API key not configured in environment.",
         )
 
+    author_text = self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]
+    body = article_body[:ARTICLE_BODY_CHAR_LIMIT]
     article_section = ""
-    if self_text and len(self_text) >= SELF_TEXT_PROMPT_MIN_CHARS:
-        article_section += f"Author's text:\n{self_text[:SELF_TEXT_PROMPT_CHAR_LIMIT]}"
-    if article_body:
-        article_section += (
-            f"\n\nArticle body:\n{article_body[:ARTICLE_BODY_CHAR_LIMIT]}"
-        )
+    # Sending an RSS feed's copy beside the fetched body repeats the post's
+    # opening, which kept Import AI 475's summary on its lead item.
+    if len(author_text) >= SELF_TEXT_PROMPT_MIN_CHARS and not (
+        body and _is_feed_copy(author_text, body)
+    ):
+        article_section += f"Author's text:\n{author_text}"
+    if body:
+        article_section += f"\n\nArticle body:\n{body}"
+    # RSS self_text is usually the feed's copy of the article body, so the
+    # longer of the two, not their sum, is the article's length.
+    article_chars = max(len(author_text), len(body))
     comments_section = top_comments[:COMMENT_PROMPT_CHAR_LIMIT]
     if pointer_thread_target(top_comments, source_id=0) is not None:
         # "Comments moved to item?id=N" is not a discussion; summarizing it
@@ -1286,18 +1431,20 @@ async def generate_detailed_tldr(
         article_prompt = _load_prompt("article_v4.txt").format(
             title=title,
             article_section=article_section,
-            budget=_section_budget(len(article_section)),
+            budget=_section_budget(article_chars),
         )
         discussion_prompt = _load_prompt("discussion_v4.txt").format(
             title=title,
             comments_section=comments_section,
-            budget=_section_budget(len(comments_section)),
+            budget=_section_budget(),
         )
         article_result, discussion_result = await asyncio.gather(
             _call_llm_for_config(
                 cfg,
                 prompt=article_prompt,
-                max_tokens=_max_tokens_for_provider(cfg, 450),
+                max_tokens=_max_tokens_for_provider(
+                    cfg, _section_max_tokens(450, article_chars)
+                ),
                 on_usage=on_usage,
             ),
             _call_llm_for_config(
@@ -1308,13 +1455,11 @@ async def generate_detailed_tldr(
             ),
         )
         good: list[tuple[str, str]] = []
-        for label, result, source in (
-            ("Article", article_result, article_section),
-            ("Discussion", discussion_result, comments_section),
+        for label, result, chars in (
+            ("Article", article_result, article_chars),
+            ("Discussion", discussion_result, 0),
         ):
-            if result.ok and (
-                text := _shape_tldr(result.content, source_chars=len(source))
-            ):
+            if result.ok and (text := _shape_tldr(result.content, article_chars=chars)):
                 good.append((label, text))
         if len(good) == 2:
             return TldrResult(
@@ -1340,30 +1485,30 @@ async def generate_detailed_tldr(
         return TldrResult(kind="llm_error", error_text="empty LLM response")
 
     if article_section:
-        name, section = "article_only_v4.txt", article_section
-        prompt = _load_prompt(name).format(
+        chars = article_chars
+        prompt = _load_prompt("article_only_v4.txt").format(
             title=title,
-            article_section=section,
-            budget=_section_budget(len(section), single_section=True),
+            article_section=article_section,
+            budget=_section_budget(chars, single_section=True),
         )
     else:
-        name, section = "discussion_only_v4.txt", comments_section
-        prompt = _load_prompt(name).format(
+        chars = 0
+        prompt = _load_prompt("discussion_only_v4.txt").format(
             title=title,
-            comments_section=section,
-            budget=_section_budget(len(section), single_section=True),
+            comments_section=comments_section,
+            budget=_section_budget(single_section=True),
         )
 
     result = await _call_llm_for_config(
         cfg,
         prompt=prompt,
-        max_tokens=_max_tokens_for_provider(cfg, 1000),
+        max_tokens=_max_tokens_for_provider(cfg, _section_max_tokens(1000, chars)),
         on_usage=on_usage,
     )
     if result.ok:
         if text := _shape_tldr(
             result.content,
-            source_chars=len(section),
+            article_chars=chars,
             single_section=True,
         ):
             return TldrResult(kind="ok", tldr=text)
@@ -1491,11 +1636,13 @@ async def _prefetch_tldrs_for_ranked(
                 story = by_id.get(story_id)
                 if stale_added >= stale_per_run or story is None:
                     continue
+                story = effective_codex_story(story)
                 current_key = _tldr_cache_key(
                     title=story.title,
                     self_text=story.self_text or "",
                     top_comments=story.top_comments or "",
                     article_body=story.article_body or "",
+                    source=story.source,
                 )
                 if current_key != cached_keys[story_id]:
                     seen.add(story_id)
@@ -1513,22 +1660,37 @@ async def _prefetch_tldrs_for_ranked(
             return False
         if _is_unfollowed_pointer(story):
             story = await _follow_pointer_thread(db, story)
+            if story is None:
+                return False
 
-        title = story.title
-        self_text = story.self_text or ""
-        top_comments = story.top_comments or ""
-        article_body = story.article_body or ""
+        def _inputs(
+            candidate: Story,
+        ) -> tuple[str, str, str, str, str] | None:
+            candidate = effective_codex_story(candidate)
+            title = candidate.title
+            self_text = candidate.self_text or ""
+            top_comments = candidate.top_comments or ""
+            article_body = candidate.article_body or ""
+            if not (self_text or top_comments or article_body):
+                return None
+            return (
+                title,
+                self_text,
+                top_comments,
+                article_body,
+                _tldr_cache_key(
+                    title=title,
+                    self_text=self_text,
+                    top_comments=top_comments,
+                    article_body=article_body,
+                    source=candidate.source,
+                ),
+            )
 
-        if not (self_text or top_comments or article_body):
+        prepared = _inputs(story)
+        if prepared is None:
             return False
-
-        cache_key = _tldr_cache_key(
-            title=title,
-            self_text=self_text,
-            top_comments=top_comments,
-            article_body=article_body,
-        )
-        if db.get_tldr_cache(story_id, cache_key):
+        if db.get_tldr_cache(story_id, prepared[4]):
             return False
 
         # Stagger LLM starts so the burst doesn't hit free-tier
@@ -1541,19 +1703,56 @@ async def _prefetch_tldrs_for_ranked(
         async with sem:
             # A tap generating this story right now covers it; while this
             # one runs, taps wait for it instead of starting their own.
+            # Shared key: ordinary work never starts while a forced flight
+            # (or any flight) exists.
             flight = Handler._tldr_flights.try_lead(story_id)
             if flight is None:
                 return False
             reply: TldrReply | None = None
             try:
+                # Re-read after leading: a forced tap may have cached fresher
+                # content between capture and lead (stagger/semaphore waits).
+                # Never regenerate from stale input over a fresh row.
+                current = db.get_story(story_id)
+                if current is None:
+                    return False
+                refreshed = _inputs(current)
+                if refreshed is None:
+                    return False
+                if db.get_tldr_cache(story_id, refreshed[4]):
+                    return False
+                title, self_text, top_comments, article_body, cache_key = refreshed
                 result = await generate_detailed_tldr(
                     title,
                     self_text=self_text,
                     top_comments=top_comments,
                     article_body=article_body,
                 )
-                cached = _maybe_cache_tldr(db, story_id, cache_key, result)
-                reply = _tldr_result_reply(db, story_id, result)
+                cached = _maybe_cache_tldr(
+                    db,
+                    story_id,
+                    cache_key,
+                    result,
+                    source_comments=current.comment_count_at_fetch,
+                )
+                if result.kind == "ok" and result.cacheable:
+                    # A complete generation: joiners share the leader's
+                    # exact reply, so bind the same captured snapshot the
+                    # cache row just stored (plus its legacy alias). Halves
+                    # and failures stay snapshot-free: provisional text
+                    # must not masquerade as known coverage.
+                    snapshot = current.comment_count_at_fetch
+                    reply = _tldr_result_reply(
+                        db,
+                        story_id,
+                        result,
+                        {
+                            "comment_count_summarized": snapshot,
+                            "comments_summarized": snapshot,
+                        },
+                    )
+                else:
+                    reply = _tldr_result_reply(db, story_id, result)
                 return cached
             finally:
                 Handler._tldr_flights.land(story_id, flight, reply)
@@ -1702,7 +1901,11 @@ class Handler:
     # contend for the DB pool with warms and regen.
     _tldr_generations = 0
     _tldr_generations_guard = threading.Lock()
-    # Summaries being generated, by story: taps and the warm prefetch share one.
+    # Summaries being generated, by story: taps and the warm prefetch share
+    # one flight, so concurrent work never spends twice. Freshness is bound
+    # to the flight object itself (Flight.forced, bound at creation): a
+    # forced refresh never joins a non-forced flight as satisfaction, and
+    # ordinary work never starts while a forced flight exists (shared key).
     _tldr_flights: SingleFlight[int, TldrReply] = SingleFlight()
 
     @classmethod
@@ -1929,6 +2132,10 @@ class Handler:
             )
         rank_ms = (time.perf_counter() - render_start) * 1000
 
+        # Stored before the deck can be served, so every impression of an
+        # interleaved version has its arms on record.
+        cls._record_interleave(user.id, requested_version, deck)
+        cls._record_deck_scores(user.id, requested_version, deck)
         with cls._dashboard_versions_guard:
             cls._decks[user.id] = DeckState(deck, time.time(), requested_version)
             cls._evict_old_decks_locked()
@@ -1994,6 +2201,97 @@ class Handler:
             t.start()
 
     @classmethod
+    def _record_deck_scores(cls, user_id: int, version: int, deck: WindowDeck) -> None:
+        try:
+            if not any(
+                r.prob_up is not None
+                for views in deck.windows.values()
+                for view in VIEWS
+                for r in views.view(view)
+            ):
+                return
+            windows: dict[str, WindowScores] = {}
+            for window, views in deck.windows.items():
+                try:
+                    pool = views.pool
+                    if pool is None:
+                        raise ValueError(
+                            f"scored window {window} has no pool statistics"
+                        )
+                    cards_list: list[CardScore] = []
+                    for view in VIEWS:
+                        for position, r in enumerate(views.view(view)):
+                            if r.pool_rank is not None:
+                                window_rank = r.pool_rank.window_rank
+                                global_rank = r.pool_rank.global_rank
+                            else:
+                                rank = pool.ranks.get(r.story.id)
+                                window_rank = (
+                                    rank.window_rank if rank is not None else None
+                                )
+                                global_rank = (
+                                    rank.global_rank if rank is not None else None
+                                )
+                            cards_list.append(
+                                CardScore(
+                                    r.story.id,
+                                    view,
+                                    position,
+                                    r.score,
+                                    r.svm_margin,
+                                    r.prob_up,
+                                    r.prob_neutral,
+                                    r.prob_down,
+                                    window_rank,
+                                    global_rank,
+                                )
+                            )
+                    windows[window] = WindowScores(
+                        pool.pool_size,
+                        pool.candidates_total,
+                        pool.quantiles,
+                        tuple(cards_list),
+                    )
+                except Exception:
+                    logging.warning(
+                        "deck scores window skipped user_id=%s version=%s window=%s",
+                        user_id,
+                        version,
+                        window,
+                        exc_info=True,
+                    )
+                    continue
+            if not windows:
+                return
+            cls.db.insert_deck_scores(
+                DeckScores(user_id, version, time.time(), windows)
+            )
+        except Exception:
+            logging.exception("deck scores persist failed user_id=%s", user_id)
+
+    @classmethod
+    def _record_interleave(cls, user_id: int, version: int, deck: WindowDeck) -> None:
+        windows: dict[str, tuple[tuple[int, str], ...]] = {
+            w: tuple((r.story.id, r.arm) for r in views.recommended)
+            for w, views in deck.windows.items()
+        }
+        arms = {arm for picks in windows.values() for _, arm in picks}
+        if not any(arms):
+            return
+        try:
+            cls.db.insert_interleave_deck(
+                InterleaveDeck(
+                    user_id=user_id,
+                    version=version,
+                    created_at=time.time(),
+                    arms=tuple(sorted(arms, key=lambda a: (a != PRODUCTION_ARM, a))),
+                    windows=windows,
+                )
+            )
+        except Exception:
+            logging.exception("interleave deck persist failed user_id=%s", user_id)
+
+    @classmethod
     def _evict_old_decks_locked(cls) -> None:
         excess = len(cls._decks) - cls._MAX_CACHED_DECKS
         if excess <= 0:
@@ -2032,7 +2330,9 @@ class Handler:
         # so this rebuild (and every warm/cold-deck build until the next
         # regen) picks up the new rows instead of a stale snapshot.
         invalidate_candidate_pool()
-        cold_deck = build_cold_deck(cls.db, cls.config, embedder=cls.embedder)
+        cold_deck = build_cold_deck(
+            cls.db, cls.config, embedder=cls.embedder, margin=COLD_DECK_MARGIN
+        )
         cls._cold_deck = cold_deck
         logging.info("cold_deck_rebuilt stories=%s", len(cold_deck.stories()))
 
@@ -2730,16 +3030,28 @@ def _rate_limited_reply(message: str, retry_after_seconds: int) -> TldrReply:
 
 
 def _cached_tldr_reply(
-    cached_tldr: str, story_id: int, cache_key: str, event: str
+    cached_tldr: str,
+    story_id: int,
+    cache_key: str,
+    event: str,
+    snapshot: int | None = None,
 ) -> TldrReply:
-    """Log + serve an exact-key cache hit (early or post-enrich)."""
+    """Log + serve an exact-key cache hit (early or post-enrich).
+
+    *snapshot* is the generation-time source snapshot bound to this exact
+    cached text (None = legacy/unknown, never advertised as current). It is
+    included only when known so older exact-payload contracts keep passing.
+    """
     logging.info(
         "tldr_detail story_id=%s result=%s cache_key=%s",
         story_id,
         event,
         cache_key[:12],
     )
-    return TldrReply({"ok": True, "tldr": cached_tldr, "cached": True})
+    payload: dict[str, object] = {"ok": True, "tldr": cached_tldr, "cached": True}
+    if snapshot is not None:
+        payload["comments_summarized"] = snapshot
+    return TldrReply(payload)
 
 
 def _stale_tldr_fallback(db: Database, story_id: int, reason: str) -> TldrReply | None:
@@ -2747,6 +3059,20 @@ def _stale_tldr_fallback(db: Database, story_id: int, reason: str) -> TldrReply 
     if story is not None and _is_unfollowed_pointer(story):
         # The only row may be a summary invented from the pointer note.
         return None
+    if story is not None and is_codex_source(story.source):
+        # Legacy Codex summaries were generated from mixed inputs; serve
+        # one only when the stored key already matches the normalized
+        # inputs, never a contaminated row.
+        effective = effective_codex_story(story)
+        current_key = _tldr_cache_key(
+            title=effective.title,
+            self_text=effective.self_text or "",
+            top_comments=effective.top_comments or "",
+            article_body=effective.article_body or "",
+            source=effective.source,
+        )
+        if db.get_tldr_cache_keys([story_id]).get(story_id) != current_key:
+            return None
     stale_tldr = db.get_any_tldr_for_story(story_id)
     if not stale_tldr:
         return None
@@ -2812,10 +3138,19 @@ def _tldr_result_reply(
 
 
 def _maybe_cache_tldr(
-    db: Database, story_id: int, cache_key: str, result: TldrResult
+    db: Database,
+    story_id: int,
+    cache_key: str,
+    result: TldrResult,
+    source_comments: int | None = None,
 ) -> bool:
     """Persist a generated TLDR unless it's a salvaged half (True=written);
-    caching a half would evict the story's complete TLDR (one row/story)."""
+    caching a half would evict the story's complete TLDR (one row/story).
+
+    *source_comments* binds the generation's source snapshot to the cached
+    text; callers pass the just-hydrated story's fetched count, never a
+    re-read of the mutable row.
+    """
     if result.kind != "ok" or not result.tldr.strip() or not result.cacheable:
         logging.warning(
             "tldr_detail story_id=%s result=partial_not_cached cache_key=%s",
@@ -2823,7 +3158,7 @@ def _maybe_cache_tldr(
             cache_key[:12],
         )
         return False
-    db.upsert_tldr_cache(story_id, cache_key, result.tldr)
+    db.upsert_tldr_cache(story_id, cache_key, result.tldr, source_comments)
     return True
 
 
@@ -2849,7 +3184,9 @@ def _generate_tldr_reply(
     runtime: type[Handler], user: User, tap: _TldrTap
 ) -> TldrReply:
     """Slot, quota, hydration and the LLM call for one story's summary."""
-    story = tap.story
+    # Effective Codex view (idempotent; the tap handler already applies
+    # it, this covers any other caller). Never written back on this path.
+    story = effective_codex_story(tap.story)
     force_refresh = tap.force_refresh
     needs_active_refresh = tap.needs_active_refresh
     needs_empty_fetch = tap.needs_empty_fetch
@@ -2894,7 +3231,10 @@ def _generate_tldr_reply(
         needs_empty_fetch
         or needs_active_refresh
         or tap_probed_growth
-        or (force_refresh and is_hn_source(story.source) and bool(story.top_comments))
+        # A forced refresh is an explicit freshness request: attempt HN
+        # hydration even when stored counts are zero. Hydration failure keeps
+        # the old content and must not be reported as a fresh snapshot.
+        or (force_refresh and is_hn_source(story.source))
     )
     src_kind: str | None = None
     if story.url and (not story.self_text or not story.top_comments):
@@ -2908,7 +3248,10 @@ def _generate_tldr_reply(
         article_body is None
         and story.url
         and src_kind is None
+        # AINews issue pages and Codex topic HTML are not article input.
+        # Keep the existing LessWrong tap behavior when its context is populated.
         and story.source != AINEWS_SOURCE
+        and not is_codex_source(story.source)
         and len(story.self_text) < 500
         and _is_fetchable_article_url(story.url)
     )
@@ -2922,16 +3265,23 @@ def _generate_tldr_reply(
         from pipeline import fetch_story
 
         async with httpx.AsyncClient(timeout=15.0) as client:
+            # Strict on explicit freshness requests: a returned Story is
+            # verified-fresh evidence of a live fetch, while None marks any
+            # upstream failure (HTTP error, malformed body, no content,
+            # exception) without touching the cached row.
             return await fetch_story(
                 client,
                 story.id,
                 runtime.db,
                 force=needs_active_refresh or tap_probed_growth or force_refresh,
+                strict=force_refresh and is_hn_source(story.source),
             )
 
     async def _src_lane() -> RedditRssContext | LessWrongContext | None:
         if src_kind == "reddit":
             assert story.url is not None
+            if runtime.config.reddit_source == "arctic_shift":
+                return await _fetch_reddit_arctic_context(story.url)
             return await _fetch_reddit_rss_context(story.url)
         if src_kind == "lesswrong":
             assert _lw_post_id is not None
@@ -3018,6 +3368,27 @@ def _generate_tldr_reply(
     elif isinstance(hn_updated, Exception):
         logging.error("Failed to dynamically fetch comments for TLDR: %r", hn_updated)
 
+    if (
+        force_refresh
+        and is_hn_source(story.source)
+        and not isinstance(hn_updated, Story)
+    ):
+        # Definitive hydration failure on an explicit freshness request:
+        # never spend the LLM budget on known-stale input nor claim fresh
+        # coverage. Serve prior text as stale (unknown snapshot) or fail
+        # retryably. A Story result proceeds below with its own input and
+        # the snapshot bound to that input.
+        fallback = _stale_tldr_fallback(runtime.db, story.id, "forced_hydration_failed")
+        if fallback is not None:
+            return fallback
+        return TldrReply(
+            {
+                "error": "Could not refresh the discussion. Please try again later.",
+                "retryable": True,
+            },
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
     article_body = story.article_body or article_body
 
     # Merge the concurrently fetched source context (same semantics as
@@ -3077,11 +3448,16 @@ def _generate_tldr_reply(
         self_text=story.self_text or "",
         top_comments=story.top_comments or "",
         article_body=article_body or "",
+        source=story.source,
     )
-    cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
-    if cached_tldr and not force_refresh:
+    cached_record = runtime.db.get_tldr_cache_record(story.id, cache_key)
+    if cached_record is not None and not force_refresh:
         return _cached_tldr_reply(
-            cached_tldr, story.id, cache_key, "post_enrich_cache_hit"
+            cached_record.text,
+            story.id,
+            cache_key,
+            "post_enrich_cache_hit",
+            cached_record.source_comments,
         )
 
     t_llm = time.perf_counter()
@@ -3113,7 +3489,16 @@ def _generate_tldr_reply(
         return _tldr_result_reply(runtime.db, story.id, result)
     if result.kind == "no_content":
         return _tldr_result_reply(runtime.db, story.id, result)
-    _maybe_cache_tldr(runtime.db, story.id, cache_key, result)
+    # Bind the source snapshot the generation actually summarized: the
+    # just-hydrated fetched count, not a later re-read of the mutable row.
+    # A failed lane leaves the old content and its old count together.
+    _maybe_cache_tldr(
+        runtime.db,
+        story.id,
+        cache_key,
+        result,
+        source_comments=story.comment_count_at_fetch,
+    )
     logging.info(
         "tldr_detail story_id=%s result=generated cache_key=%s "
         "tldr_total_ms=%.0f hydrate_ms=%.0f(hnsrc=%.0f/%.0f/art=%.0f) llm_ms=%.0f "
@@ -3139,9 +3524,80 @@ def _generate_tldr_reply(
         {
             "comment_count_live": live_comment_count,
             "comment_count_summarized": story.comment_count_at_fetch,
+            "comments_summarized": story.comment_count_at_fetch,
             "points": stored.score if stored else story.score,
             "comments": stored.comment_count if stored else story.comment_count,
         },
+    )
+
+
+def _handle_flask_story_stats(runtime: type[Handler]) -> Response:
+    """Live points/comments for one story, without touching generation.
+
+    HN sources get one bounded Firebase check. Anything else (RSS, Reddit,
+    blogs) is served stored counts and never sent to Firebase, so archive
+    Reddit is reported stored, never live. Provenance is per field: a live
+    check that returns comments but no score reports live comments with
+    stored points, never a blended "live". Read-only: no hydration, LLM
+    call, ranking, profile creation or story writes.
+    """
+    raw = request.args.get("story_id", "")
+    try:
+        story_id = int(raw)
+    except (TypeError, ValueError):
+        return _flask_json_response(
+            {"error": "story_id must be an integer"}, status=HTTPStatus.BAD_REQUEST
+        )
+    story = runtime.db.get_story(story_id)
+    if story is None:
+        return _flask_json_response(
+            {"error": "Story not found in database"}, status=HTTPStatus.NOT_FOUND
+        )
+    stored_points = story.score
+    stored_comments = story.comment_count or 0
+
+    def stored_reply(reason: str) -> Response:
+        return _flask_json_response(
+            {
+                "ok": True,
+                "story_id": story.id,
+                "points": stored_points,
+                "points_live": False,
+                "comments": stored_comments,
+                "comments_live": False,
+                "reason": reason,
+            }
+        )
+
+    if not is_hn_source(story.source):
+        return stored_reply("unsupported_source")
+    timeout = runtime.config.tldr_tap_probe_timeout_seconds
+    if timeout <= 0:
+        return stored_reply("probe_disabled")
+    from pipeline import _probe_live_items
+
+    try:
+        items = asyncio.run(_probe_live_items([story], timeout))
+    except Exception:
+        logging.exception("story_stats story_id=%s probe failed", story.id)
+        items = {}
+    live = items.get(story.id)
+    if (
+        live is None
+        or live.descendants < 0
+        or (live.score is not None and live.score < 0)
+    ):
+        return stored_reply("probe_failed")
+    return _flask_json_response(
+        {
+            "ok": True,
+            "story_id": story.id,
+            "points": live.score if live.score is not None else stored_points,
+            "points_live": live.score is not None,
+            "comments": live.descendants,
+            "comments_live": True,
+            "reason": "live_check",
+        }
     )
 
 
@@ -3175,6 +3631,11 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             return _flask_json_response(
                 {"error": "Story not found in database"}, status=HTTPStatus.NOT_FOUND
             )
+        # Stored Codex Forum rows summarize from their effective view
+        # (legacy mixed bodies omitted, generated footer stripped). Raw
+        # rows are never written back on this path: no lane below fires
+        # for this source, so normalization cannot drop preserved data.
+        story = effective_codex_story(story)
 
         # Recent, high-velocity HN threads bypass the cache hit below and the
         # dedicated "already cached" fast path, since CH prewarm data can be
@@ -3200,8 +3661,10 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             self_text=story.self_text or "",
             top_comments=story.top_comments or "",
             article_body=article_body or "",
+            source=story.source,
         )
-        cached_tldr = runtime.db.get_tldr_cache(story.id, cache_key)
+        cached_record = runtime.db.get_tldr_cache_record(story.id, cache_key)
+        cached_tldr = cached_record.text if cached_record is not None else None
         # Tap-time probe: a young HN thread that would otherwise serve cached
         # gets one live-count check first; confirmed growth falls through to
         # hydration below instead of serving stale. Miss/failure serves cached.
@@ -3219,14 +3682,18 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
             if tap_probed_growth:
                 live_comment_count = story.comment_count
         if (
-            cached_tldr
+            cached_record is not None
             and not needs_active_refresh
             and not needs_empty_fetch
             and not force_refresh
             and not tap_probed_growth
         ):
             return _cached_tldr_reply(
-                cached_tldr, story.id, cache_key, "cache_hit"
+                cached_record.text,
+                story.id,
+                cache_key,
+                "cache_hit",
+                cached_record.source_comments,
             ).response()
 
         retry_after = llm_limiter.retry_after_seconds
@@ -3263,16 +3730,48 @@ def _handle_flask_tldr_detail(runtime: type[Handler]) -> Response:
 
         # One generation per story: a request for a story already being
         # generated (another tap, the TUI, the warm prefetch) waits for that
-        # result instead of spending a slot, quota and an LLM call of its own.
-        flight, leading = runtime._tldr_flights.join_or_lead(story.id)
+        # result instead of spending a slot, quota and an LLM call of its
+        # own — unless it asked for a forced refresh, which a non-forced
+        # flight cannot satisfy. Freshness is read off the joined flight
+        # object itself (atomic with the table): a forced joiner of a
+        # non-forced flight waits once, then leads exactly one bounded fresh
+        # follow-up, coalesced with other forced callers through the same
+        # join. A forced joiner of a forced-led flight just waits.
+        flight, leading = runtime._tldr_flights.join_or_lead(
+            story.id, forced=force_refresh
+        )
         if not leading:
-            reply = flight.wait(TLDR_JOIN_TIMEOUT_SECONDS)
+            # Freshness comes off the captured flight itself: a later
+            # lookup of the key could already see a newer flight.
+            joined = flight
+            joined_forced = joined.forced
+            reply = joined.wait(TLDR_JOIN_TIMEOUT_SECONDS)
             logging.info(
-                "tldr_detail story_id=%s result=joined finished=%s",
+                "tldr_detail story_id=%s result=joined finished=%s forced_led=%s",
                 story.id,
                 reply is not None,
+                joined_forced,
             )
-            return (reply or _UNFINISHED_TLDR_REPLY).response()
+            if force_refresh and not joined_forced:
+                flight, leading = runtime._tldr_flights.followup_or_lead(
+                    joined, story.id
+                )
+                if not leading and not flight.forced:
+                    # Our own ordinary is still running after a timed-out
+                    # wait, or a newer ordinary now holds the key: never
+                    # start parallel work, report unfinished instead of a
+                    # stale success.
+                    return _UNFINISHED_TLDR_REPLY.response()
+                if not leading:
+                    follow = flight.wait(TLDR_JOIN_TIMEOUT_SECONDS)
+                    logging.info(
+                        "tldr_detail story_id=%s result=followup finished=%s",
+                        story.id,
+                        follow is not None,
+                    )
+                    return (follow or _UNFINISHED_TLDR_REPLY).response()
+            else:
+                return (reply or _UNFINISHED_TLDR_REPLY).response()
         reply = None
         try:
             reply = _generate_tldr_reply(
@@ -3485,11 +3984,13 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
         story = runtime.db.get_story(story_id)
         if story is None:
             return Response(status=204)
+        story = effective_codex_story(story)
         key = _tldr_cache_key(
             title=story.title,
             self_text=story.self_text or "",
             top_comments=story.top_comments or "",
             article_body=story.article_body or "",
+            source=story.source,
         )
         if _hot_summary_is_stale(story, runtime.config, time.time()):
             # A miss, so opening the story asks tldr-detail, which refreshes
@@ -3499,14 +4000,27 @@ def create_app(runtime: type[Handler] = Handler) -> Flask:
             )
             cached = None
         else:
-            cached = runtime.db.get_tldr_cache(story_id, key)
+            cached = runtime.db.get_tldr_cache_record(story_id, key)
         response = (
-            _cached_tldr_reply(cached, story_id, key, "prefetch_cache_hit").response()
-            if cached
+            _cached_tldr_reply(
+                cached.text,
+                story_id,
+                key,
+                "prefetch_cache_hit",
+                cached.source_comments,
+            ).response()
+            if cached is not None
             else Response(status=204)
         )
         response.headers["Cache-Control"] = "private, no-store"
         return response
+
+    @app.get("/api/story-stats")
+    def story_stats() -> ResponseReturnValue:
+        user = _flask_user(runtime)
+        if not user:
+            return _flask_json_response({"error": "No session"}, status=401)
+        return _handle_flask_story_stats(runtime)
 
     @app.route("/api/tldr-detail", methods=["POST"], provide_automatic_options=False)
     def tldr_detail() -> ResponseReturnValue:
@@ -3560,7 +4074,26 @@ def _log_llm_spend_today(db: Database) -> None:
         )
 
 
-def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
+def wait_for_startup_warms(
+    user_ids: Sequence[int], timeout_s: float, poll_s: float = 1.0
+) -> bool:
+    """Block until each of *user_ids* has a warmed deck or *timeout_s*
+    passes; True when all finished."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if all(Handler._decks.get(uid) is not None for uid in user_ids):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_s)
+
+
+def regen_loop(
+    config: Config,
+    event: threading.Event,
+    db: Database,
+    startup_warm_users: Sequence[int] = (),
+) -> None:
     logging.info("Starting background regeneration loop...")
     from pipeline.hn_dupes import HnDupeResolutionWorker
 
@@ -3581,6 +4114,16 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             config.regen_initial_delay_seconds,
         )
         time.sleep(config.regen_initial_delay_seconds)
+        if startup_warm_users:
+            started = time.monotonic()
+            done = wait_for_startup_warms(
+                startup_warm_users, config.regen_startup_warm_wait_seconds
+            )
+            logging.info(
+                "first regen waited %.0f s for startup warms (%s)",
+                time.monotonic() - started,
+                "done" if done else "timed out",
+            )
         event.set()
     while True:
         # Wait on event or timeout
@@ -3609,7 +4152,9 @@ def regen_loop(config: Config, event: threading.Event, db: Database) -> None:
             _log_llm_spend_today(db)
             reddit_worker.submit()
 
-            cold_deck = Handler._cold_deck
+            # Background work covers what the cold deck held before its reserve
+            # deepened; the reserve only backfills a voter's votes on reads.
+            cold_deck = Handler._cold_deck.capped(VIEW_SIZE * SELECT_MARGIN)
             if _wants_background_tasks(config, cold_deck):
                 t = threading.Thread(
                     target=lambda: Handler._warm_background_tasks(
@@ -3698,11 +4243,20 @@ def main() -> None:
     Handler.embedder = embedder
     Handler.regen_event = regen_event
     set_llm_usage_recorder(db.record_llm_usage)
+    from pipeline import warm_store
+
+    warm_store.configure(
+        Path(config.warm_start_dir).expanduser()
+        if config.warm_start_dir
+        else warm_store.default_directory()
+    )
     Handler._rebuild_cold_deck()
-    Handler.warm_recent_users()
+    warmed = Handler.warm_recent_users()
 
     # Start regen thread
-    t = threading.Thread(target=regen_loop, args=(config, regen_event, db), daemon=True)
+    t = threading.Thread(
+        target=regen_loop, args=(config, regen_event, db, warmed), daemon=True
+    )
     t.start()
     threading.Thread(
         target=hot_refresh_loop, args=(config, db), name="hot-refresh", daemon=True

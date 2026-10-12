@@ -209,6 +209,26 @@ def test_parse_tolerates_missing_badges_from_older_servers() -> None:
     assert [story.badges for story in Feed.parse(payload).stories] == [[], []]
 
 
+@pytest.mark.parametrize("related", [None, "title", [42], [{}]])
+@pytest.mark.parametrize("field", ["related_upvotes", "ranking_factors"])
+def test_parse_rejects_malformed_related_upvotes(related: object, field: str) -> None:
+    payload = sample_feed().to_dict()
+    stories = cast("list[dict[str, object]]", payload["stories"])
+    stories[0][field] = related
+    with pytest.raises(ValueError):
+        Feed.parse(payload)
+
+
+def test_parse_related_upvotes_and_legacy_default() -> None:
+    payload = sample_feed().to_dict()
+    stories = cast("list[dict[str, object]]", payload["stories"])
+    stories[0]["related_upvotes"] = ["Upvote\x1b[31m"]
+    del stories[1]["related_upvotes"]
+    parsed = Feed.parse(payload)
+    assert "\x1b" not in parsed.stories[0].related_upvotes[0]
+    assert parsed.stories[1].related_upvotes == []
+
+
 @pytest.mark.parametrize(
     "change",
     [{"window": "recent"}, {"window": None}, {"orders": {"date": []}}],

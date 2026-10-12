@@ -14,6 +14,7 @@ from textual.widgets import Button, Input, Markdown, OptionList, Select, Static,
 from hn_rerank.app import (
     EMPTY_NOTICE,
     LIGHT_PALETTE,
+    VIEW_LIMIT,
     Reader,
     Setup,
     _cell_len,
@@ -164,7 +165,13 @@ async def test_filter_change_starts_at_first_story(width: int) -> None:
             app.query_one("#sort", Select).value = "recommended"
         else:
             await pilot.click("#sort-recommended")
-        await pilot.pause()
+        deadline = time.monotonic() + 5.0
+        while (selected := app.selected()) is None or selected.id != 1:
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "recommended filter did not select its first story"
+                )
+            await pilot.pause(0.05)
         assert listing.highlighted == 0
         selected = app.selected()
         assert selected is not None and selected.id == 1
@@ -238,6 +245,19 @@ async def test_wide_footer_is_one_row() -> None:
         app.context_status()
         await pilot.pause()
         assert "b badges" in str(app.query_one("#shortcuts", Static).content)
+
+
+@pytest.mark.parametrize("width", [100, 240])
+async def test_wide_layout_gives_list_a_third(width: int) -> None:
+    app = Reader(api=FakeServer().api())
+    async with app.run_test(size=(width, 40)) as pilot:
+        await settle(pilot)
+        available = app.query_one("#panes").region
+        listing = app.query_one("#headlines").region
+        pane = app.query_one("#reading-pane").region
+        assert listing.y == pane.y
+        assert listing.width + pane.width == available.width
+        assert abs(listing.width - available.width / 3) <= 1
 
 
 @pytest.mark.parametrize("size", [(51, 37), (80, 30), (140, 40)])
@@ -479,14 +499,14 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
         await settle(pilot)
         app.query_one(OptionList).focus()
         for _ in Reader.SORT_CYCLE:
-            assert len(app.stories) == 12
+            assert len(app.stories) == VIEW_LIMIT
             await pilot.press("s")
             await settle(pilot)
         assert str(app.query_one("#sort", Select).value) == "recommended"
-        assert [s.id for s in app.stories] == ids[:12]
+        assert [s.id for s in app.stories] == ids[:VIEW_LIMIT]
         app.rated.add(1)
         app.rebuild()
-        assert [s.id for s in app.stories] == ids[1:13]
+        assert [s.id for s in app.stories] == ids[1 : VIEW_LIMIT + 1]
 
 
 def test_headline_truncates_long_domains_to_fit() -> None:
@@ -517,15 +537,15 @@ async def test_failure_copy_in_reading_pane() -> None:
         markdown = app.query_one(Markdown)._markdown
         assert "# Could not reach server" in markdown
         assert "Connection failed" in markdown
-        assert "**r** to retry" in markdown
+        assert "Switch sort or time window to retry." in markdown
         assert app.query_one("#status").has_class("error")
         assert not str(app.query_one("#story-heading", Static).content)
         server.fail_feed = False
-        app.action_refresh()
+        # r cannot refetch a failed feed anymore; a filter switch retries it.
+        app.query_one("#sort", Select).value = "popular"
         await settle(pilot)
-        assert [s.id for s in app.stories] == [1, 2]
+        assert [s.id for s in app.stories] == [1]
         assert "Could not reach server" not in app.query_one(Markdown)._markdown
-        assert str(app.query_one("#status", Static).content) == "2 shown · +0 ~0 −0"
 
 
 async def test_empty_notice_heading() -> None:
@@ -555,12 +575,11 @@ async def test_setup_modal_chrome(tmp_path: Path) -> None:
         assert len(widths) == 1
 
 
-async def test_reading_measure_cap() -> None:
+async def test_wide_story_heading_rule() -> None:
     fake = EditorialServer()
     app = Reader(api=fake.api())
     async with app.run_test(size=(220, 40)) as pilot:
         await settle(pilot)
-        assert app.query_one("#reading-pane").region.width <= 100
         assert app.query_one("#story-heading").styles.border_bottom[0] == "solid"
 
 
@@ -610,6 +629,31 @@ async def test_badge_legend_hotkey_and_escape_restore_story() -> None:
         assert "Section 0" in app.query_one(Markdown)._markdown
 
 
+async def test_why_story_hotkey_and_escape_restore_summary() -> None:
+    app = Reader(api=EditorialServer().api())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        selected = app.selected()
+        assert selected is not None
+        app.stories[app.stories.index(selected)] = replace(
+            selected,
+            related_upvotes=["An *upvote*", "Another upvote"],
+            ranking_factors=["Helped: Content model", "Hurt: Word model"],
+        )
+        await pilot.press("w")
+        await pilot.pause()
+        panel = app.query_one(Markdown)._markdown
+        assert "# Why this story" in panel
+        assert "learned preferences" in panel
+        assert r"An \*upvote\*" in panel
+        assert "Another upvote" in panel
+        assert "Helped: Content model" in panel
+        assert "Hurt: Word model" in panel
+        await pilot.press("escape")
+        await settle(pilot)
+        assert "Section 0" in app.query_one(Markdown)._markdown
+
+
 async def test_help_escape_restores_story_view_and_survives_refresh() -> None:
     fake = EditorialServer()
     app = Reader(api=fake.api())
@@ -633,10 +677,16 @@ async def test_reading_heading_tracks_refreshed_story_data() -> None:
     async with app.run_test(size=(120, 35)) as pilot:
         await settle(pilot)
         fake.feed.stories[0] = replace(fake.feed.stories[0], points=999, comments=123)
+        # r regenerates the summary without refetching the feed: the heading
+        # keeps the served counts until a feed refresh carries the new ones.
         app.action_refresh()
         await settle(pilot)
         selected = app.selected()
         assert selected and selected.id == 1
+        heading = str(app.query_one("#story-heading", Static).content)
+        assert "· ▲ 100 · 💬 10" in heading
+        app.refresh_feed(announce=False)
+        await settle(pilot)
         heading = str(app.query_one("#story-heading", Static).content)
         assert "· ▲ 999 · 💬 123" in heading
 

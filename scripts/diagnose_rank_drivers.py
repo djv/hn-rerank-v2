@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 import numpy as np  # noqa: E402
 from database import Database  # noqa: E402
 from pipeline import Config, Embedder, load_production_candidate_stories  # noqa: E402
+from pipeline.joined_classifier import JoinedLogistic  # noqa: E402
 from pipeline.ranking import (  # noqa: E402
     _knn_mean_and_max,
     _score_and_rank,
@@ -121,6 +122,8 @@ def main() -> None:
         cached = next(iter(_MODEL_CACHE.values()), None)
         assert cached is not None, "model cache empty after ranking"
         svm, scaler, centers = cached
+        if isinstance(svm, JoinedLogistic):
+            raise SystemExit("margin attribution needs the SVM classifier")
         if centers is None:
             centers = _positive_cluster_centers(
                 fb_embs[(np.array(feedback_labels) == 2)],

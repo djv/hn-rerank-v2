@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import threading
 import time
@@ -13,6 +15,8 @@ from typing import Any, cast
 
 from server import DeckState, Handler, SKELETON_HTML, create_app
 from pipeline import Config, Embedder, RankedStory, WindowDeck, WindowViews
+from pipeline.ranking import VIEW_SIZE
+from clients.tui.src.hn_rerank.models import Window
 from database import Database, Story, User
 from warm_scheduler import WarmScheduler
 
@@ -267,15 +271,25 @@ def test_env(tmp_path, mock_embedder):
     db.close()
 
 
-@pytest.mark.parametrize("size", [0, 1499, 1500, 5000, 10440, 12000, 20000, 30000])
-def test_fixed_pane_budget(size: int) -> None:
+@pytest.mark.parametrize(
+    ("article_chars", "combined", "single"),
+    [
+        (0, "3-4 bullets, aim for 120 words", "6-8 bullets, aim for 240 words"),
+        (9_999, "3-4 bullets, aim for 120 words", "6-8 bullets, aim for 240 words"),
+        (10_000, "4-5 bullets, aim for 150 words", "8-10 bullets, aim for 300 words"),
+        (19_999, "4-5 bullets, aim for 150 words", "8-10 bullets, aim for 300 words"),
+        (20_000, "5-6 bullets, aim for 180 words", "10-12 bullets, aim for 360 words"),
+        (46_000, "5-6 bullets, aim for 180 words", "10-12 bullets, aim for 360 words"),
+    ],
+)
+def test_pane_budget_grows_slightly_for_long_articles(
+    article_chars: int, combined: str, single: str
+) -> None:
     import server
 
-    assert server._section_budget(size, single_section=True).startswith(
-        "6-8 bullets, aim for 240 words"
-    )
-    assert server._section_budget(size).startswith("3-4 bullets, aim for 120 words")
-    assert "never pad or invent" in server._section_budget(size)
+    assert server._section_budget(article_chars).startswith(combined)
+    assert server._section_budget(article_chars, single_section=True).startswith(single)
+    assert "never pad or invent" in server._section_budget(article_chars)
 
 
 @pytest.mark.parametrize(
@@ -302,18 +316,22 @@ def test_prompts_render_budget_placeholder(template: str, fields: dict) -> None:
         **fields,
     )
     assert "3-4 bullets, aim for 120 words" in prompt
-    assert "at most one `####` heading" in prompt
+    if template.startswith("discussion"):
+        assert "at most one `####` heading" in prompt
 
 
 @pytest.mark.parametrize("template", ["article_v4.txt", "article_only_v4.txt"])
 def test_article_prompts_require_full_piece_coverage(template: str) -> None:
     """Article prompts must instruct coverage of every major section — a
     lead-only summary drops trailing sections of long newsletters (Import AI
-    473 lost its third topic starting 88% into the text)."""
+    473 lost its third topic starting 88% into the text), and with no
+    one-bullet-per-section rule Import AI 475 spent all four bullets on its
+    first item."""
     import server
 
     prompt = server._load_prompt(template)
     assert "each major section" in prompt
+    assert "Give each bullet a different section" in prompt
 
 
 @pytest.mark.parametrize("template", ["discussion_only_v4.txt", "discussion_v4.txt"])
@@ -1606,6 +1624,62 @@ def test_active_warm_commits_when_dashboard_version_advances(
     assert rank_perf_rows[0][0] == 2
 
 
+def test_warm_records_the_arms_of_interleaved_decks_only(
+    test_env, mock_embedder, monkeypatch
+) -> None:
+    _, db, _, _, user = test_env
+
+    class TestHandler(Handler):
+        pass
+
+    TestHandler.config = Config(db_path=db.db_path, server_port=0)
+    TestHandler.db = db
+    TestHandler.embedder = mock_embedder
+    TestHandler._decks = {}
+    TestHandler._dashboard_versions = {}
+    TestHandler._cold_deck = WindowDeck()
+    _reset_warm_state(TestHandler)
+
+    def card(story_id: int, arm: str) -> RankedStory:
+        return RankedStory(Story(story_id, "t", None, 1, 1, ""), 0.5, "", arm=arm)
+
+    decks = iter(
+        [
+            WindowDeck(
+                {
+                    "1w": WindowViews(
+                        recommended=(card(5, "joined_all"), card(3, "production")),
+                        popular=(card(8, ""),),
+                    ),
+                    "1d": WindowViews(recommended=(card(3, "production"),)),
+                }
+            ),
+            WindowDeck({"1w": WindowViews(recommended=(card(4, ""),))}),
+        ]
+    )
+
+    def fake_fast_rerank_for_user(database, config, embedder, user_id, **kwargs):
+        return next(decks)
+
+    import pipeline
+
+    monkeypatch.setattr(pipeline, "fast_rerank_for_user", fake_fast_rerank_for_user)
+    TestHandler._run_warm_attempt(user, TestHandler._dashboard_version(user.id))
+    interleaved_version = TestHandler._decks[user.id].version
+    TestHandler._run_warm_attempt(user, TestHandler._bump_user_version(user.id))
+    _drain_warms(TestHandler)
+    assert TestHandler._decks[user.id].version > interleaved_version
+
+    # The impression ledger's dashboard_version is the served deck's version.
+    (recorded,) = db.get_interleave_decks(user.id)
+    assert recorded.version == interleaved_version
+    assert recorded.arms == ("production", "joined_all")
+    assert recorded.windows == {
+        "1w": ((5, "joined_all"), (3, "production")),
+        "1d": ((3, "production"),),
+    }
+
+
 def test_rapid_vote_warms_coalesce_to_latest_version(
     test_env, mock_embedder, monkeypatch
 ) -> None:
@@ -2371,7 +2445,7 @@ def test_flask_test_client_tldr_forces_refresh_for_active_thread(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -2427,7 +2501,7 @@ def test_flask_test_client_tldr_forces_refresh_for_active_thread_even_when_cache
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -2489,7 +2563,7 @@ def test_flask_test_client_tldr_skips_refresh_for_cached_quiet_recent_thread(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -2563,7 +2637,7 @@ def test_flask_test_client_tldr_tap_probe_hydrates_confirmed_growth(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         current = db_.get_story(sid)
         assert current is not None
@@ -2633,7 +2707,7 @@ def test_flask_test_client_tldr_heals_count_past_lagging_hydrate(
 
     monkeypatch.setattr("pipeline._probe_live_counts", mock_probe_live_counts)
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         current = db_.get_story(sid)
         assert current is not None
         # Algolia view of the world: only 40 of the 60 live comments.
@@ -2714,7 +2788,7 @@ def test_flask_test_client_tldr_tap_probe_failure_serves_cached(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -2776,7 +2850,7 @@ def test_flask_test_client_tldr_tap_probe_skipped_for_old_thread(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -2832,9 +2906,11 @@ def test_flask_test_client_tldr_force_refresh_regenerates(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
-        calls.append({"sid": sid, "force": force})
-        return None  # no new comments; post-enrich key is unchanged
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
+        calls.append({"sid": sid, "force": force, "strict": strict})
+        # Verified fetch with unchanged content: the post-enrich key matches,
+        # but force skips that hit and regenerates anyway.
+        return db_.get_story(sid)
 
     monkeypatch.setattr("pipeline.fetch_story", mock_fetch_story)
 
@@ -2855,7 +2931,7 @@ def test_flask_test_client_tldr_force_refresh_regenerates(
     )
 
     assert resp.status_code == 200
-    assert calls == [{"sid": quiet_story.id, "force": True}]
+    assert calls == [{"sid": quiet_story.id, "force": True, "strict": True}]
     assert llm_calls == 1  # post-enrich hit skipped despite unchanged key
     body = resp.get_json()
     assert body["tldr"] == "Fresh forced TLDR"
@@ -2990,7 +3066,7 @@ def test_flask_test_client_tldr_skips_refresh_for_quiet_recent_thread(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -3039,7 +3115,7 @@ def test_flask_test_client_tldr_skips_refresh_for_old_active_thread(
 
     calls: list[dict[str, Any]] = []
 
-    async def mock_fetch_story(client_, sid, db_, *, force=False):
+    async def mock_fetch_story(client_, sid, db_, *, force=False, strict=False):
         calls.append({"sid": sid, "force": force})
         return None
 
@@ -3710,6 +3786,73 @@ def test_tldr_detail_fetches_reddit_rss_comments(test_env, monkeypatch):
     )
 
 
+def test_tldr_detail_reads_reddit_thread_from_arctic_shift(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With reddit_source="arctic_shift" a Reddit card's thread comes from
+    Arctic Shift, never from Reddit's per-post RSS."""
+    port, db, _, handler, user = test_env
+    monkeypatch.setattr(
+        handler, "config", replace(handler.config, reddit_source="arctic_shift")
+    )
+    url = "https://www.reddit.com/r/LocalLLaMA/comments/abc123/arctic_test/"
+    db.upsert_story(
+        Story(
+            id=-4321,
+            title="Arctic test",
+            url=url,
+            score=0,
+            time=1600000000,
+            text_content="Arctic test.",
+            source="rss_reddit_localllama",
+            comment_count=None,
+            discussion_url=None,
+            comment_count_at_fetch=0,
+            self_text="",
+            top_comments="",
+            article_body="",
+        )
+    )
+    import server
+
+    requested: list[str | None] = []
+
+    async def fake_arctic_context(
+        story_url: str | None,
+    ) -> server.RedditRssContext:
+        requested.append(story_url)
+        return server.RedditRssContext(
+            self_text="Archived post body.",
+            top_comments="/u/alice: Archived comment about the model.",
+            comment_count=1,
+        )
+
+    async def no_rss(_url: str | None) -> None:
+        raise AssertionError("Reddit RSS must not be fetched in arctic mode")
+
+    async def fake_generate_detailed_tldr(
+        title: str, self_text: str, top_comments: str, article_body: str
+    ) -> server.TldrResult:
+        return server.TldrResult(kind="ok", tldr=f"TLDR: {top_comments}")
+
+    monkeypatch.setattr(server, "_fetch_reddit_arctic_context", fake_arctic_context)
+    monkeypatch.setattr(server, "_fetch_reddit_rss_context", no_rss)
+    monkeypatch.setattr(server, "generate_detailed_tldr", fake_generate_detailed_tldr)
+
+    resp = local_http.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": -4321},
+        cookies={"hn_token": user.token},
+    )
+
+    assert resp.status_code == 200
+    assert "Archived comment" in resp.json()["tldr"]
+    assert requested == [url]
+    stored = db.get_story(-4321)
+    assert stored is not None
+    assert "Archived comment" in stored.top_comments
+
+
 def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     port, db, _, _, user = test_env
     db.upsert_story(
@@ -3731,7 +3874,7 @@ def test_tldr_detail_dynamic_fetch(test_env, monkeypatch):
     )
 
     # Mock fetch_story and _fetch_article_body
-    async def mock_fetch_story(client, sid, database, *, force=False):
+    async def mock_fetch_story(client, sid, database, *, force=False, strict=False):
         story = database.get_story(sid)
         from dataclasses import replace
 
@@ -3798,7 +3941,7 @@ def test_tldr_detail_hydrates_archive_seed_comments_on_demand(
         )
     )
 
-    async def mock_fetch_story(client, sid, database, *, force=False):
+    async def mock_fetch_story(client, sid, database, *, force=False, strict=False):
         from dataclasses import replace
 
         updated = replace(database.get_story(sid), top_comments="Fetched comments")
@@ -4869,13 +5012,27 @@ async def test_call_llm_responses_success_and_429(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "article_chars,comment_chars",
-    [(10_440, 0), (24_067, 0), (0, 24_000), (24_067, 13_000), (5_000, 24_000)],
+    ("article_chars", "comment_chars", "expected"),
+    [
+        (5_000, 0, [("Article", 240, 8, 1000)]),
+        (10_440, 0, [("Article", 300, 10, 1250)]),
+        (24_067, 0, [("Article", 360, 12, 1500)]),
+        (0, 24_000, [("Discussion", 240, 8, 1000)]),
+        (24_067, 13_000, [("Article", 180, 6, 675), ("Discussion", 120, 4, 450)]),
+        (5_000, 24_000, [("Article", 120, 4, 450), ("Discussion", 120, 4, 450)]),
+    ],
 )
-async def test_generated_tldr_preserves_fixed_pane_allowance(
-    monkeypatch: pytest.MonkeyPatch, article_chars: int, comment_chars: int
+async def test_generated_tldr_preserves_pane_allowance(
+    monkeypatch: pytest.MonkeyPatch,
+    article_chars: int,
+    comment_chars: int,
+    expected: list[tuple[str, int, int, int]],
 ) -> None:
+    """Each section gets its word target, token ceiling and bullet cap: long
+    articles slightly more, discussions always the base."""
     import server
+
+    calls: dict[str, tuple[str, int]] = {}
 
     async def fake_call(
         cfg: server.LlmProviderConfig,
@@ -4884,8 +5041,8 @@ async def test_generated_tldr_preserves_fixed_pane_allowance(
         max_tokens: int,
         on_usage: server.LlmUsageRecorder | None = None,
     ) -> server.LlmChatResult:
-        words = 120 if article_chars and comment_chars else 240
-        assert f"aim for {words} words" in prompt
+        label = "Article" if "Summarize the article" in prompt else "Discussion"
+        calls[label] = (prompt, max_tokens)
         return server.LlmChatResult(
             ok=True, content="\n".join(f"- Topic {i}" for i in range(1, 20))
         )
@@ -4900,10 +5057,13 @@ async def test_generated_tldr_preserves_fixed_pane_allowance(
     )
     assert result.kind == "ok"
     assert result.cacheable
+    assert sorted(calls) == sorted(label for label, *_ in expected)
     sections = [part for part in result.tldr.split("### ") if part.strip()]
-    expected = [4, 4] if article_chars and comment_chars else [8]
     assert len(sections) == len(expected)
-    for section, count in zip(sections, expected, strict=True):
+    for section, (label, words, count, tokens) in zip(sections, expected, strict=True):
+        prompt, max_tokens = calls[label]
+        assert f"aim for {words} words" in prompt
+        assert max_tokens == tokens
         assert section.count("- Topic ") == count
         assert f"- Topic {count}" in section
         assert f"- Topic {count + 1}" not in section
@@ -4944,6 +5104,75 @@ async def test_generate_detailed_tldr_combined_prompt_contract(
     assert "3-4 bullets, aim for 120 words" in discussion_prompt
     assert "Use **bold** key terms" in article_prompt
     assert "Use **bold** key terms in every content bullet" in discussion_prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_tldr_counts_feed_copy_of_article_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RSS self_text is the feed's copy of the article, so it does not add to
+    the fetched body's length: 8k + 9k of the same post keeps the base budget."""
+    import server
+
+    calls: list[tuple[str, int]] = []
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        calls.append((prompt, max_tokens))
+        return server.LlmChatResult(content="- **Item:** point", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    await server.generate_detailed_tldr(
+        "Newsletter", self_text="x" * 8_000, article_body="x" * 9_000
+    )
+
+    [(prompt, max_tokens)] = calls
+    assert "6-8 bullets, aim for 240 words" in prompt
+    assert max_tokens == 1000
+
+
+@pytest.mark.asyncio
+async def test_generate_detailed_tldr_sends_feed_copy_of_body_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An RSS feed's copy of the fetched article is dropped from the prompt
+    (repeating the opening kept Import AI 475 on its lead item), while a
+    distinct author's text, or one the body only partly contains, stays."""
+    import server
+
+    prompts: list[str] = []
+
+    async def mock_call_llm_chat(
+        *, api_key, base_url, model, prompt, max_tokens, extra=None
+    ):
+        prompts.append(prompt)
+        return server.LlmChatResult(content="- **Item:** point", ok=True)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "mistral")
+    monkeypatch.setattr(server, "_call_llm_chat", mock_call_llm_chat)
+
+    post = " ".join(f"w{i}" for i in range(2_000))
+    feed_copy = "Welcome to the newsletter. " + post[:8_000]
+    own_text = " ".join(f"own{i}" for i in range(300))
+    for self_text, body in (
+        (feed_copy, post),
+        (own_text, post),
+        (feed_copy, post[:2_000]),
+    ):
+        await server.generate_detailed_tldr(
+            "Newsletter", self_text=self_text, article_body=body
+        )
+
+    copy_prompt, own_prompt, partial_prompt = prompts
+    assert "Author's text:" not in copy_prompt
+    assert "Article body:" in copy_prompt
+    assert "Author's text:" in own_prompt
+    assert "Author's text:" in partial_prompt
 
 
 @pytest.mark.asyncio
@@ -5073,7 +5302,7 @@ async def test_generate_detailed_tldr_returns_stub_when_no_content(
     assert result.kind == "no_content"
 
 
-def test_keydown_guard_excludes_buttons_and_anchors():
+def test_keydown_guard_excludes_buttons_and_anchors() -> None:
     """Regression: the global keydown handler in static/dashboard.js must not
     bail out when a <button> or <a> has focus, otherwise clicking a mode tab
     or vote button blocks the next ArrowUp/ArrowDown from registering.
@@ -5094,6 +5323,8 @@ def test_keydown_guard_excludes_buttons_and_anchors():
     assert "textarea" in guard, "textarea should still block"
     assert "select" in guard, "select should still block"
     assert '[contenteditable="true"]' in guard, "contenteditable should still block"
+    # The native Why-this-story expander participates in keyboard navigation.
+    assert "summary" not in guard, "summary should not block global shortcuts"
 
 
 def test_extract_lesswrong_post_id():
@@ -5524,6 +5755,42 @@ def test_pool_changed_stales_every_deck_and_queues_cached_users(swr_handler):
         uid: v + 1 for uid, v in before.items()
     }
     assert sorted(calls) == sorted([(user.id, 4), (other.id, 2)])
+
+
+def test_voter_without_deck_gets_full_views_from_cold_deck(swr_handler) -> None:
+    # After a restart a voter is served the shared cold deck less their votes
+    # until the first warm lands; a heavy voter has voted its top stories,
+    # and the reserve must still fill each served view.
+    user, h = swr_handler
+    now = int(time.time())
+    n = 3 * VIEW_SIZE
+    for i in range(n):
+        h.db.upsert_story(
+            Story(
+                800_000 + i,
+                f"Busy story {i}",
+                f"https://example.com/busy/{i}",
+                5000 - i,
+                now - 3600,
+                "story text",
+                source="hn",
+                comment_count=10,
+            )
+        )
+    voted = {800_000 + i for i in range(2 * VIEW_SIZE)}
+    for sid in voted:
+        h.db.upsert_feedback(user.id, sid, "down")
+    h._trigger_warm = classmethod(  # type: ignore[method-assign]
+        lambda cls, *a, **kw: None
+    )
+
+    h._rebuild_cold_deck()
+    feed = h._feed_for_user(user, "1w")
+
+    for view in ("recommended", "popular"):
+        assert len(feed.orders[view]) == VIEW_SIZE
+        assert not voted & set(feed.orders[view])
+    assert feed.orders["popular"] == [800_000 + i for i in range(2 * VIEW_SIZE, n)]
 
 
 def test_page_embeds_the_feed_the_client_builds_cards_from(test_env):
@@ -6697,3 +6964,676 @@ def test_tldr_cache_misses_when_a_busy_thread_outgrew_its_summary(
     db.upsert_tldr_cache(4992, key, "Old thread summary")
     assert db.update_story_counts(4992, 450, 900)
     assert client.get("/api/tldr-cache/4992").status_code == 200
+
+
+def _stats_test_story(
+    story_id: int, source: str = "hn", score: int = 100, comments: int = 10
+) -> Story:
+    return Story(
+        story_id,
+        f"Stats story {story_id}",
+        None,
+        score,
+        1_700_000_000,
+        f"Stats story {story_id} body.",
+        source=source,
+        comment_count=comments,
+        comment_count_at_fetch=comments,
+        top_comments="Existing comments.",
+    )
+
+
+def _authed_client(handler: Any, user: User) -> Any:
+    client = create_app(handler).test_client()
+    client.set_cookie("hn_token", user.token)
+    return client
+
+
+def test_story_stats_requires_session_and_validates_input(test_env: Any) -> None:
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9101))
+    client = create_app(handler).test_client()
+    assert client.get("/api/story-stats?story_id=9101").status_code == 401
+    authed = _authed_client(handler, user)
+    assert authed.get("/api/story-stats?story_id=nope").status_code == 400
+    assert authed.get("/api/story-stats?story_id=999999").status_code == 404
+
+
+def test_story_stats_live_reports_validated_counts_and_writes_nothing(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+    from pipeline import LiveCounts
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9102))
+    probed: list[int] = []
+
+    async def fake_probe(stories: Any, timeout_s: float) -> dict[int, LiveCounts]:
+        assert timeout_s > 0
+        probed.extend(s.id for s in stories)
+        return {s.id: LiveCounts(score=150, descendants=42) for s in stories}
+
+    monkeypatch.setattr("pipeline._probe_live_items", fake_probe)
+
+    async def no_llm(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("stats must never generate")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", no_llm)
+    body = (
+        _authed_client(handler, user).get("/api/story-stats?story_id=9102").get_json()
+    )
+    assert body == {
+        "ok": True,
+        "story_id": 9102,
+        "points": 150,
+        "points_live": True,
+        "comments": 42,
+        "comments_live": True,
+        "reason": "live_check",
+    }
+    assert probed == [9102]
+    reread = db.get_story(9102)
+    assert reread is not None
+    assert (reread.score, reread.comment_count, reread.comment_count_at_fetch) == (
+        100,
+        10,
+        10,
+    )
+    assert db.get_any_tldr_for_story(9102) is None
+
+
+def test_story_stats_probe_failure_reports_stored_silently(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+    from pipeline import LiveCounts
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9103))
+
+    async def failing_probe(stories: Any, timeout_s: float) -> dict[int, LiveCounts]:
+        raise ConnectionError("firebase unreachable")
+
+    monkeypatch.setattr("pipeline._probe_live_items", failing_probe)
+
+    async def no_llm(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("stats must never generate")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", no_llm)
+    body = (
+        _authed_client(handler, user).get("/api/story-stats?story_id=9103").get_json()
+    )
+    assert body == {
+        "ok": True,
+        "story_id": 9103,
+        "points": 100,
+        "points_live": False,
+        "comments": 10,
+        "comments_live": False,
+        "reason": "probe_failed",
+    }
+    reread = db.get_story(9103)
+    assert reread is not None and (reread.score, reread.comment_count) == (100, 10)
+
+
+def test_story_stats_unsupported_source_never_probes(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9104, source="rss_reddit_python"))
+
+    async def no_probe(stories: Any, timeout_s: float) -> Any:
+        raise AssertionError("unsupported sources must not reach Firebase")
+
+    monkeypatch.setattr("pipeline._probe_live_items", no_probe)
+
+    async def no_llm(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("stats must never generate")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", no_llm)
+    body = (
+        _authed_client(handler, user).get("/api/story-stats?story_id=9104").get_json()
+    )
+    assert body["points_live"] is False and body["comments_live"] is False
+    assert body["reason"] == "unsupported_source"
+    assert (body["points"], body["comments"]) == (100, 10)
+
+
+def test_story_stats_missing_score_stays_field_honest(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pipeline import LiveCounts
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9105))
+
+    async def scoreless_probe(stories: Any, timeout_s: float) -> dict[int, LiveCounts]:
+        return {s.id: LiveCounts(score=None, descendants=9) for s in stories}
+
+    monkeypatch.setattr("pipeline._probe_live_items", scoreless_probe)
+    body = (
+        _authed_client(handler, user).get("/api/story-stats?story_id=9105").get_json()
+    )
+    assert body["points"] == 100 and body["points_live"] is False
+    assert body["comments"] == 9 and body["comments_live"] is True
+
+
+def test_story_stats_disabled_probe_reports_stored(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, db, _, handler, user = test_env
+    db.upsert_story(_stats_test_story(9106))
+    handler.config = replace(handler.config, tldr_tap_probe_timeout_seconds=0)
+
+    async def no_probe(stories: Any, timeout_s: float) -> Any:
+        raise AssertionError("disabled probe must not run")
+
+    monkeypatch.setattr("pipeline._probe_live_items", no_probe)
+    body = (
+        _authed_client(handler, user).get("/api/story-stats?story_id=9106").get_json()
+    )
+    assert body["reason"] == "probe_disabled"
+    assert body["points_live"] is False and body["comments_live"] is False
+
+
+def test_tldr_cache_reply_carries_known_snapshot_only(test_env: Any) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    story = _stats_test_story(9107)
+    db.upsert_story(story)
+    key = server._tldr_cache_key(
+        title=story.title,
+        self_text="",
+        top_comments="Existing comments.",
+        article_body="",
+    )
+    db.upsert_tldr_cache(story.id, key, "Snapshot summary", source_comments=40)
+    known = _authed_client(handler, user).get(f"/api/tldr-cache/{story.id}").get_json()
+    assert known["comments_summarized"] == 40
+    db.upsert_tldr_cache(story.id, key, "Legacy summary")
+    legacy = _authed_client(handler, user).get(f"/api/tldr-cache/{story.id}").get_json()
+    assert legacy["tldr"] == "Legacy summary"
+    assert "comments_summarized" not in legacy
+
+
+def _zero_count_story(story_id: int) -> Story:
+    return Story(
+        story_id,
+        f"Quiet story {story_id}",
+        None,
+        5,
+        1_700_000_000,
+        "",
+        source="hn",
+        comment_count=0,
+        comment_count_at_fetch=0,
+        top_comments="",
+    )
+
+
+def test_force_refresh_hydration_failure_serves_stale_without_llm(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_zero_count_story(9108))
+    db.upsert_tldr_cache(9108, "old-key", "Old cached text")
+    seen: list[bool] = []
+
+    async def failing_fetch(
+        client: Any,
+        sid: int,
+        db_: Any,
+        *,
+        force: bool = False,
+        strict: bool = False,
+    ) -> Any:
+        seen.append(strict)
+        raise httpx.ConnectError("algolia unreachable")
+
+    monkeypatch.setattr("pipeline.fetch_story", failing_fetch)
+    llm_calls: list[str] = []
+
+    async def counting_llm(title: str, **kwargs: Any) -> Any:
+        llm_calls.append(title)
+        return server.TldrResult(kind="ok", tldr="must not happen")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", counting_llm)
+    body = (
+        _authed_client(handler, user)
+        .post("/api/tldr-detail", json={"story_id": 9108, "force_refresh": True})
+        .get_json()
+    )
+    assert seen == [True]
+    assert llm_calls == []
+    assert body["tldr"] == "Old cached text"
+    assert body.get("stale") is True
+    assert "comments_summarized" not in body
+    assert db.get_tldr_cache(9108, "old-key") == "Old cached text"
+
+
+def test_force_refresh_hydration_failure_without_stale_is_retryable(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_zero_count_story(9109))
+
+    async def failing_fetch(
+        client: Any,
+        sid: int,
+        db_: Any,
+        *,
+        force: bool = False,
+        strict: bool = False,
+    ) -> Any:
+        raise httpx.ConnectError("algolia unreachable")
+
+    monkeypatch.setattr("pipeline.fetch_story", failing_fetch)
+    llm_calls: list[str] = []
+
+    async def counting_llm(title: str, **kwargs: Any) -> Any:
+        llm_calls.append(title)
+        return server.TldrResult(kind="ok", tldr="must not happen")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", counting_llm)
+    response = _authed_client(handler, user).post(
+        "/api/tldr-detail", json={"story_id": 9109, "force_refresh": True}
+    )
+    assert response.status_code == 503
+    assert response.get_json()["retryable"] is True
+    assert llm_calls == []
+    assert db.get_any_tldr_for_story(9109) is None
+
+
+def test_force_refresh_zero_count_hydrates_and_snapshots(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_zero_count_story(9110))
+    seen: list[bool] = []
+
+    async def fresh_fetch(
+        client: Any,
+        sid: int,
+        db_: Any,
+        *,
+        force: bool = False,
+        strict: bool = False,
+    ) -> Any:
+        seen.append(strict)
+        row = db_.get_story(sid)
+        assert row is not None
+        return replace(
+            row,
+            top_comments="Fresh hydrated discussion here.",
+            comment_count=7,
+            comment_count_at_fetch=7,
+        )
+
+    monkeypatch.setattr("pipeline.fetch_story", fresh_fetch)
+    llm_calls: list[str] = []
+
+    async def fresh_llm(title: str, **kwargs: Any) -> Any:
+        llm_calls.append(title)
+        return server.TldrResult(kind="ok", tldr="Fresh TLDR")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", fresh_llm)
+    body = (
+        _authed_client(handler, user)
+        .post("/api/tldr-detail", json={"story_id": 9110, "force_refresh": True})
+        .get_json()
+    )
+    assert seen == [True]
+    assert llm_calls != []
+    assert body["comment_count_summarized"] == 7
+    assert body["comments_summarized"] == 7
+    fresh_key = server._tldr_cache_key(
+        title="Quiet story 9110",
+        self_text="",
+        top_comments="Fresh hydrated discussion here.",
+        article_body="",
+    )
+    assert db.get_tldr_cache(9110, fresh_key) == "Fresh TLDR"
+    assert db.get_tldr_cache_snapshot(9110, fresh_key) == 7
+
+
+@pytest.mark.parametrize("algolia", ["http-503", "connect-error", "wrong-type"])
+def test_force_refresh_real_fetch_fallback_is_conservative(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch, algolia: str
+) -> None:
+    """The actual fetch_story upstream fallback (no mocks at that layer):
+    HTTP errors, transport failures and malformed items return None under
+    strict, so forced refresh fails retryably without spending the LLM."""
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_zero_count_story(9111))
+
+    class FakeResp:
+        def __init__(self, status: int, body: Any) -> None:
+            self.status_code = status
+            self._body = body
+
+        def json(self) -> Any:
+            if isinstance(self._body, Exception):
+                raise self._body
+            return self._body
+
+    class FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> FakeResp:
+            assert "algolia" in url, f"unexpected outbound {url}"
+            if algolia == "http-503":
+                return FakeResp(503, None)
+            if algolia == "connect-error":
+                raise httpx.ConnectError("down")
+            return FakeResp(200, {"id": 9111, "type": "comment"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    llm_calls: list[str] = []
+
+    async def counting_llm(title: str, **kwargs: Any) -> Any:
+        llm_calls.append(title)
+        return server.TldrResult(kind="ok", tldr="must not happen")
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", counting_llm)
+    response = _authed_client(handler, user).post(
+        "/api/tldr-detail", json={"story_id": 9111, "force_refresh": True}
+    )
+    assert response.status_code == 503
+    assert response.get_json()["retryable"] is True
+    assert llm_calls == []
+    assert db.get_any_tldr_for_story(9111) is None
+
+
+def test_tldr_detail_short_lesswrong_post_keeps_article_fetch(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Populated LessWrong context keeps the pre-Codex article tap behavior."""
+    import server
+
+    port, db, _, _, user = test_env
+    url = "https://www.lesswrong.com/posts/short-post/short-post"
+    db.upsert_story(
+        Story(
+            id=-9100,
+            title="Short LessWrong post",
+            url=url,
+            score=0,
+            time=1600000000,
+            text_content="Short LessWrong post. Short body. Existing comment.",
+            source="rss_lesswrong_com",
+            self_text="Short body.",
+            top_comments="Existing comment.",
+            article_body="",
+        )
+    )
+    article_calls: list[str] = []
+    context_calls: list[str] = []
+    seen_bodies: list[str] = []
+
+    async def recording_fetch(article_url: str) -> server.ArticleFetchResult:
+        article_calls.append(article_url)
+        return server.ArticleFetchResult(body="Full article body", status=200)
+
+    async def unused_context(post_id: str) -> None:
+        context_calls.append(post_id)
+        raise AssertionError("Already populated LessWrong context must not refetch")
+
+    async def capturing_llm(
+        title: str,
+        self_text: str = "",
+        top_comments: str = "",
+        article_body: str = "",
+    ) -> server.TldrResult:
+        seen_bodies.append(article_body)
+        return server.TldrResult(kind="ok", tldr="clean summary")
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", recording_fetch)
+    monkeypatch.setattr(server, "_fetch_lesswrong_context", unused_context)
+    monkeypatch.setattr(server, "generate_detailed_tldr", capturing_llm)
+    response = local_http.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": -9100},
+        cookies={"hn_token": user.token},
+    )
+    assert response.status_code == 200
+    assert article_calls == [url]
+    assert context_calls == []
+    assert seen_bodies == ["Full article body"]
+
+
+def test_tldr_detail_codex_short_post_skips_article_fetch(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short Codex Forum post must never enter the on-demand article lane."""
+    import server
+    from pipeline.codex_forum import CODEX_FORUM_SOURCE
+
+    port, db, _, _, user = test_env
+    # Fetchable host isolates the source policy from the URL blocklist.
+    db.upsert_story(
+        Story(
+            id=9101,
+            title="Speed up codex runs",
+            url="https://example.com/codex-topic-1",
+            score=0,
+            time=1600000000,
+            text_content="Speed up codex runs. How do I speed up my codex runs?",
+            source=CODEX_FORUM_SOURCE,
+            self_text="How do I speed up my codex runs?",
+            top_comments="",
+            article_body="",
+        )
+    )
+
+    article_calls: list[str] = []
+
+    async def recording_fetch(url: str) -> Any:
+        article_calls.append(url)
+        return server.ArticleFetchResult(body="REPLY TEXT MUST NOT APPEAR", status=200)
+
+    seen: dict[str, str] = {}
+
+    async def capturing_llm(
+        title: str,
+        self_text: str = "",
+        top_comments: str = "",
+        article_body: str = "",
+    ) -> Any:
+        seen.update(
+            {
+                "title": title,
+                "self_text": self_text,
+                "top_comments": top_comments,
+                "article_body": article_body,
+            }
+        )
+        return server.TldrResult(kind="ok", tldr="clean summary")
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", recording_fetch)
+    monkeypatch.setattr(server, "generate_detailed_tldr", capturing_llm)
+
+    resp = local_http.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 9101},
+        cookies={"hn_token": user.token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert article_calls == []
+    assert seen["article_body"] == ""
+    assert "How do I speed up my codex runs?" in seen["self_text"]
+
+
+def test_tldr_detail_codex_legacy_row_summarizes_clean_inputs(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy mixed Codex row is summarized from its effective view only."""
+    import server
+    from pipeline.codex_forum import CODEX_FORUM_SOURCE
+
+    port, db, _, _, user = test_env
+    db.upsert_story(
+        Story(
+            id=9102,
+            title="Speed up codex runs",
+            url="https://example.com/codex-topic-2",
+            score=0,
+            time=1600000000,
+            text_content=(
+                "Speed up codex runs. Opening post text 1 post - 1 participant "
+                "Read full topic REPLY TEXT FROM NON-OPENING POSTS"
+            ),
+            source=CODEX_FORUM_SOURCE,
+            self_text="Opening post text 1 post - 1 participant Read full topic",
+            top_comments="",
+            article_body="REPLY TEXT FROM NON-OPENING POSTS",
+        )
+    )
+
+    article_calls: list[str] = []
+
+    async def recording_fetch(url: str) -> Any:
+        article_calls.append(url)
+        return server.ArticleFetchResult(body="MORE REPLY TEXT", status=200)
+
+    seen: dict[str, str] = {}
+
+    async def capturing_llm(
+        title: str,
+        self_text: str = "",
+        top_comments: str = "",
+        article_body: str = "",
+    ) -> Any:
+        seen.update(
+            {
+                "title": title,
+                "self_text": self_text,
+                "top_comments": top_comments,
+                "article_body": article_body,
+            }
+        )
+        return server.TldrResult(kind="ok", tldr="clean summary")
+
+    monkeypatch.setattr(server, "_fetch_article_body_with_result", recording_fetch)
+    monkeypatch.setattr(server, "generate_detailed_tldr", capturing_llm)
+
+    resp = local_http.post(
+        f"http://127.0.0.1:{port}/api/tldr-detail",
+        json={"story_id": 9102},
+        cookies={"hn_token": user.token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert article_calls == []
+    assert seen["article_body"] == ""
+    assert seen["self_text"] == "Opening post text"
+    assert "REPLY TEXT" not in seen["self_text"]
+    # Raw stored row preserved: no tap-time cleanup of cached bodies.
+    stored = db.get_story(9102)
+    assert stored is not None
+    assert stored.article_body == "REPLY TEXT FROM NON-OPENING POSTS"
+
+
+@pytest.mark.parametrize("trained,fail", [(True, False), (True, True), (False, False)])
+def test_warm_deck_scores_logging(
+    test_env: tuple[int, Database, threading.Event, type[Handler], User],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    trained: bool,
+    fail: bool,
+) -> None:
+    import pipeline
+    from pipeline.ranking import assemble_window_deck
+    from database import DeckScores
+
+    port, db, _, TestHandler, user = test_env
+    cards = [
+        RankedStory(
+            Story(i, f"card {i}", None, 100, int(time.time()), ""),
+            i / 10,
+            "",
+            prob_up=0.6 if trained else None,
+            prob_down=0.2 if trained else None,
+            svm_margin=i / 2 if trained else None,
+        )
+        for i in range(1, 12)
+    ]
+    deck = assemble_window_deck(cards, config=Config(), now=time.time())
+    deck = WindowDeck(
+        {
+            w: replace(
+                v, explore=tuple(replace(r, is_novel=True) for r in v.recommended[-3:])
+            )
+            for w, v in deck.windows.items()
+        }
+    )
+    if trained:
+        db.upsert_story(Story(999, "previous vote", None, 1, 1, ""))
+        db.upsert_feedback(user.id, 999, "up")
+    else:
+        TestHandler._cold_deck = deck
+    monkeypatch.setattr(pipeline, "fast_rerank_for_user", lambda *args, **kwargs: deck)
+    monkeypatch.setattr(TestHandler, "_trigger_warm", classmethod(lambda *args: None))
+
+    def broken_insert(scores: DeckScores) -> None:
+        raise RuntimeError("score persistence unavailable")
+
+    if fail:
+        monkeypatch.setattr(db, "insert_deck_scores", broken_insert)
+    TestHandler._decks = {}
+    versions = []
+    for _ in range(2):
+        version = TestHandler._bump_user_version(user.id)
+        TestHandler._run_warm_attempt(user, version)
+        versions.append(version)
+        assert TestHandler._decks[user.id].deck == deck
+    response = local_http.get(
+        f"http://127.0.0.1:{port}/api/feed", cookies={"hn_token": user.token}
+    )
+    assert response.status_code == 200
+    feed_orders = response.json()["orders"]
+    for view in ("recommended", "popular", "explore"):
+        assert feed_orders[view] == [
+            r.story.id for r in deck.windows[cast(Window, "1w")].view(view)
+        ]
+    records = db.get_deck_scores(user.id)
+    if trained and not fail:
+        assert [r.version for r in records] == versions
+        for record in records:
+            assert set(record.windows) == set(deck.windows)
+            for window, scores in record.windows.items():
+                assert [
+                    (c.view, c.position, c.story_id, c.score, c.svm_margin)
+                    for c in scores.cards
+                ] == [
+                    (view, position, r.story.id, r.score, r.svm_margin)
+                    for view in ("recommended", "popular", "explore")
+                    for position, r in enumerate(
+                        deck.windows[cast(Window, window)].view(view)
+                    )
+                ]
+    else:
+        assert records == []
+    if fail:
+        assert "deck scores persist failed" in caplog.text
+        assert "RuntimeError: score persistence unavailable" in caplog.text
+        assert any(record.exc_info for record in caplog.records)
