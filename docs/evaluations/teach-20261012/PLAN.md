@@ -1,6 +1,7 @@
 # Teach: active learning in place of Explore — plan (2026-10-12)
 
-Status: proposed, not approved. Origin: the user's 2026-10-11 idea "redo
+Status: Phase 0 ran 2026-10-12: no-go (FINDINGS.md "Teach Phase 0");
+Phases 1-2 not started. Was: proposed, not approved. Origin: the user's 2026-10-11 idea "redo
 Explore to be just that [stories whose vote teaches the model] and call it
 Teach"; the decision waited for the offline experiments, now done (recency
 and neutral-as-down null, FINDINGS.md 2026-10-11).

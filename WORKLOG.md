@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — Teach Phase 0 simulation (no-go)
+
+User approved Phase 0 of docs/evaluations/teach-20261012/PLAN.md. Codex
+(Sol 6.1 medium) wrote `scripts/simulate_teach.py` and its tests; the agent
+reviewed it, fixed the fold audit's pool/eval id order, and ran it on a VPS
+snapshot of profile 151 (unit `teach-sim`, nice 15, 2 threads, about 60 min).
+Branch checks on the VPS: 1,328 passed / 1 skipped, ruff clean, ty clean on
+the new files. Result: no rule cleared the gate (FINDINGS.md). No runtime
+change.
+
 ## 2026-10-12 — Dropped five weak feeds
 
 config.toml: dropped r/MachineLearning, r/ExpatFIRE, r/financialindependence,

@@ -1,5 +1,32 @@
 # HN Rerank findings
 
+## Teach Phase 0: selection simulation — 2026-10-12
+
+`scripts/simulate_teach.py` (46ebd0b) on a live-DB snapshot (2026-10-12
+01:07 UTC, SHA-256 8f3bab3e…, profile 151, the 29 re-vote rows excluded),
+5 temporal folds as in the evaluator (latest 20% reserved). Per fold the
+earlier half of the held-out votes (160-162 stories) is the pool a rule picks
+from, 25 per round with retraining; the production ranker is scored on the
+fixed later half (160-162). Paired bootstrap against random picks (3 seeds),
+mean over folds. The 200-vote budget exceeded the pools and is excluded.
+
+| rule | AUC at 100 votes | Δ vs random, 95% |
+|---|---|---|
+| none (0 votes) | 0.819 | |
+| random | 0.828 | |
+| near Recommended cutoff | 0.832 | +0.004 [−0.000, +0.009] |
+| P(up) closest to 0.5 | 0.832 | +0.004 [−0.001, +0.008] |
+| 75/25 cutoff + random | 0.832 | +0.004 [−0.001, +0.008] |
+| entropy (Explore's Unsure) | 0.830 | +0.002 [−0.004, +0.007] |
+| novel (Explore's Novel) | 0.828 | −0.000 [−0.006, +0.005] |
+
+Pre-registered gate (a rule's CI above 0 at 100 votes): no-go. Boundary
+rules lead by about +0.004, half again what random votes add (+0.009), but
+the CI touches 0. Explore's current Unsure and Novel picks teach no more
+than random ones. Limit: pools hold only stories the user was shown and voted
+on. Per-story output stays private (laptop). Run: about 60 min, 2 CPUs on the
+VPS.
+
 ## Blind re-vote calibration, recency check, re-votes applied — 2026-10-11
 
 Question: how much ranking headroom is left above production, given that the
