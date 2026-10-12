@@ -53,8 +53,10 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   ty clean; the startup warm wrote profile 151's row (5 windows, no null
   scores); a cold smoke profile wrote none; journal clean.
   Discover (replaces Novel in Explore; FINDINGS "Discover Phase 0"):
-  Phase 1 build approved by the user 2026-10-12, built by Muse on branch
-  `discover`; not merged or deployed.
+  built by Muse (a2caf47), merged (7c362d1) and deployed 2026-10-12 12:31
+  UTC with the user's OK, no independent review (user's choice). VPS gate
+  1,349 passed / 1 skipped, TUI 219 passed; live feed for profile 151 has
+  3 Discover, 3 Unsure and 3 Interest cards in every window; journal clean.
   Teach (active learning in place of Explore): Phase 0 simulation showed
   only a tiny gain over random picks; parked by the user.
   [Evidence](FINDINGS.md#blind-re-vote-calibration-recency-check-re-votes-applied--2026-10-11).
@@ -292,9 +294,9 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
-- Discover: check Muse's build on branch `discover`, run the full gate,
-  offer a review, then deploy with the user's restart OK. Read the result
-  about 2026-11-02 (PLAN.md Phase 2).
+- Discover: read the result about 2026-11-02 (PLAN.md Phase 2: Discover
+  up-rate, novel up-votes per week, Explore down-rate), next to the trial
+  report.
 - After 2026-11-05: replay rank caps and score bars on `deck_scores`
   (FINDINGS "Short-window Recommended: score bar check").
 - After the trial ends (2026-11-05): merge `muse-primary-fallback`, set

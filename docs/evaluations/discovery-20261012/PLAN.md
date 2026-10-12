@@ -3,7 +3,9 @@
 Status: approved to start by the user 2026-10-12 ("go ahead with the
 explore plan"). Phase 0 done: R1 (best production score among far
 stories, tau 0.60) passes the gate (FINDINGS.md "Discover Phase 0").
-Phase 1 needs the user's OK.
+Phase 1 built with R1 at 0.60 (a module constant, `DISCOVER_MAX_SIM_UP`)
+and deployed 2026-10-12 12:31 UTC (7c362d1). Phase 2 measurement runs to
+about 2026-11-02.
 
 ## Why
 
