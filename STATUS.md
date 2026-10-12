@@ -27,6 +27,8 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Training neutral votes as down gave no gain either. Five weak feeds
   (FIRE trio, r/MachineLearning, Haskell Discourse) dropped and deployed
   2026-10-12 00:23 UTC, with the user's OK to restart mid-trial.
+  Teach (active learning in place of Explore): Phase 0 simulation showed
+  only a tiny gain over random picks; parked by the user.
   [Evidence](FINDINGS.md#blind-re-vote-calibration-recency-check-re-votes-applied--2026-10-11).
 - Muse-primary summaries with Mistral fallback: branch `muse-primary-fallback`
   (ddb424d, pushed, not merged or deployed). A failed primary call falls back once,

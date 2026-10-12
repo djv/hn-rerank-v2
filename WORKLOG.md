@@ -9,6 +9,9 @@ snapshot of profile 151 (unit `teach-sim`, nice 15, 2 threads, about 60 min).
 Branch checks on the VPS: 1,328 passed / 1 skipped, ruff clean, ty clean on
 the new files. Result: no rule cleared the gate (FINDINGS.md). No runtime
 change.
+Then added `--initial-train-frac` (d743955) for a tighter rerun, ran a fast
+logistic-regression stand-in (private script, laptop `~/revote`), and stopped
+the rerun when the user parked Teach. VPS `/tmp/teach-sim` removed.
 
 ## 2026-10-12 — Dropped five weak feeds
 

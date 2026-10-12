@@ -27,6 +27,16 @@ than random ones. Limit: pools hold only stories the user was shown and voted
 on. Per-story output stays private (laptop). Run: about 60 min, 2 CPUs on the
 VPS.
 
+Fast stand-in check (user asked for a quicker signal read): a balanced
+up-vs-rest logistic regression on stored embeddings, 40 overlapping temporal
+splits of the same 3,233 votes, pool and evaluation 227 each. No added votes
+0.771; 100 random votes +0.007. Picking where P(up) is closest to 0.5 beat
+random by +0.0016 / +0.0026 / +0.0015 at 25 / 50 / 100 votes (95% CIs above 0,
+though overlapping splits make them too narrow; wins 55-62% of splits);
+near-cutoff was mixed (+0.0015 at 100). A real but tiny signal, matching the
+full run. The tighter full-ranker rerun (`--initial-train-frac 0.3`) was
+stopped after 2 of 5 folds when the user parked Teach (2026-10-12).
+
 ## Blind re-vote calibration, recency check, re-votes applied — 2026-10-11
 
 Question: how much ranking headroom is left above production, given that the
