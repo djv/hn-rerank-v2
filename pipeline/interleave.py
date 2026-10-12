@@ -5,6 +5,9 @@ Each round visits the arms in a fresh random order and every arm adds its
 best story not yet in the list, so any prefix that ends a round holds the
 same number of stories from each arm. A vote on a story credits the arm
 that added it; with equally good arms each arm expects the same credit.
+The served Recommended prefix can now cut a round (the far card takes the
+last served slot): unbiased in expectation, per-deck arm counts can differ
+by one.
 """
 
 from __future__ import annotations

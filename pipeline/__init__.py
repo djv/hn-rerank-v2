@@ -1099,7 +1099,11 @@ def fast_rerank_for_user(
         with trace.stage("interleave_draft"):
             final = draft_recommended(final, arm_rankings, np.random.default_rng())
     with trace.stage("far_card"):
-        final = place_far_card(final)
+        final = place_far_card(
+            final,
+            now=time.time(),
+            horizon=float(config.regen_interval_seconds),
+        )
     return final
 
 

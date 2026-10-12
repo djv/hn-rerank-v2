@@ -8,6 +8,8 @@ from hypothesis import given, settings, strategies as st
 
 from clients.tui.src.hn_rerank.models import Window
 from database import CardScore, Database, DeckScores, Story, WindowScores
+import pytest
+
 from pipeline import (
     Config,
     DISCOVER_MAX_SIM_UP,
@@ -15,6 +17,7 @@ from pipeline import (
     RankedStory,
     WindowDeck,
     WindowViews,
+    draft_recommended,
     place_far_card,
 )
 from pipeline.ranking import (
@@ -25,6 +28,7 @@ from pipeline.ranking import (
 )
 
 NOW = 2_000_000_000.0
+HORIZON = 3600.0
 HEAD = VIEW_SIZE - 1
 
 
@@ -90,7 +94,9 @@ def test_place_far_card_picks_best_far_from_tail_and_discover() -> None:
         _card(20, score=60.0, closest_up=0.5, is_discover=True),
         _card(21, score=30.0, closest_up=0.5, is_discover=True),
     )
-    out = place_far_card(_deck(tuple(head + list(tail)), explore))
+    out = place_far_card(
+        _deck(tuple(head + list(tail)), explore), now=NOW, horizon=HORIZON
+    )
     rec = out.window("1w").recommended
     assert [r.story.id for r in rec[:HEAD]] == [r.story.id for r in head]
     assert rec[HEAD].story.id == 20
@@ -106,7 +112,7 @@ def test_place_far_card_takes_best_tail_when_no_discover_eligible() -> None:
         _card(12, score=40.0, closest_up=0.5),
         _card(13, score=55.0, closest_up=0.5),
     )
-    out = place_far_card(_deck(tuple(head + list(tail))))
+    out = place_far_card(_deck(tuple(head + list(tail))), now=NOW, horizon=HORIZON)
     rec = out.window("1w").recommended
     assert rec[HEAD].story.id == 13
     assert rec[HEAD].arm == FAR_ARM
@@ -119,7 +125,7 @@ def test_place_far_card_tie_breaks_by_lower_id() -> None:
         _card(30, score=50.0, closest_up=0.1),
         _card(20, score=50.0, closest_up=0.1),
     )
-    out = place_far_card(_deck(tuple(head + list(tail))))
+    out = place_far_card(_deck(tuple(head + list(tail))), now=NOW, horizon=HORIZON)
     assert out.window("1w").recommended[HEAD].story.id == 20
 
 
@@ -131,7 +137,7 @@ def test_place_far_card_head_untouched_no_duplicates() -> None:
     )
     explore = (_card(20, score=70.0, closest_up=0.2, is_discover=True),)
     deck = _deck(tuple(head + list(tail)), explore)
-    out = place_far_card(deck)
+    out = place_far_card(deck, now=NOW, horizon=HORIZON)
     for window, views in out.windows.items():
         for view in ("recommended", "explore"):
             ids = [r.story.id for r in getattr(views, view)]
@@ -149,7 +155,9 @@ def test_place_far_card_ignores_head_story_ids_in_explore() -> None:
     head = _head_cards()
     dup = _card(head[0].story.id, score=999.0, closest_up=0.1, is_discover=True)
     tail = (_card(13, score=40.0, closest_up=0.2),)
-    out = place_far_card(_deck(tuple(head + list(tail)), (dup,)))
+    out = place_far_card(
+        _deck(tuple(head + list(tail)), (dup,)), now=NOW, horizon=HORIZON
+    )
     assert out.window("1w").recommended[HEAD].story.id == 13
 
 
@@ -161,7 +169,7 @@ def test_place_far_card_no_eligible_leaves_deck_unchanged() -> None:
     )
     explore = (_card(20, score=60.0, closest_up=0.9, is_discover=True),)
     deck = _deck(tuple(head + list(tail)), explore)
-    out = place_far_card(deck)
+    out = place_far_card(deck, now=NOW, horizon=HORIZON)
     assert out.window("1w").recommended == deck.window("1w").recommended
     assert out.window("1w").explore == deck.window("1w").explore
 
@@ -169,7 +177,7 @@ def test_place_far_card_no_eligible_leaves_deck_unchanged() -> None:
 def test_place_far_card_short_recommended_still_places() -> None:
     head = _head_cards(n=3)
     explore = (_card(20, score=60.0, closest_up=0.2, is_discover=True),)
-    out = place_far_card(_deck(tuple(head), explore))
+    out = place_far_card(_deck(tuple(head), explore), now=NOW, horizon=HORIZON)
     rec = out.window("1w").recommended
     assert [r.story.id for r in rec[:3]] == [r.story.id for r in head]
     assert rec[3].story.id == 20
@@ -275,7 +283,7 @@ def _random_deck(draw: st.DrawFn) -> WindowDeck:
 @settings(deadline=None)
 @given(_random_deck())
 def test_serve_window_far_invariants(deck: WindowDeck) -> None:
-    placed = place_far_card(deck)
+    placed = place_far_card(deck, now=NOW, horizon=HORIZON)
     served = serve_window(placed.window("1w"), "1w", NOW)
     ids = [r.story.id for r in served.recommended]
     assert len(ids) == len(set(ids))
@@ -402,13 +410,15 @@ def test_interleave_report_far_vote_credited_to_no_arm() -> None:
         Impression(11, 100.0, 1, "recommended", "1w"),
     ]
     votes = [Vote(10, "up", 150.0), Vote(11, "up", 150.0)]
-    credited, _ = credit_votes(decks, votes, impressions)
-    assert [(c.story_id, c.arm) for c in credited] == [(10, "production"), (11, "far")]
+    credited, skipped = credit_votes(decks, votes, impressions)
+    assert [(c.story_id, c.arm) for c in credited] == [(10, "production")]
+    assert skipped["far_card"] == 1
     summary = summarize(credited, ["production", "joined_all"], 0.0, 0.05)
     by_arm = cast("dict[str, dict[str, int]]", summary["credited_by_arm"])
     assert set(by_arm) == {"production", "joined_all"}
     assert by_arm["production"] == {"up": 1}
     assert by_arm["joined_all"] == {}
+    assert summary["decks_with_credit"] == 1
 
 
 def test_deck_scores_arm_roundtrip() -> None:
@@ -470,3 +480,180 @@ def test_deck_scores_old_row_without_arm_loads_empty() -> None:
         assert row.windows["1d"].cards[0].arm == ""
     finally:
         db.close()
+
+
+def _deck_scores_payload_with_arm(arm: object) -> dict[str, object]:
+    return {
+        "1d": {
+            "pool_size": 1,
+            "candidates_total": 1,
+            "quantiles": {},
+            "cards": [
+                {
+                    "story_id": 5,
+                    "view": "recommended",
+                    "position": 0,
+                    "score": 0.5,
+                    "svm_margin": None,
+                    "prob_up": 0.7,
+                    "prob_neutral": None,
+                    "prob_down": None,
+                    "window_rank": 0,
+                    "global_rank": 0,
+                    "arm": arm,
+                }
+            ],
+        }
+    }
+
+
+def test_deck_scores_arm_null_raises() -> None:
+    db = Database(":memory:")
+    try:
+        db.execute(
+            "INSERT OR REPLACE INTO deck_scores "
+            "(user_id, version, created_at, windows_json) VALUES (?, ?, ?, ?)",
+            (1, 7, 10.0, json.dumps(_deck_scores_payload_with_arm(None))),
+        )
+        with pytest.raises(ValueError):
+            db.get_deck_scores(1)
+    finally:
+        db.close()
+
+
+def test_deck_scores_arm_int_raises() -> None:
+    db = Database(":memory:")
+    try:
+        db.execute(
+            "INSERT OR REPLACE INTO deck_scores "
+            "(user_id, version, created_at, windows_json) VALUES (?, ?, ?, ?)",
+            (1, 7, 10.0, json.dumps(_deck_scores_payload_with_arm(3))),
+        )
+        with pytest.raises(ValueError):
+            db.get_deck_scores(1)
+    finally:
+        db.close()
+
+
+def test_place_far_card_prefers_staying_within_horizon() -> None:
+    head = _head_cards()
+    old_age = 12 * 3600 - 600
+    leaving = _card(50, score=90.0, closest_up=0.1, age_s=old_age)
+    staying = _card(51, score=80.0, closest_up=0.1, age_s=3600)
+    deck = _deck(tuple(head + [leaving, staying]), window="12h")
+    out = place_far_card(deck, now=NOW, horizon=HORIZON)
+    rec = out.window("12h").recommended
+    assert rec[HEAD].story.id == 51
+    assert rec[HEAD].arm == FAR_ARM
+
+
+def test_place_far_card_falls_back_to_best_when_none_stays() -> None:
+    head = _head_cards()
+    old_age_best = 12 * 3600 - 600
+    old_age_next = 12 * 3600 - 700
+    best = _card(50, score=90.0, closest_up=0.1, age_s=old_age_best)
+    nxt = _card(51, score=80.0, closest_up=0.1, age_s=old_age_next)
+    deck = _deck(tuple(head + [best, nxt]), window="12h")
+    out = place_far_card(deck, now=NOW, horizon=HORIZON)
+    rec = out.window("12h").recommended
+    assert rec[HEAD].story.id == 50
+    assert rec[HEAD].arm == FAR_ARM
+
+
+def test_no_upvotes_leaves_closest_up_none_and_places_nothing() -> None:
+    ranked = [
+        RankedStory(story=_story(i), score=float(10 - i), best_match_title="")
+        for i in range(5)
+    ]
+    closest = np.array([0.1, 0.1, 0.1, 0.1, 0.1], dtype=np.float32)
+    explore = ExploreContext(
+        cand_closest_up=closest,
+        cand_interest=np.zeros(5, dtype=np.int64),
+        interest_sizes=np.zeros(0, dtype=np.int64),
+        row_of={r.story.id: i for i, r in enumerate(ranked)},
+        has_upvotes=False,
+    )
+    deck = assemble_window_deck(ranked, config=Config(), now=NOW, explore=explore)
+    for views in deck.windows.values():
+        for view in ("recommended", "popular", "explore"):
+            for r in getattr(views, view):
+                assert r.closest_up is None
+    placed = place_far_card(deck, now=NOW, horizon=HORIZON)
+    for views in placed.windows.values():
+        for r in views.recommended:
+            assert r.arm != FAR_ARM
+
+
+def test_interleaved_draft_then_far_card_keeps_head_and_records_far() -> None:
+    from pipeline.interleave import PRODUCTION_ARM
+    from server import Handler
+
+    class TestHandler(Handler):
+        pass
+
+    rec = tuple(_card(i, score=float(100 - i), closest_up=0.9) for i in range(1, 25))
+    explore = (
+        _card(100, score=90.0, closest_up=0.1, is_discover=True),
+        _card(101, score=10.0, closest_up=0.1, is_discover=True),
+    )
+    deck = _deck(rec, explore, window="1w")
+    arm_rankings = {"joined_all": [r.story.id for r in reversed(rec)]}
+    rng = np.random.default_rng(0)
+    drafted = draft_recommended(deck, arm_rankings, rng)
+    placed = place_far_card(drafted, now=NOW, horizon=HORIZON)
+    drafted_head = [
+        (r.story.id, r.arm) for r in drafted.window("1w").recommended[:HEAD]
+    ]
+    placed_head = [(r.story.id, r.arm) for r in placed.window("1w").recommended[:HEAD]]
+    assert placed_head == drafted_head
+    far = placed.window("1w").recommended[HEAD]
+    assert far.story.id == 100
+    assert far.arm == FAR_ARM
+    db = Database(":memory:")
+    try:
+        TestHandler.db = db
+        TestHandler._record_interleave(7, 9, placed)
+        (row,) = db.get_interleave_decks(7)
+        picks = row.windows["1w"]
+        assert (100, FAR_ARM) in picks
+        assert all(arm == FAR_ARM or sid != 100 for sid, arm in picks)
+        assert PRODUCTION_ARM in {arm for _, arm in picks}
+    finally:
+        db.close()
+
+
+def test_same_story_head_in_one_window_far_in_another() -> None:
+    shared = _card(500, score=100.0, closest_up=0.1, age_s=3600)
+    head_1d = [shared] + [
+        _card(i, score=float(99 - i), closest_up=0.9, age_s=3600) for i in range(10)
+    ]
+    tail_1d = [
+        _card(600, score=50.0, closest_up=0.1, age_s=3600),
+        _card(601, score=40.0, closest_up=0.1, age_s=3600),
+    ]
+    head_1w = [
+        _card(101 + i, score=float(200 - i), closest_up=0.9, age_s=2 * 86400)
+        for i in range(HEAD)
+    ]
+    tail_1w = [
+        shared,
+        _card(600, score=50.0, closest_up=0.1, age_s=3600),
+        _card(601, score=40.0, closest_up=0.1, age_s=3600),
+    ]
+    deck = WindowDeck(
+        {
+            "1d": WindowViews(recommended=tuple(head_1d + tail_1d)),
+            "1w": WindowViews(recommended=tuple(head_1w + tail_1w)),
+        }
+    )
+    out = place_far_card(deck, now=NOW, horizon=HORIZON)
+    rec_1d = out.window("1d").recommended
+    rec_1w = out.window("1w").recommended
+    assert rec_1d[HEAD].story.id == 600
+    assert rec_1d[HEAD].arm == FAR_ARM
+    assert rec_1w[HEAD].story.id == 500
+    assert rec_1w[HEAD].arm == FAR_ARM
+    head_ids_1d = {r.story.id for r in rec_1d[:HEAD]}
+    assert 500 in head_ids_1d
+    head_card_1d = next(r for r in rec_1d[:HEAD] if r.story.id == 500)
+    assert head_card_1d.arm != FAR_ARM
