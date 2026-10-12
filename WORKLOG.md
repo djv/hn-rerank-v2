@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — Log production scores for every cached deck
+
+Added optional raw SVM margins and typed per-window pool quantiles/ranks,
+retained through view mapping and serve-time filtering. The warm stores every
+cached view card in the additive STRICT `deck_scores` ledger under the same
+requested version as `interleave_decks`; untrained decks write nothing and
+persistence failures log tracebacks without preventing serving. Production
+ranking arithmetic, views, badges, interleaving, impressions and clients are
+unchanged. Tests cover typed DB replacement/round trips, full-pool quantiles
+and ranks, served-view identity, fresh/cached SVM margins and score values,
+and warm coverage/failure/cold behavior. Card-local pool ranks survive HN
+canonicalization; logging-only fields do not change dataclass equality.
+Focused logging/evaluation parity checks: 51 passed. The full gate remains
+unverified here: localhost sockets are denied, and unchanged STRICT migration
+tests fail on SQLite ATTACH. No deployment or commit in this sandbox; the supervisor must review, rerun socket-based tests, and verify
+logging after an authorized restart. No retention job or replay policy added.
+
 ## 2026-10-12 — Teach Phase 0 simulation (no-go)
 
 User approved Phase 0 of docs/evaluations/teach-20261012/PLAN.md. Codex

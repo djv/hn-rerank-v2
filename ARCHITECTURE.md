@@ -1079,3 +1079,55 @@ successful vote can be cleared. Summaries are cached per session and the next
 few stories are prefetched sequentially after the selected one settles, with
 provisional responses excluded from the cache. See
 [terminal release instructions](docs/TUI_RELEASE.md).
+
+### Cached deck score ledger
+
+The additive STRICT `deck_scores` table has `(user_id, version)` as its
+primary key, `created_at`, and `windows_json`. Every trained warm writes one
+row immediately after the interleave ledger, before publishing the cache;
+repeating a version replaces its row. Cold/untrained decks (no `prob_up`)
+write nothing. Persistence errors log a full traceback and serving continues.
+This is logging only: ranking, view selection/order, badges, interleaving,
+impression APIs and clients are unchanged.
+
+`RankedStory.svm_margin` records the up-class SVM decision value before
+min-max normalization (including cached model scoring); it is absent when
+no SVM scored the story, including the alternative JoinedLogistic classifier.
+`WindowViews.pool` carries a typed `WindowPool`, computed in
+`assemble_window_deck` from each full in-window scored pool after view
+assembly. It stores pool size, total rerank candidates,
+p50/p75/p90/p95/p99/max of score, SVM margin, P(up), and P(down), omitting
+metrics with no values. Stable descending production-score ranks are zero
+based, globally and within the window. View mapping and serving retain this
+metadata without using it to select cards. Each card also carries its typed
+`RankedStory.pool_rank` so canonical story-ID replacements preserve the
+original scored candidate's ranks. Logging-only fields are excluded from
+dataclass equality so existing serving/evaluation card comparisons retain
+their semantics.
+
+`DeckScores` / `WindowScores` / `CardScore` become JSON only at the database
+boundary. Every cached view card has story ID, view, position, production
+score, SVM margin, all three class probabilities, and window/global ranks.
+Join impressions in `interaction_events` on `user_id`,
+`dashboard_version = deck_scores.version`, and `story_id`, also matching
+window/view when selecting a card entry. These are warm-time values for the
+cached version, not later rescoring with final points or comments. They enable
+short-window Recommended cap/threshold/fill replay after the trial ends on
+2026-11-05; no such policy is implemented here. At roughly 80 versions per
+day for the main profile and a few hundred cached cards each, expect tens of
+thousands of card entries daily. No retention job exists yet.
+
+Analyst notes:
+- `position` is the index in the cached view, not the served position
+  (served views are capped, Explore is re-sorted, voted stories are
+  stripped); replay by `window_rank`.
+- `score`, `svm_margin` and `prob_*` are production's for every card,
+  including challenger-arm picks; join `interleave_decks` for the arm.
+- `prob_*` are SVM probabilities before the linear blend; `score` is
+  after it.
+- A canonicalized HN duplicate carries the replaced story's values.
+- Pool statistics include stories later dropped by deduplication.
+- The last write wins for a re-warmed version.
+- Cold profiles write no row.
+- Join on `(user_id, version = dashboard_version, window, view,
+  story_id)`; `created_at` is warm time, not impression time.

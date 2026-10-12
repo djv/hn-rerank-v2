@@ -27,7 +27,7 @@ from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
 from clients.tui.src.hn_rerank.models import VIEWS, WINDOWS, View, Window
-from database import Database, Story
+from database import Database, ScoreQuantiles, Story
 from .config import (
     BQ_ARCHIVE_SOURCE,
     CH_ARCHIVE_SOURCE,
@@ -408,6 +408,9 @@ class RankedStory:
     # Interleaved Recommended views only: the arm whose team-draft pick put
     # this story there (pipeline/interleave.py); "" everywhere else.
     arm: str = ""
+    svm_margin: float | None = field(default=None, compare=False)
+    # Per-window score provenance survives canonical story-ID replacement.
+    pool_rank: PoolRank | None = field(default=None, compare=False)
 
 
 def clean_text(raw_text: str, min_len: int = 0) -> str:
@@ -1238,6 +1241,7 @@ def _score_and_rank(
     )
 
     now = time.time()
+    svm_margins: NDArray[np.float64] | None = None
     scores = None
     probs = None
     linear_models: linear_blend.LinearBlendModels | None = None
@@ -1709,6 +1713,8 @@ def _score_and_rank(
                     raw_scores = decision[:, idx_up]
                     probs = _softmax_rows(decision)
             scores = _minmax01(raw_scores)
+            if not isinstance(svm, JoinedLogistic):
+                svm_margins = np.asarray(raw_scores, dtype=np.float64)
         except Exception as e:
             trace.set_label("svm_fit", "error")
             logging.error("Failed to fit feedback SVM: %r", e)
@@ -1840,6 +1846,9 @@ def _score_and_rank(
                         prob_down=float(svm_probs[idx, idx_down]),
                         prob_neutral=float(svm_probs[idx, idx_neutral]),
                         prob_up=float(svm_probs[idx, idx_up]),
+                        svm_margin=float(svm_margins[idx])
+                        if svm_margins is not None
+                        else None,
                     )
                 )
         except (ValueError, IndexError, NameError) as e:
@@ -1848,12 +1857,15 @@ def _score_and_rank(
             ranked = []
 
     if not ranked:
-        for s, score in zip(candidates, scores):
+        for idx, (s, score) in enumerate(zip(candidates, scores)):
             ranked.append(
                 RankedStory(
                     story=s,
                     score=float(score),
                     best_match_title="",
+                    svm_margin=float(svm_margins[idx])
+                    if svm_margins is not None
+                    else None,
                 )
             )
 
@@ -1961,6 +1973,45 @@ def in_window(posted: int, window: Window, now: float) -> bool:
 
 
 @dataclass(frozen=True)
+class PoolRank:
+    window_rank: int
+    global_rank: int
+
+
+@dataclass(frozen=True)
+class WindowPool:
+    """Production-score statistics before any view selection or deduplication.
+
+    Equal scores retain the stable input order used by deck assembly.
+    """
+
+    pool_size: int
+    candidates_total: int
+    quantiles: dict[str, ScoreQuantiles]
+    ranks: dict[int, PoolRank]
+
+
+def window_pool(
+    pool: Sequence[RankedStory],
+    by_score: Sequence[RankedStory],
+    global_ranks: Mapping[int, int],
+) -> WindowPool:
+    quantiles: dict[str, ScoreQuantiles] = {}
+    for metric in ("score", "svm_margin", "prob_up", "prob_down"):
+        values = [v for r in pool if (v := getattr(r, metric)) is not None]
+        if values:
+            quantiles[metric] = ScoreQuantiles(
+                *(float(v) for v in np.percentile(values, [50, 75, 90, 95, 99, 100]))
+            )
+    return WindowPool(
+        len(pool),
+        len(by_score),
+        quantiles,
+        {r.story.id: PoolRank(i, global_ranks[r.story.id]) for i, r in enumerate(pool)},
+    )
+
+
+@dataclass(frozen=True)
 class WindowViews:
     """The three views of one time window. Recommended is in model-score
     order and Popular in HN-gravity order. A cached deck's Explore is in
@@ -1971,6 +2022,7 @@ class WindowViews:
     recommended: tuple[RankedStory, ...] = ()
     popular: tuple[RankedStory, ...] = ()
     explore: tuple[RankedStory, ...] = ()
+    pool: WindowPool | None = field(default=None, compare=False)
 
     def view(self, name: View) -> tuple[RankedStory, ...]:
         if name == "recommended":
@@ -2039,6 +2091,7 @@ class WindowDeck:
                     tuple(fn(w, "recommended", views.recommended)),
                     tuple(fn(w, "popular", views.popular)),
                     tuple(fn(w, "explore", views.explore)),
+                    views.pool,
                 )
                 for w, views in self.windows.items()
             }
@@ -2110,6 +2163,7 @@ def assemble_window_deck(
       dupes`` would drop them downstream anyway; see WORKLOG 2026-07-10).
     """
     by_score = sorted(ranked, key=lambda r: r.score, reverse=True)
+    global_ranks = {r.story.id: i for i, r in enumerate(by_score)}
     velocities = [
         r.story.score / max((now - r.story.time) / 3600.0, 0.1) for r in by_score
     ]
@@ -2245,10 +2299,16 @@ def assemble_window_deck(
                 picked.add(r.story.id)
                 explore_view.append(mark(r))
         explore_view.extend(interest_picks(pool, recommended[:VIEW_SIZE], picked))
+        stats = window_pool(pool, by_score, global_ranks)
+
+        def with_rank(r: RankedStory) -> RankedStory:
+            return replace(r, pool_rank=stats.ranks[r.story.id])
+
         windows[window] = WindowViews(
-            tuple(recommended),
-            tuple(popular_card(r) for r in popular),
-            tuple(explore_view),
+            tuple(with_rank(r) for r in recommended),
+            tuple(with_rank(popular_card(r)) for r in popular),
+            tuple(with_rank(r) for r in explore_view),
+            stats,
         )
     return WindowDeck(windows)
 
@@ -2300,6 +2360,7 @@ def serve_window(views: WindowViews, window: Window, now: float) -> WindowViews:
         tuple(current(views.recommended)[:VIEW_SIZE]),
         tuple(current(views.popular)[:VIEW_SIZE]),
         tuple(explore),
+        views.pool,
     )
 
 
