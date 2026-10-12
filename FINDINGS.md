@@ -1,5 +1,39 @@
 # HN Rerank findings
 
+## Read-only live-feed check — 2026-10-12 16:32 UTC
+
+The user selected Check live feed after `hn rerank rr` and `q`.
+Existing profile 151's authenticated localhost GETs returned 200 for
+all five supported windows (12h, 1d, 1w, 1m, archive), ready=true,
+version=target_version=1791821397103. Each serves 12 Recommended and
+9 Explore cards. Recommended position 12 has the Discover badge in
+every window; the corresponding stored trial row credits that story
+to `far`. Explore has 3 Discover, 3 Unsure and 3 Interest cards.
+The 1d far card is "Tattoos you can turn on and off"; Codex Forum is
+also present in that window's Recommended list. Dashboard and readiness
+GETs returned 200. These verify served data and HTML availability,
+not physical browser/TUI rendering or discovery quality.
+
+Profile 151 has 5,141 interaction events, all impressions. Last 24 h:
+117 impressions, zero article_open/comments_open/dwell. No local reader
+process matched hn-rerank/hn_rerank. Reading-signal delivery is therefore
+still unverified; no reader launch, interaction or synthetic event occurred.
+VPS runtime b1897f4, active/running, NRestarts=0, original 16:09:54 UTC
+start. Warning-or-higher journal since 16:10 UTC has no entries. The
+16:09:54 shutdown warning precedes this check interval. No production
+update, restart, profile creation, vote or provider generation was requested.
+
+Before the user's scope choice, seed 1155516390 reproduced the test failure
+locally: default tol=1e-4 gives max held-out probability gap 0.00762340,
+cold/warm iterations 11/6. Test-only tol=1e-6 reduces the gap to
+0.0000142874 (20/12 iterations); tol=1e-8 gives 0.000000287008 (29/22).
+Muse's small test-only draft is preserved unmerged and uncommitted in
+`/home/d/code/hn-rerank-warm-test-20261012`, branch
+`fix/warm-test-20261012`, changing only tests/test_joined_classifier.py.
+It adds the explicit failed example and tighter test-only solver tolerance;
+the 5e-3 assertion remains. No tests/gates ran on that draft after the user
+switched scope. Production tolerance and main test remain unchanged.
+
 ## Far card deploy — 2026-10-12
 
 The user lifted the Recommended freeze and chose Far 1 (Phase 0's near

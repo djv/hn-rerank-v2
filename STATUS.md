@@ -38,6 +38,12 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Read-only live check 2026-10-12 16:32 UTC: all five profile-151 feed
+  windows ready, 12 Recommended with Discover at slot 12 / trial arm `far`,
+  and 3 cards per Explore badge. Dashboard/readiness 200; service running,
+  no post-start warnings. Only impressions have arrived (5,141 total);
+  opens/dwell and physical rendering remain unverified. FINDINGS "Read-only
+  live-feed check". User selected this check over the test fix.
 - Blind re-vote calibration (46 votes): the user's re-votes separate the
   original ups at AUC 0.785 vs production 0.778. That headroom (+0.007,
   95% −0.12 to +0.12) is not settled; agreement 59%, old votes flip more.
@@ -334,7 +340,10 @@ ranking research remains paused and production trial configuration unchanged.
   card combined). Phase 0b (Combo, Far 1) runs 2026-11-05
   (`fu-20261012-104919-066`).
 - Fix the flaky warm-start test (raise its tolerance or pin the bad seed
-  after checking why lbfgs stops further apart).
+  after checking why lbfgs stops further apart). Recorded seed reproduced;
+  tighter test-only solver tolerance removes the discrepancy. Unvalidated
+  Muse draft parked in `/home/d/code/hn-rerank-warm-test-20261012`
+  (`fix/warm-test-20261012`); not integrated after the user's scope choice.
 - Reading signal: after the user restarts `hn`, confirm `article_open`,
   `comments_open` and `dwell` rows arrive for profile 151; after about two
   weeks, check how opens and dwell relate to votes before using them.
