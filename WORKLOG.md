@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-10-11 — Live DB: blind re-votes applied to profile 151
+
+User asked to apply the calibration re-votes where they differ, then to add
+the June ones too (FINDINGS.md "Blind re-vote calibration"). Through the
+service's own `/api/feedback` on 127.0.0.1 as profile 151, read-only checks
+before and after: 17 votes changed, 12 added (stories voted only by user 1
+in June, outside the 09-29 July-onward merge). 151: 4,059 -> 4,071 votes;
+user 1 unchanged (5,189). New rows: `updated_at` 1791763112.57–1791763180.12.
+No trial impressions on these stories; service active, no journal errors.
+Undo: the prior action/timestamp of each row is in a private file on the
+laptop; restore with SQL (the API would stamp the current time).
+
 ## 2026-10-11 — Plan Codex Forum fixes and handoff to Muse
 
 User requested a fix plan and Muse handoff. Prepared FIX-PLAN.md and

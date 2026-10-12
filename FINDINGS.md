@@ -1,5 +1,52 @@
 # HN Rerank findings
 
+## Blind re-vote calibration, recency check, re-votes applied — 2026-10-11
+
+Question: how much ranking headroom is left above production, given that the
+user's own votes are noisy? The user re-voted, blind, user 1's frozen held-out
+decision1 stories (2,066; 30 with no saved or Muse summary left out) in the
+unchanged TUI against a local stand-in server. Draws used active testing
+(Kossen et al., ICML 2021) and LURE weighting. The tool, draws and labels stay
+private on the laptop (`~/revote`), outside this repo. 46 votes, 8 skips.
+
+- Ceiling (re-votes separating the original ups): AUC 0.785 [0.659, 0.894];
+  whole-pool production 0.778. Headroom +0.007 [−0.118, +0.116]: not
+  settled; ±0.07 needs about 77 more votes.
+- Weighted agreement with the original vote 59%; up/not-up flips 23%.
+  Original downs stayed down; about half of the neutrals are now down; of the
+  ups, 45% stayed up, 30% became neutral, 25% down. Votes older than 95 days
+  flipped 0.33 vs 0.14 for newer ones.
+- On the 46 stories, production separates the original labels better than the
+  re-votes (AUC 0.867 vs 0.837). It ranks high some personal-finance/expat
+  Reddit threads that are now voted down.
+
+Recency check (user chose it over the earlier nulls, see 2026-09-29 and
+2026-10-02): `scripts/eval_ranker_variants.py --user-id 1 --folds 5
+--candidate-pool heldout-feedback --split temporal --window-days 30
+--dump-scores` on a copy of the decision1 snapshot, clean origin/main. Its
+production scores reproduce the pool's (correlation 1.0, none dropped).
+
+| variant | AUC on re-votes | Δ vs control, 95% | AUC original (all held-out) |
+|---|---|---|---|
+| production | 0.837 | | 0.781 |
+| prodlr blend, half_life 100000 (control) | 0.833 | | 0.784 |
+| half_life 60 | 0.837 | +0.004 [0.000, +0.017] | 0.784 |
+| half_life 30 | 0.838 | +0.005 [0.000, +0.019] | 0.784 |
+| margin3_up → recency 30 d | 0.770 → 0.776 | +0.006 [−0.007, +0.027] | 0.772 |
+
+No gain worth shipping, consistent with the earlier nulls. Limit: the folds
+train on votes before their cutoffs, so a very recent taste shift cannot show.
+
+Applied to the live profile (user 2026-10-11): through `/api/feedback`
+as profile 151, 17 differing votes changed (7 neutral→down, 5 up→neutral,
+4 up→down, 1 neutral→up) and 12 June stories, never merged into 151, added
+(4/4/4); 17 matching votes unchanged. 151 has 4,071 votes. User 1 is
+unchanged, so the decision1 eval labels are too. All 29 rows carry
+`updated_at` 1791763112.57–1791763180.12 (2026-10-11 23:58:32–23:59:40 UTC)
+and none of these stories had a trial impression, so the interleave report
+does not credit them. Fresh-vote evals should exclude that window: these
+are re-votes of old stories, not feed votes. Undo record: private, laptop.
+
 ## Codex Forum fix plan and Muse handoff — 2026-10-11
 
 The user requested planning and handing the fixes to Muse. The bounded plan

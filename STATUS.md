@@ -18,6 +18,18 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Blind re-vote calibration (46 votes): the user's re-votes separate the
+  original ups at AUC 0.785 vs production 0.778. That headroom (+0.007,
+  95% −0.12 to +0.12) is not settled; agreement 59%, old votes flip more.
+  Recency weighting gave no gain on the re-votes (+0.004–0.006, CI from 0).
+  At the user's request the re-votes went live on profile 151: 17 changed,
+  12 June stories added; user 1 and trial credit unaffected.
+  [Evidence](FINDINGS.md#blind-re-vote-calibration-recency-check-re-votes-applied--2026-10-11).
+- Muse-primary summaries with Mistral fallback: branch `muse-primary-fallback`
+  (ddb424d, pushed, not merged or deployed). A failed primary call falls back once,
+  and a circuit breaker keeps a rate-limited primary off. Branch checks:
+  backend 1,359 passed / 1 skipped, ruff/format/ty clean; Claude cloud
+  review findings verified and fixed. Not tested against the real Go gateway.
 - Codex Forum scheduled side-vector follow-up verified at 17:06 UTC: the
   ordinary timer encoded all 83 pending vectors and exited successfully.
   Read-only post-job coverage exceeded 99.99% across all 17 feedback profiles;
@@ -235,7 +247,8 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
-No Codex rollout blocker remains. The TUI medium result review is complete
+The Muse-fallback deploy waits for the trial to end (no restart before
+2026-11-05 without the user's OK). No Codex rollout blocker remains. The TUI medium result review is complete
 and its introduced findings corrected.
 Codex Forum source-safety rollout is complete at approved target 794caa4.
 The next ordinary side-vector refresh passed the read-only follow-up. Fresh
@@ -246,6 +259,14 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- After the trial ends (2026-11-05): merge `muse-primary-fallback`, set
+  `LLM_PROVIDER=gospark` and `LLM_FALLBACK_PROVIDER=mistral` in the VPS
+  shared `.env`, restart with the user's OK, smoke-test a tap and watch Go
+  usage. The breaker honors Go's long Retry-After until a restart.
+- Fresh-vote evals: exclude profile 151's 29 re-vote rows
+  (`updated_at` 1791763112.57–1791763180.12).
+- Optional: about 77 more calibration votes (laptop `~/revote/calibrate.py`)
+  would narrow the headroom to ±0.07.
 - CI: watch the first weekly/PR Terminal client run (macOS leg). Windows-only
   flake `test_filter_change_starts_at_first_story[60]` is left unfixed since
   Windows is no longer tested.
