@@ -63,6 +63,7 @@ SCRIPT_MAINS = [
     "seed_hn_from_clickhouse",
     "seed_smoke_test",
     "simulate_interleaving",
+    "simulate_teach",
     "interleave_report",
     "source_yield_report",
 ]
