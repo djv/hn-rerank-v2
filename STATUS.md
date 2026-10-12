@@ -67,6 +67,12 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   `hn`; no server restart.
   Teach (active learning in place of Explore): Phase 0 simulation showed
   only a tiny gain over random picks; parked by the user.
+  Recommended diversity Phase 0 (plan `docs/evaluations/diversity-20261012/`):
+  no re-rank rule passed the pre-set gate. Far 1 (last slot to a story far
+  from up-votes) just missed it: +0.049 diversity against the 0.05 bar,
+  −1.1 points up-rate and twice the novel up-votes. MMR 0.8 was free on
+  up-rate but gained only +0.040. Topic caps cost the most up-rate.
+  Recommended is unchanged. FINDINGS "Diversity Phase 0".
   [Evidence](FINDINGS.md#blind-re-vote-calibration-recency-check-re-votes-applied--2026-10-11).
 - Muse-primary summaries with Mistral fallback: branch `muse-primary-fallback`
   (ddb424d, pushed, not merged or deployed). A failed primary call falls back once,

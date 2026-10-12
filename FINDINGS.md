@@ -1,5 +1,52 @@
 # HN Rerank findings
 
+## Diversity Phase 0: Recommended re-rank rules — 2026-10-12
+
+Plan: `docs/evaluations/diversity-20261012/PLAN.md` (gate fixed before the
+run). Read-only on profile 151:
+- 2,234 stories first shown since 2026-09-24, scored by day-old production
+  models.
+- 35 (day, window) groups of at least 12 stories (17 smaller skipped) over
+  19 days.
+- Each rule picks k = 8 per group.
+- Paired bootstrap over days.
+- Script: laptop `~/revote/diversity-phase0.py`. Muse wrote it. The agent
+  reviewed it and fixed the per-day diversity, which had pooled pairs across
+  windows. The agent then ran it on the VPS.
+
+Production's top 8 (B): up-rate 40.7%, down-rate 12.5%, diversity 0.543
+per group of 8, 4 novel up-votes caught.
+
+| rule | up diff [95% CI] | diversity gain [95% CI] | novel ups | overlap with B |
+|---|---|---|---|---|
+| MMR 0.9 | +1.0 pts [-1.3, +3.6] | +0.022 [0.009, 0.040] | 4 | 92% |
+| MMR 0.8 | -0.3 [-3.2, +2.5] | +0.040 [0.024, 0.060] | 4 | 88% |
+| MMR 0.7 | -3.8 [-8.8, +0.2] | +0.059 [0.037, 0.085] | 4 | 83% |
+| MMR 0.6 | -4.1 [-10.6, +0.8] | +0.087 [0.055, 0.126] | 6 | 75% |
+| Cap 1 per topic | -8.1 [-14.3, -2.4] | +0.044 [0.010, 0.083] | 3 | 72% |
+| Cap 2 per topic | -2.7 [-6.5, +0.5] | +0.020 [0.005, 0.042] | 4 | 89% |
+| Far 1 (last slot) | -1.1 [-4.0, +1.6] | +0.049 [0.032, 0.069] | 8 | 89% |
+
+- No rule passes the gate (gain ≥ 0.05; up diff ≥ −2 points with the CI
+  lower bound ≥ −5; novel ups ≥ B's). Per the plan: report and stop.
+- Near misses:
+  - Far 1 doubles the novel up-votes for −1.1 points, but its gain is 0.049
+    against the 0.05 bar.
+  - MMR 0.8 costs nothing measurable and has 1.3 points fewer downs, but
+    gains only 0.040.
+- MMR 0.7 and 0.6 clear the diversity bar, but their up-rate CIs reach −9 to
+  −11 points.
+- Topic caps are the worst trade: Cap 1 loses 8 points of up-rate for less
+  diversity than MMR 0.7. The 40 k-means topics are too coarse to cap on.
+- Short (12h, 1d) and long (1w, 1m) windows rank the rules the same way.
+  Long windows lose more up-rate under strong rules (MMR 0.6: −5.0 points
+  long, −1.7 short).
+- Limits: the pool is stories already shown, and a shown but unvoted story
+  counts as not liked. About 110 up-votes per rule, so this is a directional
+  read only.
+- A combination (MMR 0.8 plus Far 1's last slot) was suggested by this data
+  and not tested. A fair test needs days after 2026-10-12.
+
 ## Discover Phase 0: pick rules for far stories — 2026-10-12
 
 Plan: `docs/evaluations/discovery-20261012/PLAN.md`. Read-only on profile

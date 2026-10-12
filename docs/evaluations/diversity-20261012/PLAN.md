@@ -4,6 +4,9 @@ Status: the user chose this as the next step on 2026-10-12 ("Diversity prep"):
 offline preparation only, ready to ship after the interleaving trial ends on
 2026-11-05. Recommended does not change before then.
 
+Result (2026-10-12): Phase 0 ran; no rule passed the gate (FINDINGS.md
+"Diversity Phase 0"). Phase 1 does not start from this result.
+
 ## Why
 
 - The user's worst failure is a same-y feed (STATUS.md "Goals").
