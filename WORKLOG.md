@@ -9,6 +9,10 @@ subreddits. Their stories stay in the DB and leave the candidate pool, as
 with the 10-08 drops; both interleaving arms share the pool. User approved
 the mid-trial restart. VPS checks on the change: 1,304 passed / 1 skipped,
 ruff clean (no Python changed).
+Deployed: VPS pulled f3d5f3d (config only since 794caa4), restarted
+2026-10-12 00:23:27 UTC. Profile 151's ranking-ready and 1d/1w/1m feeds
+returned 200 with 16/16/19 cards, none from the dropped feeds; journal
+clean since the restart.
 
 ## 2026-10-11 — Live DB: blind re-votes applied to profile 151
 

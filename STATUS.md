@@ -24,6 +24,9 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Recency weighting gave no gain on the re-votes (+0.004–0.006, CI from 0).
   At the user's request the re-votes went live on profile 151: 17 changed,
   12 June stories added; user 1 and trial credit unaffected.
+  Training neutral votes as down gave no gain either. Five weak feeds
+  (FIRE trio, r/MachineLearning, Haskell Discourse) dropped and deployed
+  2026-10-12 00:23 UTC, with the user's OK to restart mid-trial.
   [Evidence](FINDINGS.md#blind-re-vote-calibration-recency-check-re-votes-applied--2026-10-11).
 - Muse-primary summaries with Mistral fallback: branch `muse-primary-fallback`
   (ddb424d, pushed, not merged or deployed). A failed primary call falls back once,
