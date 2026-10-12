@@ -1,5 +1,15 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — Standalone TUI lint gate repaired
+
+The project's continuing CI check found Terminal client run38275441048
+failed on PLR1730 after251 tests passed. Reproduced outside the backend
+workspace, then applied Ruff's two min/max duration clamp substitutions
+in dwell.py (equivalent bounds). Focused dwell30, TUI251/1 skipped,
+backend1376/1 skipped passed; both environments' lint/types, touched-file
+format, standalone build and installed-wheel version check passed.
+No production/reader restart. GitHub workflow confirmation pending push.
+
 ## 2026-10-12 — Warm-start test convergence regression
 
 User selected Finish test fix after the independent live-feed/draft review.

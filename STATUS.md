@@ -38,6 +38,11 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Terminal client CI lint failure reproduced and fixed: dwell clamping
+  now uses equivalent min/max expressions. Standalone VPS gate: 251 passed /
+  1 skipped, lint/types/format/build and wheel --version clean. Backend gate
+  1,376 passed / 1 skipped, lint/types/format clean. Runtime unchanged;
+  GitHub CI confirmation pending push.
 - Read-only trial safety check 2026-10-12 16:43 UTC: 61 credited votes
   across 16 decks after excluding 29 calibration re-votes. Production
   7 up / 8 neutral / 8 down; #2 10/8/2; #4 8/3/7. Descriptive only;

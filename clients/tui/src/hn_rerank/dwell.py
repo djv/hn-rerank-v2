@@ -50,10 +50,8 @@ class DwellTracker:
 
     def _finish(self, ctx: DwellContext, start: float, end: float) -> Dwell | None:
         duration_ms = int((end - start) * 1000)
-        if duration_ms < 0:
-            duration_ms = 0
-        if duration_ms > MAX_DWELL_MS:
-            duration_ms = MAX_DWELL_MS
+        duration_ms = max(duration_ms, 0)
+        duration_ms = min(duration_ms, MAX_DWELL_MS)
         if (end - start) < self._min_s:
             return None
         return Dwell(ctx, duration_ms)

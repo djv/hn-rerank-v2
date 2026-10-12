@@ -1,5 +1,22 @@
 # HN Rerank findings
 
+## Terminal client standalone lint repair — 2026-10-12
+
+Continuing the project exposed failing Terminal client run 38275441048 on
+b1897f4: all 251 tests passed / 1 skipped, then Ruff PLR1730 failed on
+both dwell duration clamps. Reproduced in an isolated standalone copy at
+/tmp/hn-tui-standalone-20261012 on the VPS; root-workspace Ruff had passed.
+Applied only Ruff's equivalent max(duration_ms,0) and
+min(duration_ms,MAX_DWELL_MS) replacements to clients/tui/src/hn_rerank/dwell.py.
+No behavior change, new tests, runtime update or reader restart.
+
+Standalone gates: dwell tests30 passed; full TUI251 passed/1 skipped
+(61.93s at -n4), Ruff/ty/changed-file formatting clean; uv build succeeded;
+installed wheel hn-rerank --version returned 0.1.0 outside the source tree.
+Full isolated backend gate1376 passed/1 skipped (23.96s), repository
+Ruff/ty/changed-file formatting clean. Same unrelated MLP warning as before.
+GitHub CI confirmation will follow the pre-authorized push to djv/hn-rerank-v2.
+
 ## Live trial safety check — 2026-10-12 16:43 UTC
 
 Read-only production DB at b1897f4, service active. Fixed report snapshot
