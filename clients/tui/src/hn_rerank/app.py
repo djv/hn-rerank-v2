@@ -2690,7 +2690,7 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "summary")
         view = str(self.query_one("#sort", Select).value)
         reasons = {
-            "recommended": "Recommended orders stories by the model's learned preferences from your votes.",
+            "recommended": "Recommended orders stories by the model's learned preferences from your votes. Its last card is a ✨ Discover pick: unlike your up-votes, but the model's best guess you'll like it.",
             "popular": "Popular orders eligible HN stories by points and age; older stories lose weight.",
             "explore": "Explore offers discovery picks, including unfamiliar stories and interests Recommended misses. Its order is shuffled.",
         }
