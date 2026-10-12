@@ -40,8 +40,8 @@ def _rank_top50(
     out: dict[int, dict[str, Any]] = {}
     for r in ranked[:50]:
         badges: list[str] = []
-        if r.is_novel:
-            badges.append("novel")
+        if r.is_discover:
+            badges.append("discover")
         if r.is_interest:
             badges.append("interest")
         if r.is_uncertain:

@@ -2547,7 +2547,7 @@ class Reader(App[None]):
             "🔥 **Hot** — rising fast · 🏆 **Top** — at least 100 HN points · "
             "💬 **Talk** — at least 50 comments and comments ≥ points\n\n"
             "Badges combine when several apply.\n\n"
-            "🤔 **Unsure** — model uncertain · ✨ **Novel** — unlike your votes · 🎯 **Interest** — an interest Recommended misses\n\n"
+            "🤔 **Unsure** — model uncertain · ✨ **Discover** — new to you, likely good · 🎯 **Interest** — an interest Recommended misses\n\n"
             "Escape: return to the story. ?: shortcuts."
         )
         self.focus_summary()

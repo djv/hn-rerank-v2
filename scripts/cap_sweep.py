@@ -40,8 +40,8 @@ def _rank_top50_labels(
     out: dict[int, str] = {}
     for r in ranked[:50]:
         badges: list[str] = []
-        if r.is_novel:
-            badges.append("novel")
+        if r.is_discover:
+            badges.append("discover")
         if r.is_interest:
             badges.append("interest")
         if r.is_uncertain:
@@ -67,7 +67,7 @@ def _classify_loss(
         "pri": 0,
         "sim": 0,
         "unc": 0,
-        "novel": 0,
+        "discover": 0,
         "nonhn": 0,
         "other": 0,
     }
@@ -80,8 +80,8 @@ def _classify_loss(
                 counts["sim"] += 1
             if "uncertain" in label:
                 counts["unc"] += 1
-            if "novel" in label:
-                counts["novel"] += 1
+            if "discover" in label:
+                counts["discover"] += 1
             if "non_hn" in label:
                 counts["nonhn"] += 1
     return counts
@@ -143,7 +143,7 @@ def main() -> None:
 
         header = (
             f"{'hn_cap':>8} {'shared':>7} {'lost':>5} "
-            f"{'L_pri':>6} {'L_sim':>6} {'L_unc':>6} {'L_novel':>8} {'L_nonhn':>8} "
+            f"{'L_pri':>6} {'L_sim':>6} {'L_unc':>6} {'L_discover':>8} {'L_nonhn':>8} "
             f"{'cand':>6}"
         )
         print(header)
@@ -162,7 +162,7 @@ def main() -> None:
             print(
                 f"{cap:>8} {len(shared):>7} {len(lost_ids):>5} "
                 f"{counts['pri']:>6} {counts['sim']:>6} {counts['unc']:>6} "
-                f"{counts['novel']:>8} {counts['nonhn']:>8} "
+                f"{counts['discover']:>8} {counts['nonhn']:>8} "
                 f"{cf.get('candidates', '?'):>6}"
             )
     finally:
