@@ -1,5 +1,31 @@
 # HN Rerank findings
 
+## Sameness and novel up-votes, profile 151 — 2026-10-12
+
+Read-only; the user named a same-y feed as the worst failure. Impressions
+2026-09-28 to 10-12, same outcome rules as below. Topics = 40 k-means
+clusters of stored embeddings, fit on shown and voted stories. "Novel" up-vote =
+max cosine similarity below 0.60 to every earlier up-vote. Script: laptop
+`~/revote/sameness-metrics.py` (written by Muse, reviewed and run by the agent).
+
+- Recommended is tighter than what was available, but not by topic count:
+  versus random samples of the same week's stories, mean pairwise diversity
+  is 0.15-0.21 lower in every window, while normalized topic entropy is about
+  the same (-0.07 to +0.08). It covers the topics but picks close neighbours
+  within them. Some narrowing is inherent to personalization; the random
+  baseline is an upper bound, not a target.
+- Novel up-votes are rare: 13 of 204 up-votes since 09-28 (6%). Recommended
+  had 7 of its 140 (5%), Popular 1 of 42, Explore 5 of 20 (25%). Only 1
+  up-vote landed in a topic with no up-vote in the previous 90 days.
+- Far cards (unlike every earlier up-vote when shown) get up-votes at about
+  half the rate of near ones in Recommended (11% vs 22%), and rarely
+  in Explore (3% vs 6%) or Popular (0.5% vs 8%).
+- The 12h/1d up-votes a 0.346 score bar would cut were the more novel ones
+  (median similarity 0.73 vs 0.78; novel 2 of 20 vs 3 of 51). The samples are
+  small, but this backs the sameness guardrail on any bar.
+- Proposed discovery metric: novel up-votes per week (now about 6), with
+  total up-votes and down-votes per shown card as guardrails.
+
 ## Short-window Recommended: score bar check — 2026-10-12
 
 Read-only; the user chose this follow-up to the live metrics below. Serve-time

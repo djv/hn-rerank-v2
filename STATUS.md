@@ -19,6 +19,12 @@ must not narrow topics or reduce novel up-votes. Audience: the user first,
 then other people's profiles; also a public showcase and an ML playground.
 A new profile's first feed therefore matters too.
 
+Chosen next goals (user 2026-10-12): discovery (fewer same-y
+feeds: Explore first, since it is outside the trial; Recommended diversity
+after 2026-11-05), a reading signal (TUI opens and dwell) and a good
+first feed for new profiles. Serve-time score logging (`deck-scores`
+branch) supports all three.
+
 ## Objective
 Deploy the approved Codex Forum source-safety target 794caa4 (user 2026-10-11).
 Rollout is verified on the VPS. The two low implementation findings and
