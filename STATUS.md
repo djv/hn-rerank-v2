@@ -38,6 +38,11 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Reading-signal prerequisite check 2026-10-12 18:10 UTC: no local reader
+  process; `hn` points to the client venv and imports this checkout's
+  app.py/dwell.py with telemetry hooks present. Profile 151 still has
+  5,141 impressions and zero opens/dwell. Await normal user reading;
+  no reader launch, synthetic event or provider request was issued.
 - Terminal client CI lint failure reproduced and fixed: dwell clamping
   now uses equivalent min/max expressions. Standalone VPS gate: 251 passed /
   1 skipped, lint/types/format/build and wheel --version clean. Backend gate

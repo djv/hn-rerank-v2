@@ -1,5 +1,24 @@
 # HN Rerank findings
 
+## Reading-signal live verification pending — 2026-10-12 18:10 UTC
+
+The user selected Verify reading signal. Laptop process inspection found
+no running hn-rerank/hn_rerank process (shell/search processes excluded).
+~/.bash_aliases defines hn as the clients/tui/.venv/bin/hn-rerank entry.
+Using that exact venv through uv --no-sync, import inspection resolved
+hn_rerank.app and dwell to this checkout's current source files. Reader
+has _send_interaction and _dwell_event; source records article_open and
+comments_open from the o/c action and closes dwell on selection/focus
+changes. This verifies launch configuration/source, not live event delivery.
+
+Read-only production SQL at 18:07:56 UTC found profile151 had5,141
+impressions, no other event type. A second query at18:10:50 UTC again
+returned zero reading events. A popup requested normal user use of hn
+(read >=2s, then o/c on a story with both links); it returned no answer.
+No reader was launched, browser operated, telemetry submitted or provider
+generation requested by the agent. Next step remains querying real events
+after the user reads; absence alone is not evidence of a telemetry bug.
+
 ## Terminal client standalone lint repair — 2026-10-12
 
 Continuing the project exposed failing Terminal client run 38275441048 on
