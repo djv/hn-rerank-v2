@@ -4,6 +4,21 @@ Updated 2026-10-11. Previous handoff (one-classifier research, Why-this-story
 preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
+## Goals (user 2026-10-12)
+What "working well" means, from the user's answers. Weigh every ranking or
+view change against all four aims, not AUC alone:
+- Save time: most cards worth reading.
+- Discovery: good things the front pages would not surface.
+- Stay current: the important developments get shown.
+- Calmer habit: a bounded alternative to scrolling HN and Reddit.
+
+The user reads in a mix of quick checks and catch-ups, so every window
+matters. The worst failure is a same-y feed (a filter bubble). It ranks above
+duds, missed great stories and voting effort. Any change that cuts duds
+must not narrow topics or reduce novel up-votes. Audience: the user first,
+then other people's profiles; also a public showcase and an ML playground.
+A new profile's first feed therefore matters too.
+
 ## Objective
 Deploy the approved Codex Forum source-safety target 794caa4 (user 2026-10-11).
 Rollout is verified on the VPS. The two low implementation findings and
