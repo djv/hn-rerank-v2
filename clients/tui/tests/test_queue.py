@@ -1,19 +1,19 @@
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 
-import time
-
 import httpx
 import pytest
-from hypothesis import given, strategies as st
+from hypothesis import given
+from hypothesis import strategies as st
 from textual.content import Content
 from textual.widgets import Markdown, OptionList, Select, Tabs
 
 import hn_rerank.app as reader_module
-from hn_rerank.app import Reader
 from hn_rerank.api import Profile
+from hn_rerank.app import Reader
 from hn_rerank.models import Feed, FeedBadge, FeedStory
 from hn_rerank.queue import (
     QueueEntry,
@@ -579,6 +579,7 @@ async def test_queue_snapshots_survive_windows_but_reset_on_reconnect(
 )
 def test_age_boundaries(window: str, seconds: int) -> None:
     from typing import cast
+
     from hn_rerank.models import Window
 
     assert in_window(100, cast(Window, window), 100 + seconds)

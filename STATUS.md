@@ -61,7 +61,11 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   cloud review said "revise" (H1 frozen cards vanished after reranks, H2
   version mismatch for trial credit, rounds chosen by the user for M1/M2);
   all fixed. Gates: backend 1427 passed, TUI 272 passed, ruff/format/ty clean.
-  Unverified: live deploy, and real TUI use of rounds.
+  Approved Muse result review: PASS, no High issues. Agent assessment:
+  `docs/evaluations/single-queue-20261013/MUSE-ASSESSMENT.md`. Standalone
+  CI import errors corrected with the user's approval; VPS backend 1445/1
+  skipped, TUI 272/1 skipped, lint/types/format clean. Rollout authorized;
+  unverified until smoke: live deploy. Real TUI use of rounds remains unverified.
 - Reading-signal review 2026-10-13 (FINDINGS "First reading-signal
   review"): Recommended 41% up / 9% down vs Popular 62% down in the user's
   last three TUI sessions. TUI `position` fixed to served rank (583d0bd);
@@ -470,8 +474,11 @@ ranking research remains paused and production trial configuration unchanged.
 - Discover: read the result about 2026-11-02 (PLAN.md Phase 2: Discover
   up-rate, novel up-votes per week, Explore down-rate), next to the trial
   report.
-- After 2026-11-05 and Diversity Phase 0b: build single-queue Step 1
-  (PLAN.md above), then start its day-alternating test.
+- Single-queue Step 1: finish the authorized merge/deploy/single restart and
+  existing-profile smoke, then the user restarts `hn` and checks rounds.
+  Startup alternates Queue/Recommended by UTC day; record the actual start
+  date when reading Discover/far-card results. Further behavior fixes need
+  separately scoped authorization; remaining observations are in the Muse assessment.
 - After 2026-11-05: replay rank caps and score bars on `deck_scores`
   (FINDINGS "Short-window Recommended: score bar check").
 - After the trial ends (2026-11-05): merge `muse-primary-fallback`, set

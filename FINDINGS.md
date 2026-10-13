@@ -1,5 +1,17 @@
 # HN Rerank findings
 
+## Single-queue Muse result review — 2026-10-13
+
+Muse Spark 1.3 contributor through pi, read-only source review of `5b3b996`:
+PASS, no High issues. Source verification and remaining Medium/Low bounds:
+`docs/evaluations/single-queue-20261013/MUSE-ASSESSMENT.md`; original report:
+`REVIEW-step1-muse.md` in the same directory. Only the user's separately
+approved import sorting was changed. VPS backend 1445/1 skipped; standalone
+TUI 272/1 skipped at four workers. Both Ruff/ty environments and 14 touched
+Python format checks passed. The preceding eight-worker TUI run alongside
+backend checks hit the existing 0.8-second quit-test deadline (271/1 skipped/
+1 failed); the full lower-concurrency rerun passed without changing that test.
+
 ## First reading-signal review (TUI) — 2026-10-13
 
 Read-only, live VPS DB, profile 151, three TUI sessions since 2026-10-12
