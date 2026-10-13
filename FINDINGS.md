@@ -1,5 +1,25 @@
 # HN Rerank findings
 
+## Read-only resume check — 2026-10-13
+
+Laptop checkout ecc7471 was clean. VPS production remains b1897f4, active
+since2026-10-12 16:09:54 UTC; its unrelated VPS-COLD-ARCHIVE-20261011.json
+is preserved. No warning-priority journal entries in the checked30minutes.
+The preserved isolated check-ranking-report-WwGg9E tree has the corrected
+Import AI gate at ae98d0d; its gate SHA256 matched current laptop source
+(21d7e1f7ba0ebb14ac65cab46a962085f743f189e355574b3b3b6f143bed9c9a).
+Existing report-source WIP there was preserved. Running the gate against
+/home/dev/hn-rewrite/main/hn_rewrite.db returned exit3 NOT_APPLICABLE:
+publisher's newest issue476 is already voted. No unseen PASS established.
+
+Read-only SQLite aggregates for profile151: 91 dwell events (latest
+2026-10-13 02:40:43 UTC), 5,223 impressions (latest02:40:02), one article
+open (October12 18:42:18), zero comments opens. No raw interaction rows or
+article titles saved. Arctic refresh logs: failed_feeds3 at06:14, then0
+at08:15 and10:14 UTC; latest had108requests, no overload or transport error.
+No service restart, trial/config change, synthetic telemetry or new research.
+Documentation-only save; prior code verification remains unchanged.
+
 ## Ranking-trial report review and corrections — 2026-10-12
 
 The user requested `rv`, then approved corrections via `q`: reporting only,

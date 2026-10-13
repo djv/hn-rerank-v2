@@ -1,6 +1,6 @@
 # HN Rerank status
 
-Updated 2026-10-12. Previous handoff (one-classifier research, Why-this-story
+Updated 2026-10-13. Previous handoff (one-classifier research, Why-this-story
 preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
@@ -38,6 +38,15 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Resume check 2026-10-13: service remains active at b1897f4, started
+  October12 16:09:54 UTC; recent warning journal empty. Corrected Import AI
+  gate (source hash matched current laptop checkout) ran from the preserved
+  isolated VPS check tree against the live DB: issue476 remains newest and
+  already voted, exit3 NOT_APPLICABLE, not PASS. Profile151 now has 91 dwell,
+  5,223 impression and one article_open events; zero comments_open. Latest
+  Arctic Shift refresh at10:14 UTC has zero failed feeds. No runtime,
+  feedback, trial or research change; next checks remain normal comments
+  opening and the next fresh unseen/unvoted publisher issue.
 - Ranking-trial report corrections approved after Claude cloud review and
   committed/pushed as `6ed5651` in `scripts/interleave_report.py`: fixed two-challenger alpha,
   downvote harm/safety tests, Newcombe/Wilson intervals, explicit calibration
