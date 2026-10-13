@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-10-13 — Single queue merged and deployed
+
+Merged `bede2ce`, VPS fast-forward, one restart at 20:59:38 UTC. Private
+online backup passed quick_check; config/lock/unrelated archive hashes
+preserved. Existing profile151 dashboard/feed/readiness and all five ready
+windows passed. Summary generation and repeat post-enrich cache hit passed.
+Additive columns present, new-process warning journal empty; old-process
+exit143 belonged to the requested stop. Import AI NOT_APPLICABLE, issue476
+already voted. No new profile, feedback or artificial telemetry. Full record:
+`docs/evaluations/single-queue-20261013/DEPLOYMENT.md`. Real rounds and live
+Queue events await the user's fresh `hn` launch; its editable path is verified.
+
 ## 2026-10-13 — Single queue: independent Muse result review
 
 Approved Muse Spark review through pi: PASS, no High issues. The agent

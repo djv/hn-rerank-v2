@@ -1,5 +1,17 @@
 # HN Rerank findings
 
+## Single-queue live rollout — 2026-10-13
+
+Runtime `bede2ce`, one restart20:59:38 UTC, PID121960 active/running.
+Additive queue telemetry columns present; all five profile151 feeds ready
+at version1791925180942 with12 Recommended cards. Cached POST hydration
+generated a new key; repeat POST verified post_enrich_cache_hit. Another
+stale-cache POST generated successfully. New-process warning journal empty;
+outgoing process exited143 on requested stop. Import AI gate exit3 because
+issue476 was voted, not PASS. Backup and preservation evidence, test counts,
+review caveats and unverified real TUI behavior are in
+`docs/evaluations/single-queue-20261013/DEPLOYMENT.md`.
+
 ## Single-queue Muse result review — 2026-10-13
 
 Muse Spark 1.3 contributor through pi, read-only source review of `5b3b996`:
