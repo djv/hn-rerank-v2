@@ -214,6 +214,8 @@ class InteractionEvent:
     duration_ms: int | None = None
     # Comma-joined badge kinds of the card as shown ("" when none or unknown).
     badges: str = ""
+    surface: str = ""
+    queue_position: int | None = None
 
 
 class InteractionInsertResult(NamedTuple):
@@ -527,7 +529,11 @@ class Database:
                         duration_ms         INTEGER CHECK(
                             duration_ms IS NULL OR duration_ms >= 0
                         ),
-                        received_at         REAL NOT NULL
+                        received_at         REAL NOT NULL,
+                        surface             TEXT NOT NULL DEFAULT '',
+                        queue_position      INTEGER CHECK(
+                            queue_position IS NULL OR queue_position >= 0
+                        )
                     ) STRICT
                 """)
                 interaction_columns = {
@@ -538,6 +544,16 @@ class Database:
                     conn.execute(
                         "ALTER TABLE interaction_events "
                         "ADD COLUMN badges TEXT NOT NULL DEFAULT ''"
+                    )
+                if "surface" not in interaction_columns:
+                    conn.execute(
+                        "ALTER TABLE interaction_events "
+                        "ADD COLUMN surface TEXT NOT NULL DEFAULT ''"
+                    )
+                if "queue_position" not in interaction_columns:
+                    conn.execute(
+                        "ALTER TABLE interaction_events ADD COLUMN queue_position "
+                        "INTEGER CHECK(queue_position IS NULL OR queue_position >= 0)"
                     )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_interaction_events_user_time "
@@ -1888,8 +1904,8 @@ class Database:
                             event_id, client_session_id, user_id, story_id,
                             event_type, dashboard_version, position, sort_mode,
                             age_filter, source_filter, ranker_arm, occurred_at,
-                            duration_ms, received_at, badges
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            duration_ms, received_at, badges, surface, queue_position
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(event_id) DO NOTHING
                         """,
                         (
@@ -1908,6 +1924,8 @@ class Database:
                             event.duration_ms,
                             received_at,
                             event.badges,
+                            event.surface,
+                            event.queue_position,
                         ),
                     )
                     inserted += cursor.rowcount

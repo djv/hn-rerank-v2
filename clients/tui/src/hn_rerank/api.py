@@ -29,6 +29,8 @@ class InteractionEvent:
     ranker_arm: str = "tui_observed"
     # Badge kinds of the story as shown.
     badges: list[str] = field(default_factory=list)
+    surface: str = "views"
+    queue_position: int | None = None
     # Only dwell events carry a duration; omitted from the payload when None.
     duration_ms: int | None = None
 
@@ -439,7 +441,10 @@ class API:
             "source_filter": event.source_filter,
             "ranker_arm": event.ranker_arm,
             "badges": list(event.badges),
+            "surface": event.surface,
         }
+        if event.queue_position is not None:
+            payload["queue_position"] = event.queue_position
         if event.duration_ms is not None:
             payload["duration_ms"] = event.duration_ms
         await self.request("POST", "api/interaction", json={"events": [payload]})

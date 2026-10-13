@@ -102,7 +102,7 @@ feed immediately and fetches its latest existing version in the background
 (one request in flight, at most one queued follow-up), keeping the open
 story, its text and scroll usable while waiting.
 Regeneration still respects provider limits and does not guarantee a longer summary.
-Press `s` to cycle Recommended → Popular → Explore → Date; `h` / `l` step to
+Press `s` to cycle Queue → Recommended → Popular → Explore; `h` / `l` step to
 the previous / next sort.
 
 Resize and focus changes preserve reading position. Run the offline preview from
@@ -123,3 +123,42 @@ Empty filters and feed failures get headed notices in the reading pane rather
 than a bare line; the setup form is a bordered card on a dimmed scrim; the
 reading pane caps at 100 columns with a hairline under the headline; votes
 confirm in the status line.
+
+### Queue sort and daily comparison
+
+Queue plays each window's served Recommended cards, then Explore grouped as
+Discover, Unsure (`uncertain`), Interest, and other badge kinds, then the first
+five additional Popular stories. Duplicates and unavailable stories are skipped.
+Queue keeps served order within each group and never shuffles. Voting advances
+through the full queue; undo returns a story to its queue slot. Each window's
+queue consists of session-scoped rounds. Each round freezes the current
+Recommended → badge-grouped Explore → five additional Popular composition,
+skipping voted, unavailable, aged-out stories and all ids in earlier rounds.
+When the latest round is exhausted, the current feed builds the next round;
+refreshes never extend an unfinished round. Slots are global across all rounds
+and never shift. Stored card data stays playable when reranking drops a card
+from the served views; fresh feeds update its counts when present. Only a vote,
+unavailability or actual window age removes it (Archive never ages out).
+Switching windows retains rounds; reconnecting or changing profiles clears them.
+An empty next round shows **Caught up for this window**. A later refresh with
+new cards resumes automatically, with `Round N · N cards` in the status line.
+The `s`, `h`, and `l` keys and sort
+tabs/dropdown still reach Recommended, Popular, and Explore.
+
+The startup sort alternates by UTC ordinal day: odd days open Queue, even days
+open Recommended. The choice is made at launch and held across UTC midnight. Analyze actual
+`surface` or the session's assigned default rather than the event's UTC date.
+
+All four reading events (impression, dwell, article open, comments open) carry
+`surface="queue"` and `queue_position` in Queue. `queue_position` is the slot in
+the concatenation of all rounds, including voted and skipped stories.
+`sort_mode` and `position` retain the origin view and that view's served rank,
+excluding client-inserted undo rows. Queue `dashboard_version` is the stored
+`served_version` of the feed that built the round, preserving trial credit by
+(version, window, story id); views events still use the current feed version.
+For Explore cards in Queue, this is the index in the server's Explore order;
+in the Explore view it is the index in the client-shuffled list. Reports must
+split Explore positions by `surface`, treating `surface=''` (old rows) as views.
+Other sorts send `surface="views"` and
+omit `queue_position`. Deploy the server's additive event-field support with
+this client; older servers reject these events (reading remains best effort).

@@ -1,5 +1,17 @@
 # HN Rerank findings
 
+## Single-queue Muse result review — 2026-10-13
+
+Muse Spark 1.3 contributor through pi, read-only source review of `5b3b996`:
+PASS, no High issues. Source verification and remaining Medium/Low bounds:
+`docs/evaluations/single-queue-20261013/MUSE-ASSESSMENT.md`; original report:
+`REVIEW-step1-muse.md` in the same directory. Only the user's separately
+approved import sorting was changed. VPS backend 1445/1 skipped; standalone
+TUI 272/1 skipped at four workers. Both Ruff/ty environments and 14 touched
+Python format checks passed. The preceding eight-worker TUI run alongside
+backend checks hit the existing 0.8-second quit-test deadline (271/1 skipped/
+1 failed); the full lower-concurrency rerun passed without changing that test.
+
 ## First reading-signal review (TUI) — 2026-10-13
 
 Read-only, live VPS DB, profile 151, three TUI sessions since 2026-10-12
@@ -4224,3 +4236,20 @@ not the final snapshot. No extra embedding job, restart, generation or DB write
 was issued by the agent. Fresh summary generation and physical TUI remain
 untested; parked/low findings unchanged. Evidence:
 [DEPLOYMENT.md](docs/evaluations/codex-forum-review-20261010/DEPLOYMENT.md#scheduled-side-vector-follow-up).
+
+## Single-queue Step 1 review — 2026-10-13
+
+A Claude cloud review of branch `single-queue`
+([REVIEW-step1-claude-cloud.md](docs/evaluations/single-queue-20261013/REVIEW-step1-claude-cloud.md))
+said "revise". The agent verified:
+- H1: `/api/feed` stories are only the served views
+  (`WindowViews.stories`), and each rerank re-caps them, so frozen Explore
+  cards vanished.
+- H2: trial credit (`scripts/interleave_report.py` `credit_votes`) keys on
+  (dashboard_version, window, story), not on position, so queue events must
+  send the version that served the card.
+
+Positional `INSERT INTO interaction_events VALUES` exists only in tests that
+list their columns. The user chose rounds for M1/M2. The agent's own fix:
+the client age check applies only to cards no longer in the current feed,
+since the server already serves only current stories.

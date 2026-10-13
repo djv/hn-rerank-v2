@@ -51,10 +51,21 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 - Single-queue plan 2026-10-13 (user's original idea: one stream, no
   sections): `docs/evaluations/single-queue-20261013/PLAN.md`. Independent
   Claude cloud review said "revise"; the agent verified its code claims. The
-  user chose client-first: Step 1 after 2026-11-05 is a client-only Queue
+  user chose client-first: Step 1 is a client-only Queue
   sort (Recommended -> Explore -> top Popular -> done), with day-alternating
   live comparison; Step 2 is a serve-time interleaved queue only if Step 1
-  sticks. Nothing built.
+  sticks. Step 1 built 2026-10-13 on branch `single-queue` (pushed, not
+  merged or deployed): TUI Queue sort in rounds (each round Recommended ->
+  Explore -> 5 Popular from the then-current feed, card data kept, served
+  deck version sent); server accepts `surface`/`queue_position`. The Claude
+  cloud review said "revise" (H1 frozen cards vanished after reranks, H2
+  version mismatch for trial credit, rounds chosen by the user for M1/M2);
+  all fixed. Gates: backend 1427 passed, TUI 272 passed, ruff/format/ty clean.
+  Approved Muse result review: PASS, no High issues. Agent assessment:
+  `docs/evaluations/single-queue-20261013/MUSE-ASSESSMENT.md`. Standalone
+  CI import errors corrected with the user's approval; VPS backend 1445/1
+  skipped, TUI 272/1 skipped, lint/types/format clean. Rollout authorized;
+  unverified until smoke: live deploy. Real TUI use of rounds remains unverified.
 - Reading-signal review 2026-10-13 (FINDINGS "First reading-signal
   review"): Recommended 41% up / 9% down vs Popular 62% down in the user's
   last three TUI sessions. TUI `position` fixed to served rank (583d0bd);
@@ -430,6 +441,14 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Single queue: run the user-approved Muse Spark review of the rounds fix
+  (commits after 3fb6318, against
+  `docs/evaluations/single-queue-20261013/REVIEW-step1-claude-cloud.md`).
+  If it finds no High issue (user 2026-10-13: "deploy if clean"), fix
+  Medium/Low, merge to main, push, pull on the VPS, restart once (the user
+  OK'd it), smoke test, check the new `interaction_events` columns with
+  `sqlite3 -readonly`, then tell the user to restart `hn`. Record the start
+  date of the day-alternating test (about 3 weeks).
 - Stopping design: user chose (2026-10-13) to wait for the November5
   result before deciding. After it, if the user chooses continuation, define a separate
   prospective stage and its useful-improvement/uncertainty target, exposure
@@ -455,8 +474,11 @@ ranking research remains paused and production trial configuration unchanged.
 - Discover: read the result about 2026-11-02 (PLAN.md Phase 2: Discover
   up-rate, novel up-votes per week, Explore down-rate), next to the trial
   report.
-- After 2026-11-05 and Diversity Phase 0b: build single-queue Step 1
-  (PLAN.md above), then start its day-alternating test.
+- Single-queue Step 1: finish the authorized merge/deploy/single restart and
+  existing-profile smoke, then the user restarts `hn` and checks rounds.
+  Startup alternates Queue/Recommended by UTC day; record the actual start
+  date when reading Discover/far-card results. Further behavior fixes need
+  separately scoped authorization; remaining observations are in the Muse assessment.
 - After 2026-11-05: replay rank caps and score bars on `deck_scores`
   (FINDINGS "Short-window Recommended: score bar check").
 - After the trial ends (2026-11-05): merge `muse-primary-fallback`, set

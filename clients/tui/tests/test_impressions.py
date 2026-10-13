@@ -12,11 +12,13 @@ from hn_rerank.app import Reader
 
 from ._settle import settle
 from .test_client import FakeServer
+from .test_dwell import install_clocks
 
 
 async def test_selected_impression_is_delayed_not_prefetched_and_best_effort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    install_clocks(monkeypatch)  # Navigation under load must not add real-time dwell.
     delay = asyncio.Event()
 
     async def controlled_sleep(seconds: float) -> None:
@@ -52,6 +54,8 @@ async def test_selected_impression_is_delayed_not_prefetched_and_best_effort(
         assert event["story_id"] == 2
         assert event["position"] == 1
         assert event["sort_mode"] == "recommended"
+        assert event["surface"] == "views"
+        assert "queue_position" not in event
         assert event["window"] == "1w" and "age_filter" not in event
         assert event["event_type"] == "impression"
         assert event["dashboard_version"] == fake.feed.version
