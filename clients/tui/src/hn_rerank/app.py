@@ -821,6 +821,10 @@ class Reader(App[None]):
         # when the user leaves that view, so each visit gets a fresh order.
         self.explore_orders: dict[str, list[int]] = {}
         self.view_key: str | None = None
+        # Each story's slot in the current view's full order (voted and
+        # unavailable stories included): the served rank that impressions
+        # and dwell report, so a vote does not shift later cards' positions.
+        self.view_ranks: dict[int, int] = {}
         self.restored: dict[int, FeedStory] = {}
         self.history: list[FeedStory] = []
         # The window and views (sorts) each voted story was listed in, so
@@ -1209,6 +1213,7 @@ class Reader(App[None]):
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
         self.view_key = f"{self.selected_window()}:{sort}"
         order = self.view_order(sort)
+        self.view_ranks = {sid: rank for rank, sid in enumerate(order)}
         self.stories = [
             lookup[sid]
             for sid in order
@@ -1335,9 +1340,10 @@ class Reader(App[None]):
         if self.feed is None or not self.query("#headlines"):
             return None
         try:
-            position = self.stories.index(story)
+            listed = self.stories.index(story)
         except ValueError:
             return None
+        position = self.view_ranks.get(story.id, listed)
         return DwellContext(
             story_id=story.id,
             position=position,
