@@ -9,7 +9,7 @@ in `followups/plan.json` before any run. All offline numbers below reuse
 labels from the earlier model selection; they are exploratory, not
 confirmation.
 
-## Live design (implemented, off by default, not deployed)
+## Live design (deployed for profile 151; off by default for other profiles)
 
 - Arms: production (current three-model blend), `joined_all` (#2),
   `joined_no_metadata` (#4). Each window's Recommended view is a team-draft
@@ -146,11 +146,11 @@ also ships the expanded Why-this-story panel.
 
 - Start T0 is the first `interleave_decks` row after the deployment that
   drafts after deduplication (recorded in STATUS.md); decks from the first
-  deployment (03:56–04:3x UTC Oct 8, unbalanced 3/2/7 splits after drops)
+  deployment (before 04:07:22 UTC Oct 8, unbalanced 3/2/7 splits after drops)
   are excluded. T0 = 1791432442.75 (2026-10-08 04:07:22 UTC, deploy
   8d85747); the window ends 1793851642.75 (2026-11-05 04:07:22 UTC); the one final analysis covers votes in [T0, T0 + 28 days):
-  `uv run python scripts/interleave_report.py --db hn_rewrite.db --user-id
-  151 --since T0 --until T0+2419200`.
+  The final command and frozen-snapshot requirements are in the reporting
+  addendum below. Analyze the snapshot, not a later mutable live DB.
 - Primary test, per challenger: credited upvote rate against production's,
   two-proportion z-test, two-sided, alpha .025 (Bonferroni over two).
   Secondary: the per-deck upvote sign test and the credited downvote rates,
@@ -172,3 +172,79 @@ also ships the expanded Why-this-story panel.
 - Known limits: profile 151 only and Recommended views only. The user knows
   the test is running but not which arm drafted a card. All arms refit after
   every vote. Undo re-inserts a card by production's score.
+
+## Reporting addendum — approved October 12, before the endpoint
+
+This addendum follows the independent Claude cloud review and was selected
+after seeing the interim counts. It completes previously unspecified reporting
+choices; it is not a claim that these details were specified before T0.
+The primary up-rate z-test, arms, fixed endpoint and runtime are unchanged.
+
+- The family remains the two original challengers: alpha .05 / 2 = .025,
+  even if a safety stop leaves only one challenger in `--arms`.
+- Downvote harm is a **one-sided pooled two-proportion z-test** of
+  challenger > production, at .025 for the final harm check. The safety
+  rule uses the same p-value at .01 plus a difference of at least .10.
+  These flags indicate an alarm, not proof of safety when absent.
+- Report the up-rate difference with a descriptive, unadjusted **95%
+  Newcombe interval combining Wilson score intervals** (no continuity
+  correction). [Newcombe 1998](https://pubmed.ncbi.nlm.nih.gov/9595617/);
+  [SciPy Wilson bounds](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats._result_classes.BinomTestResult.proportion_ci.html).
+  The existing primary p-value remains decisive. Clustering and adaptation
+  remain limitations; the interval does not establish equivalence.
+- Only decks created at or after T0 are eligible. Votes use the half-open
+  interval [T0, endpoint). Missing tables or no eligible decks fail explicitly.
+- Exclude the recorded calibration `updated_at` interval **inclusively**:
+  [1791763112.57, 1791763180.12]. The CLI accepts repeatable exclusions
+  and reports their bounds, raw counts and excluded counts. A read-only
+  diagnostic found all 29 affected rows and zero Recommended impressions
+  for those story IDs since T0, so no original or calibration trial credit
+  was lost for them. A separate diagnostic found one production upvote
+  attributed to a pre-T0 deck; the corrected loader excludes that deck.
+- Impressions with identical timestamps are ordered deterministically by
+  occurred_at, received_at and event_id. The existing one-second slack
+  and latest-impression attribution rule are unchanged. Client/server clock
+  skew still needs a descriptive check; the slack is not a clock guarantee.
+
+### Freeze before the final analysis
+
+`feedback` stores final mutable state, not a vote log. A later edit or undo
+can overwrite a vote from the trial window. `--until` alone cannot recover
+that overwritten state. Freeze a SQLite-consistent copy at the endpoint
+**before further voting/calibration**, then run all final analyses on that
+same file. No timer or production change is created by this addendum. If
+the snapshot is taken late, disclose its capture time and any intervening
+changes; do not label it exact endpoint state without evidence.
+
+On the VPS, keep the snapshot outside Git in a private directory, using
+SQLite's backup facility (copies consistently even when the live DB uses WAL):
+
+```sh
+install -d -m 700 /home/dev/hn-rewrite/analysis/trial-20261105
+sqlite3 -readonly /home/dev/hn-rewrite/main/hn_rewrite.db \
+  '.backup /home/dev/hn-rewrite/analysis/trial-20261105/endpoint.db'
+chmod 600 /home/dev/hn-rewrite/analysis/trial-20261105/endpoint.db
+```
+
+Record actual capture time and the snapshot's SHA-256 alongside the result;
+retain the snapshot unchanged. From a checkout containing these corrections:
+
+```sh
+uv run python scripts/interleave_report.py \
+  --db /home/dev/hn-rewrite/analysis/trial-20261105/endpoint.db \
+  --user-id 151 --since 1791432442.75 --until 1793851642.75 \
+  --exclude-updated-between 1791763112.57 1791763180.12 \
+  --output /home/dev/hn-rewrite/analysis/trial-20261105/report.json
+```
+
+The CLI is read-only on its input DB; `--output` writes the named report.
+It does not copy the DB, schedule a capture, decide deployment, or measure
+rank latency. Continue the separate descriptive `rank_perf` median check
+against the 30-second safety bar. No additional review was authorized.
+
+At the October 12 snapshot, 61 credits in 4.52 days imply about 13.5/day,
+far below the replay's 50/day. Around 125/arm at 28 days would resemble the
+optimistic replay's seven-day row (low power). State observed sample size
+and uncertainty at the endpoint; do not extend the trial or change votes
+to reach a desired result. The saved 61-credit snapshot includes the one
+now-confirmed pre-T0 production credit and is historical, not corrected.

@@ -1,5 +1,60 @@
 # HN Rerank findings
 
+## Ranking-trial report review and corrections — 2026-10-12
+
+The user requested `rv`, then approved corrections via `q`: reporting only,
+regression tests, documented frozen snapshot, checks, commit and push.
+One independent Claude cloud review of ae98d0d source and aggregate report:
+https://claude.ai/code/session_01Ut3LPTtPYwgDFqBj4Ks6p1
+Full unchanged review: docs/evaluations/ranking-trial-review-20261012/REVIEW.md.
+No production DB, credentials or private context were given to the reviewer.
+
+Agent verified the findings in source and with read-only production queries:
+29 calibration rows in [1791763112.57,1791763180.12], zero Recommended
+impressions for those story IDs since T0 (including before calibration),
+so no original trial credit was overwritten there. Exactly one credited
+production upvote referred to a deck created before T0, a real protocol
+violation. Mutable feedback can still change retrospective reports; the
+tool cannot recover overwritten actions. The final frozen-copy procedure
+is now documented, but no endpoint capture or timer has been created.
+
+Implemented reporting corrections in scripts/interleave_report.py:
+- Newcombe 95% intervals using SciPy's uncorrected Wilson bounds; primary
+  upvote test unchanged. Down harm is a one-sided pooled z-test at .025;
+  safety requires >=.10 difference and p<.01. Bonferroni family stays two
+  even when --arms contains only one challenger.
+- Deck creation >=since, votes in [since,until), inclusive repeatable
+  calibration exclusions with raw/excluded/eligible counts and bounds.
+- Missing deck tables propagate an error; no eligible decks fail explicitly.
+  Impression timestamp ties use occurred_at,received_at,event_id ordering.
+- CLI rejects invalid intervals/alpha, duplicate or unknown trial arms.
+  Input DB is read-only; --output writes only its report.
+
+The reporting addendum states that the newly fixed secondary choices were
+selected after viewing interim counts, before the endpoint. No claim that
+those details were originally preregistered. Primary test/arms/dates and
+client/server timestamp slack remain unchanged. Clock skew, correlated
+votes/adaptive fits, and upvotes-per-vote rather than per-exposure remain
+limits; they are not reasons to silently change the primary metric.
+
+Read-only corrected CLI rerun using the original snapshot's cutoff, on
+the current mutable live DB (not an archived endpoint snapshot), saved as
+docs/evaluations/ranking-trial-review-20261012/corrected-saved-window-report.json:
+227 raw, 29 excluded, 198 eligible; 60 credits across15 decks. Production
+6up/8neutral/8down; #2 10/8/2; #4 8/3/7. Upvote p=.130/.257; intervals
+[-.062,.473]/[-.117,.432]; down-safety flags false. Original report remains
+historical, with its 61 credits/16 decks. This correction does not select
+a winner. Accrual remains far below the optimistic power replay's 50/day.
+
+Regression evidence: after fixing a missing text_content in the new test
+fixture, five regressions fail against ae98d0d for the intended source
+defects (pre-T0 decks, inclusive cutoff, missing decks/table, variable alpha).
+Corrected focused report/draft/far-card checks: 50 passed. Type/lint/format
+checks clean. Full suite: 1,419 passed / 1 skipped in44.03s, with the existing
+MLP convergence warning. Tests ran
+in isolated VPS checkout /home/dev/hn-rewrite/check-ranking-report-WwGg9E,
+with one BLAS thread; production checkout/service and config untouched.
+
 ## Import AI visible Recommended gate — 2026-10-12
 
 Source: user live reading feedback: "Import AI is always good" and request

@@ -1,0 +1,93 @@
+{
+  "user_id": 151,
+  "since": 1791432442.75,
+  "until": 1791823366.514476,
+  "raw_votes": 227,
+  "excluded_votes": 29,
+  "excluded_updated_intervals": [
+    {
+      "start": 1791763112.57,
+      "end": 1791763180.12
+    }
+  ],
+  "votes": 198,
+  "credited": 60,
+  "skipped": {
+    "deck_not_interleaved": 1,
+    "view_popular": 123,
+    "view_explore": 13,
+    "no_impression": 1
+  },
+  "summary": {
+    "credited_by_arm": {
+      "production": {
+        "neutral": 8,
+        "up": 6,
+        "down": 8
+      },
+      "joined_all": {
+        "neutral": 8,
+        "up": 10,
+        "down": 2
+      },
+      "joined_no_metadata": {
+        "neutral": 3,
+        "up": 8,
+        "down": 7
+      }
+    },
+    "decks_with_credit": 15,
+    "per_test_alpha": 0.025,
+    "bonferroni_challengers": 2,
+    "up_rate_diff_ci_method": "newcombe_wilson",
+    "up_rate_diff_ci_confidence": 0.95,
+    "down_rate_test": "one_sided_pooled_z_challenger_greater",
+    "safety_alpha": 0.01,
+    "joined_all": {
+      "deck_sign_p": 0.6875,
+      "deck_wins": 4,
+      "deck_losses": 2,
+      "rate_p": 0.12982628978151767,
+      "up_rate": 0.5,
+      "control_up_rate": 0.2727272727272727,
+      "down_rate": 0.1,
+      "control_down_rate": 0.36363636363636365,
+      "credited": 20,
+      "control_credited": 22,
+      "deck_sign_rejects": false,
+      "rate_rejects": false,
+      "up_rate_diff": 0.2272727272727273,
+      "up_rate_diff_ci": [
+        -0.062338359802240784,
+        0.4726790936632659
+      ],
+      "down_rate_diff": -0.26363636363636367,
+      "down_rate_p": 0.9774361876459001,
+      "down_rate_rejects": false,
+      "down_safety_stop": false
+    },
+    "joined_no_metadata": {
+      "deck_sign_p": 0.7265625,
+      "deck_wins": 5,
+      "deck_losses": 3,
+      "rate_p": 0.2573120746349482,
+      "up_rate": 0.4444444444444444,
+      "control_up_rate": 0.2727272727272727,
+      "down_rate": 0.3888888888888889,
+      "control_down_rate": 0.36363636363636365,
+      "credited": 18,
+      "control_credited": 22,
+      "deck_sign_rejects": false,
+      "rate_rejects": false,
+      "up_rate_diff": 0.1717171717171717,
+      "up_rate_diff_ci": [
+        -0.11661305858922011,
+        0.43178985072825343
+      ],
+      "down_rate_diff": 0.02525252525252525,
+      "down_rate_p": 0.434817556307583,
+      "down_rate_rejects": false,
+      "down_safety_stop": false
+    }
+  }
+}

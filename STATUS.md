@@ -38,6 +38,18 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Ranking-trial report corrections approved after Claude cloud review and
+  implemented in `scripts/interleave_report.py`: fixed two-challenger alpha,
+  downvote harm/safety tests, Newcombe/Wilson intervals, explicit calibration
+  exclusions, half-open vote window and pre-T0 deck rejection. Missing decks
+  fail explicitly. A read-only rerun of the saved October12 window now has
+  60 credits / 15 decks (one pre-T0 production upvote removed), no significant
+  arm difference or down-safety alarm. Full evidence and review:
+  `docs/evaluations/ranking-trial-review-20261012/`. The final analysis must
+  use a frozen endpoint DB; the reporting addendum documents capture and
+  exclusion commands. Isolated VPS suite 1,419 passed / 1 skipped, plus 50
+  focused checks, lint/type/format clean. No capture timer, runtime or
+  trial-arm/date change.
 - Import AI Recommended integration gate implemented (user 2026-10-12):
   `scripts/check_import_ai_recommended.py` checks real publisher RSS,
   read-only feedback/seen history and existing-profile served feeds. Fresh
@@ -437,8 +449,10 @@ ranking research remains paused and production trial configuration unchanged.
   a Reddit card's tldr-detail (live tap) with archive comments. Rollback:
   delete `reddit_source` in config.toml and restart (RSS until Nov 13).
 - Final analysis at T0 + 28 days, 2026-11-05 04:07 UTC (Nov 4 23:07 ET):
-  `uv run python scripts/interleave_report.py --db hn_rewrite.db
-  --user-id 151 --since 1791432442.75 --until 1793851642.75` on the VPS.
-  Weekly descriptive reports and safety checks per INTERLEAVING.md.
+  freeze a SQLite-consistent endpoint copy before further voting; analyze
+  that copy with the recorded calibration exclusion. Exact commands and
+  capture limits are in INTERLEAVING.md's reporting addendum. No snapshot
+  job is scheduled by this change. Weekly descriptive reports and separate
+  latency safety checks continue; the report now provides down-safety flags.
 - Carried over: 1m Popular age-mix check, real-terminal tint/footer check,
   October 21 Gemma 2 future-vote recheck (/home/d/TASKS.md).

@@ -1,5 +1,18 @@
 # Worklog: hn-rewrite
 
+## 2026-10-12 — Approved ranking-trial reporting corrections
+
+After one Claude cloud review, the user approved fixing final reporting,
+tests, docs, commit and push. Added Newcombe/Wilson up-rate intervals,
+fixed-family downvote significance/safety tests, explicit calibration
+exclusions/counts, trial-deck and half-open vote boundaries, deterministic
+impression ties and explicit missing-deck failures. Documented a frozen
+endpoint copy because feedback is mutable. The saved October12 window
+rerun removes one pre-T0 production upvote: 60 credits/15 decks, no winner.
+Review, validation and caveats are in FINDINGS.md and the review directory.
+Trial dates/arms and production runtime stay unchanged; no capture job or
+additional review was launched.
+
 ## 2026-10-12 — Approved Import AI gate corrections
 
 Stored story times now determine required windows; publisher dates determine
