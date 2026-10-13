@@ -48,6 +48,12 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   and sequential methods are unvalidated, not approved for implementation.
   No stopping rule, trial date/arm, runtime or capture job changed.
   Evidence: `docs/evaluations/stopping-rule-review-20261013/ASSESSMENT.md`.
+- Second resume check 2026-10-13 ~15:15 UTC: service still b1897f4, no
+  warnings in 12 h. Profile151: 235 dwell, 5,333 impression, 2 article_open,
+  still zero comments_open. Import AI RSS newest is still issue476 (voted),
+  so the gate stays NOT_APPLICABLE until the next issue (~2026-10-19).
+  User chose to wait for the November5 endpoint before any continuation
+  design (no design work, snapshot or runtime change now).
 - Resume check 2026-10-13: service remains active at b1897f4, started
   October12 16:09:54 UTC; recent warning journal empty. Corrected Import AI
   gate (source hash matched current laptop checkout) ran from the preserved
@@ -411,7 +417,8 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
-- Stopping design: if the user chooses continuation, define a separate
+- Stopping design: user chose (2026-10-13) to wait for the November5
+  result before deciding. After it, if the user chooses continuation, define a separate
   prospective stage and its useful-improvement/uncertainty target, exposure
   and attribution rules, dependence treatment, stopping/cap and safeguards.
   Preserve the original November5 snapshot/report and do not pool repeated
