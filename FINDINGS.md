@@ -55,6 +55,15 @@ MLP convergence warning. Tests ran
 in isolated VPS checkout /home/dev/hn-rewrite/check-ranking-report-WwGg9E,
 with one BLAS thread; production checkout/service and config untouched.
 
+Save handoff: implementation commit6ed5651 pushed to origin/main; local and
+remote-tracking hashes matched, working tree clean. This save changes only
+handoff documentation; reuse the unchanged code's full/focused/lint/type/
+format results above. No new tests, reviewer, runtime action or capture job.
+The previously verified short reader session (18:39:50–18:44:01 UTC)
+recorded 51 dwell events totaling230.421s, 47 impressions and one
+article_open. comments_open remains unverified; no article title or raw
+interaction rows are included in this handoff.
+
 ## Import AI visible Recommended gate — 2026-10-12
 
 Source: user live reading feedback: "Import AI is always good" and request

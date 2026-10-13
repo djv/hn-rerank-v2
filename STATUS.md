@@ -39,7 +39,7 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
 - Ranking-trial report corrections approved after Claude cloud review and
-  implemented in `scripts/interleave_report.py`: fixed two-challenger alpha,
+  committed/pushed as `6ed5651` in `scripts/interleave_report.py`: fixed two-challenger alpha,
   downvote harm/safety tests, Newcombe/Wilson intervals, explicit calibration
   exclusions, half-open vote window and pre-T0 deck rejection. Missing decks
   fail explicitly. A read-only rerun of the saved October12 window now has
@@ -63,10 +63,11 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   The user authorized corrections: stored-time windows, explicit future-date
   failure, API profile verification and stronger real-API/CLI regressions.
   Verification results are recorded in FINDINGS.md.
-- Real reading delivery observed 2026-10-12: profile151 has8 dwell events
-  totaling426.078s, with normal impressions. The hn reader is running from
-  the expected venv. Article/comments opens still unverified; no synthetic
-  telemetry or browser operation by the agent. Owned read-only watch ended.
+- Real reading delivery verified for the short 2026-10-12 session
+  (18:39:50–18:44:01 UTC): 51 dwell events totaling 230.421 s, 47
+  impressions and one article_open. Dwell and article-open delivery are
+  confirmed; comments_open remains unverified. No synthetic telemetry or
+  browser operation by the agent. Owned read-only watch ended.
 - Reading-signal prerequisite check 2026-10-12 18:10 UTC: no local reader
   process; `hn` points to the client venv and imports this checkout's
   app.py/dwell.py with telemetry hooks present. Profile 151 still has
@@ -371,6 +372,9 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
+Final trial reproducibility requires an endpoint snapshot before later
+vote edits/undo; capture is documented but not scheduled. Reporting code
+and verification are complete. No trial winner is established.
 None for the far card or warm-start test. The recorded seed's failure is
 fixed with tighter test-only convergence; full backend gates pass.
 The Muse-fallback deploy waits for the trial to end (no restart before
@@ -393,8 +397,8 @@ ranking research remains paused and production trial configuration unchanged.
   positions from impressions; novel up-votes per week; Discover plus the far
   card combined). Phase 0b (Combo, Far 1) runs 2026-11-05
   (`fu-20261012-104919-066`).
-- Reading signal: after the user restarts `hn`, confirm `article_open`,
-  `comments_open` rows arrive for profile 151 (dwell is now verified); after about two
+- Reading signal: confirm `comments_open` arrives in normal profile151 use
+  (dwell and article_open are verified); after about two
   weeks, check how opens and dwell relate to votes before using them.
 - Discover: read the result about 2026-11-02 (PLAN.md Phase 2: Discover
   up-rate, novel up-votes per week, Explore down-rate), next to the trial
