@@ -99,7 +99,7 @@ def test_idle_caps_segment() -> None:
     tracker.start(make_ctx(1), 0.0)
     dwell = tracker.stop(600.0)
     assert dwell is not None
-    assert dwell.duration_ms == 300_000
+    assert dwell.duration_ms == 90_000
 
 
 def test_touch_idle_rollover_opens_same_ctx() -> None:
@@ -108,7 +108,7 @@ def test_touch_idle_rollover_opens_same_ctx() -> None:
     dwell = tracker.touch(600.0)
     assert dwell is not None
     assert dwell.ctx.story_id == 7
-    assert dwell.duration_ms == 300_000
+    assert dwell.duration_ms == 90_000
     assert tracker.current is not None and tracker.current.story_id == 7
     again = tracker.stop(605.0)
     assert again is not None and again.duration_ms == 5000
@@ -154,7 +154,7 @@ def test_duration_clamped_to_day() -> None:
 @given(st.data())
 def test_dwell_durations_bounded(data: Any) -> None:
     tracker = DwellTracker()
-    idle_ms = 300_000
+    idle_ms = 90_000
     min_ms = 1000
     now = 0.0
     ctxs = [
@@ -232,7 +232,7 @@ def test_dwell_ctx_matches_open_segment(data: Any) -> None:
             dwell = tracker.touch(now)
             if open_ctx is None:
                 assert dwell is None
-            elif last_input is not None and now - last_input > 300.0:
+            elif last_input is not None and now - last_input > 90.0:
                 assert dwell is not None and dwell.ctx == open_ctx
                 last_input = now
             else:
@@ -427,7 +427,7 @@ async def test_dwell_under_a_second_sends_nothing(
         assert [e for e in interaction_events(fake) if e["event_type"] == "dwell"] == []
 
 
-async def test_dwell_idle_caps_at_five_minutes(
+async def test_dwell_idle_caps_at_idle_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = install_clocks(monkeypatch)
@@ -444,13 +444,13 @@ async def test_dwell_idle_caps_at_five_minutes(
         await flush(app)
         dwells = [e for e in interaction_events(fake) if e["event_type"] == "dwell"]
         assert len(dwells) == 1
-        assert dwells[0]["duration_ms"] == 300_000
+        assert dwells[0]["duration_ms"] == 90_000
 
 
 async def test_dwell_input_keeps_idle_open_across_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Paging every 60 s for 8 min logs one 480 s dwell, not the 300 s cap."""
+    """Paging every 60 s for 8 min logs one 480 s dwell, not the 90 s cap."""
     state = install_clocks(monkeypatch)
     fake = FakeServer()
     app = Reader(api=fake.api(), prefetch=0)
@@ -475,7 +475,7 @@ async def test_dwell_input_keeps_idle_open_across_boundary(
 async def test_dwell_idle_then_input_splits_segments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Idle 10 min, space, 5 s, j logs 300 s and 5 s dwells in order."""
+    """Idle 10 min, space, 5 s, j logs 90 s and 5 s dwells in order."""
     state = install_clocks(monkeypatch)
     fake = FakeServer()
     app = Reader(api=fake.api(), prefetch=0)
@@ -494,7 +494,7 @@ async def test_dwell_idle_then_input_splits_segments(
         await settle(pilot)
         await flush(app)
         dwells = [e for e in interaction_events(fake) if e["event_type"] == "dwell"]
-        assert [d["duration_ms"] for d in dwells] == [300_000, 5_000]
+        assert [d["duration_ms"] for d in dwells] == [90_000, 5_000]
         assert all(d["story_id"] == 1 for d in dwells)
 
 

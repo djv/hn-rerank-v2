@@ -55,7 +55,7 @@ best-effort impression events to your configured server's existing interaction
 ledger: story ID, zero-based list position, filters, feed version, time and a
 random session ID. The reader also logs article/comment opens (`o`/`c`) at
 once and dwell intervals per selection, with the same 1 s minimum and a
-5 min idle cap (input idle ends the segment). Prefetches do not count;
+90 s idle cap (input idle ends the segment). Prefetches do not count;
 failures never block reading. Dwell also ends when the terminal reports a
 focus loss (in tmux this needs `focus-events on`); without such reports only
 the idle cap bounds it, so it measures selection time, not attention. Events

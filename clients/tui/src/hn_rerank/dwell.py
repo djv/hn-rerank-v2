@@ -26,6 +26,12 @@ class Dwell:
     duration_ms: int
 
 
+# Input idle longer than this ends a reading segment. A terminal left open
+# keeps focus, so this is the only bound on away time; 90 s covers reading a
+# summary page, and 300 s logged breaks as reading (FINDINGS 2026-10-13).
+IDLE_LIMIT_S = 90.0
+
+
 class DwellTracker:
     """One open reading segment at most, with an injected monotonic clock.
 
@@ -36,7 +42,7 @@ class DwellTracker:
     Durations are integer milliseconds, clamped to 0..86,400,000.
     """
 
-    def __init__(self, idle_limit_s: float = 300.0, min_s: float = 1.0) -> None:
+    def __init__(self, idle_limit_s: float = IDLE_LIMIT_S, min_s: float = 1.0) -> None:
         self._idle_limit_s = idle_limit_s
         self._min_s = min_s
         self._ctx: DwellContext | None = None
