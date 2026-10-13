@@ -51,10 +51,12 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 - Single-queue plan 2026-10-13 (user's original idea: one stream, no
   sections): `docs/evaluations/single-queue-20261013/PLAN.md`. Independent
   Claude cloud review said "revise"; the agent verified its code claims. The
-  user chose client-first: Step 1 after 2026-11-05 is a client-only Queue
+  user chose client-first: Step 1 is a client-only Queue
   sort (Recommended -> Explore -> top Popular -> done), with day-alternating
   live comparison; Step 2 is a serve-time interleaved queue only if Step 1
-  sticks. Nothing built.
+  sticks. Step 1 built 2026-10-13 on branch `single-queue` (TUI Queue sort,
+  frozen per window with new Recommended cards appended; server accepts
+  `surface`/`queue_position`); deploy pending the `rv` cloud review.
 - Reading-signal review 2026-10-13 (FINDINGS "First reading-signal
   review"): Recommended 41% up / 9% down vs Popular 62% down in the user's
   last three TUI sessions. TUI `position` fixed to served rank (583d0bd);

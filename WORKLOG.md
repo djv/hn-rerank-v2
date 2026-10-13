@@ -1,5 +1,21 @@
 # Worklog: hn-rewrite
 
+## 2026-10-13 — Single queue Step 1 (TUI Queue sort, event fields)
+
+Built Step 1 of `docs/evaluations/single-queue-20261013/PLAN.md` with Codex.
+TUI: a Queue sort (first in the cycle; startup alternates Queue/Recommended
+by UTC day) plays Recommended, Explore (Discover, Unsure, Interest, rest)
+and five more Popular cards, then "Caught up for this window". Each window's
+queue is frozen at first view for the session; later reranks append only new
+Recommended cards (user choice 2026-10-13). The agent's review of the first
+draft found that rebuilding from each reranked deck refilled Recommended
+forever, so Explore and Popular were never reached; the freeze fixes that.
+Queue events keep the origin view and served rank and add `surface` and
+`queue_position`; the server validates them and stores them in two additive
+`interaction_events` columns. Gates: backend 1427 passed, TUI 266 passed,
+ruff/format/ty clean (the worktree venv had to be rebuilt on Python 3.12;
+on 3.14 two strict-migration tests fail on `ATTACH ... ?mode=ro`).
+
 ## 2026-10-13 — First reading-signal review; TUI position and idle fixes
 
 Reviewed the user's TUI sessions since 2026-10-12 (FINDINGS "First
