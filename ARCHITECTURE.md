@@ -988,7 +988,10 @@ preserve rounds; reconnects and profile switches clear them.
 Each QueueEntry freezes `served_version` from its building feed. Queue events
 send that as `dashboard_version`, preserving trial credit keyed by
 (dashboard_version, window, story_id); views events use the current version.
-Served ranks exclude client-inserted undo rows. Only Queue votes record queue
+Served ranks exclude client-inserted undo rows. An undone card returned in a
+fresh API feed is server-served even when `ready=false`; only absent cards
+keep the local restoration marker. This preserves the returned order's ranks
+when a new Queue round is built during ranking. Only Queue votes record queue
 origin metadata for undo. Reports must split Explore positions by `surface`,
 treating `surface=''` (old rows) as views. Startup daily assignment is held for
 the session, so midnight-crossing sessions must be analyzed by actual surface

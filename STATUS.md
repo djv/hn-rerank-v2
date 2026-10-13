@@ -70,7 +70,16 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   and repeat cache hit verified, new-process warning journal empty.
   Import AI exit3 NOT_APPLICABLE (issue476 voted). Deployment evidence:
   `docs/evaluations/single-queue-20261013/DEPLOYMENT.md`. Real TUI use of
-  rounds and live Queue telemetry remain unverified; the user restarts `hn`.
+  rounds and live Queue delivery confirmed in the user's21:07–21:21 UTC
+  session:77 Queue events, second-round Recommended reached, all21 Rec
+  impressions matched stored trial cards. Subjective feel remains unassessed.
+  Follow-up served-rank fix approved: a still-ranking API response returning
+  an undone card now clears its local restoration marker, preserving new
+  round composition/ranks. Regression failed before correction; focused29,
+  backend1445/1 skipped, standalone TUI274/1 skipped, Ruff/ty/format passed.
+  Evidence: `docs/evaluations/single-queue-20261013/SERVED-RANK-FIX.md`.
+  Client fix loads on a fresh `hn` launch; no server restart or historical
+  telemetry rewrite. Normal-use verification of the edge remains pending.
 - Reading-signal review 2026-10-13 (FINDINGS "First reading-signal
   review"): Recommended 41% up / 9% down vs Popular 62% down in the user's
   last three TUI sessions. TUI `position` fixed to served rank (583d0bd);
@@ -446,14 +455,11 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
-- Single queue: run the user-approved Muse Spark review of the rounds fix
-  (commits after 3fb6318, against
-  `docs/evaluations/single-queue-20261013/REVIEW-step1-claude-cloud.md`).
-  If it finds no High issue (user 2026-10-13: "deploy if clean"), fix
-  Medium/Low, merge to main, push, pull on the VPS, restart once (the user
-  OK'd it), smoke test, check the new `interaction_events` columns with
-  `sqlite3 -readonly`, then tell the user to restart `hn`. Record the start
-  date of the day-alternating test (about 3 weeks).
+- Single queue: approved Muse review and rollout are complete. The first
+  normal session on2026-10-13 verified Queue progression and trial mapping.
+  The served-rank client correction loads on the user's next `hn` launch.
+  Continue normal sessions and assess usability/card quality; do not change
+  the ranker from one session's vote mix. Day-alternating use began2026-10-13.
 - Stopping design: user chose (2026-10-13) to wait for the November5
   result before deciding. After it, if the user chooses continuation, define a separate
   prospective stage and its useful-improvement/uncertainty target, exposure
@@ -479,10 +485,10 @@ ranking research remains paused and production trial configuration unchanged.
 - Discover: read the result about 2026-11-02 (PLAN.md Phase 2: Discover
   up-rate, novel up-votes per week, Explore down-rate), next to the trial
   report.
-- Single-queue Step 1 is deployed: the user restarts `hn` and checks rounds.
+- Single-queue Step 1 is deployed; normal-use rounds are technically verified.
   Startup alternates Queue/Recommended by UTC day; record the actual start
-  date when reading Discover/far-card results. Further behavior fixes need
-  separately scoped authorization; remaining observations are in the Muse assessment.
+  date when reading Discover/far-card results. Remaining observations and the
+  served-rank correction are in the updated Muse assessment.
 - After 2026-11-05: replay rank caps and score bars on `deck_scores`
   (FINDINGS "Short-window Recommended: score bar check").
 - After the trial ends (2026-11-05): merge `muse-primary-fallback`, set

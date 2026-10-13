@@ -1,5 +1,21 @@
 # Worklog: hn-rewrite
 
+## 2026-10-13 — Queue ranks for returned undo cards
+
+The user approved the served-rank follow-up after a normal Queue session.
+The prior assessment's ready-feed race was incorrect: `set_feed` does not
+rebuild. A new regression instead reproduced the still-ranking case: a
+server-returned undo card retained its local marker, disappeared from the
+next Queue round, and compressed later served ranks. Returned cards now
+clear the marker regardless of readiness; missing undo cards remain local.
+Focused29, backend1445/1 skipped, standalone TUI274/1 skipped; root/standalone
+Ruff/ty and touched-file formatting passed. Five live API windows parsed
+and composed correctly through the client, read-only. Client-only change,
+no service restart or historical telemetry edit. A fresh `hn` launch loads
+the correction; normal-use observation of the edge remains pending.
+Evidence and first-session delivery:
+`docs/evaluations/single-queue-20261013/SERVED-RANK-FIX.md`.
+
 ## 2026-10-13 — Single queue merged and deployed
 
 Merged `bede2ce`, VPS fast-forward, one restart at 20:59:38 UTC. Private

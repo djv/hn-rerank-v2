@@ -1,5 +1,17 @@
 # HN Rerank findings
 
+## Queue served-rank follow-up — 2026-10-13
+
+Corrected the earlier ready-feed race claim after inspecting live source:
+`set_feed` does not rebuild, so that path already passed. The new regression
+failed on a still-ranking response returning an undone card: expected slots
+`(2,rank0),(3,rank1)` became `(3,rank0)`. Clearing returned restoration markers
+regardless of readiness fixed it while retaining absent undo rows. Focused29,
+backend1445/1 skipped, standalone TUI274/1 skipped; lint/types/format passed.
+The client composed all five live API windows with matching served ranks.
+No feedback or artificial telemetry was sent. Full evidence:
+`docs/evaluations/single-queue-20261013/SERVED-RANK-FIX.md`.
+
 ## Single-queue live rollout — 2026-10-13
 
 Runtime `bede2ce`, one restart20:59:38 UTC, PID121960 active/running.

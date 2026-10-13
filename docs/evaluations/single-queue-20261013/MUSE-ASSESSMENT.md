@@ -14,11 +14,16 @@ context. Raw report: `REVIEW-step1-muse.md`. Verdict: PASS, no High issues.
   is needed before calling this a false-story event.
 - M2: filtering restored IDs before enumeration compresses ranks, reproduced
   with order `[1,2,3]` and restored `{2}`: `(1,0),(3,1)`. This is deliberate
-  for client-inserted undo rows (existing regression test). A ready feed is
-  rebuilt in `set_feed` before `restored` is cleared in `refresh_feed`, so
-  a new round built in that interval can also filter a genuinely served
-  restored card. This remaining Medium affects position analytics; version
-  and story attribution remain separate and intact. No behavior edit made.
+  for client-inserted undo rows (existing regression test). Follow-up source
+  verification corrected the earlier timing claim: `set_feed` does not
+  rebuild, and ready refreshes already clear returned restoration markers
+  before rebuilding. The reproduced Medium instead occurs on a still-ranking
+  response (`ready=false`) containing an undone card. Its restoration marker
+  was retained, so a new round omitted that served card and compressed later
+  ranks. The user approved fixing this on 2026-10-13. Returned cards now lose
+  the local marker regardless of readiness; absent undo rows remain local.
+  Both readiness states are covered by the new refresh regression. Version
+  and story attribution remain unchanged; no historical telemetry is rewritten.
 - M3: session storage grows with earlier rounds, as required for stable
   slots and undo. The suggested prune to `entries` would retain all those
   IDs anyway. No demonstrated resource failure; long-session growth remains

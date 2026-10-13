@@ -622,3 +622,48 @@ def test_restored_rows_do_not_count_in_served_ranks() -> None:
     assert build_round([], feed, set(), {2}) == [
         [QueueEntry(1, "recommended", 0, 7), QueueEntry(3, "recommended", 1, 7)]
     ]
+
+
+@pytest.mark.parametrize("ready", [False, True])
+async def test_refresh_returned_undo_card_keeps_server_ranks(ready: bool) -> None:
+    fake = FakeServer()
+    fake.feed = replace(
+        queue_feed(),
+        stories=[story(1)],
+        orders={"recommended": [1]},
+    )
+    app = Reader(
+        api=fake.api(),
+        prefetch=0,
+        utc_clock=lambda: datetime.fromordinal(739899).replace(tzinfo=UTC),
+    )
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        first = app.stories[0]
+        # An undone card from another view is locally restored while the
+        # first queue round is still open. It has no slot in this window yet.
+        undone = story(2)
+        app.history.append(undone)
+        app.vote_views[2] = ("1w", ["recommended"])
+        app.apply_undo(undone)
+        app.apply_vote(first)
+        assert not app.stories
+        fake.feed = replace(
+            fake.feed,
+            stories=[undone, story(3)],
+            orders={"recommended": [2, 3]},
+            version=7,
+            target_version=7 if ready else 8,
+            ready=ready,
+        )
+        app.refresh_feed(announce=False)
+        await settle(pilot)
+        assert app.queue_rounds["1w"][-1] == [
+            QueueEntry(2, "recommended", 0, 7),
+            QueueEntry(3, "recommended", 1, 7),
+        ]
+        ctx = app._dwell_ctx(next(item for item in app.stories if item.id == 3))
+        assert ctx is not None
+        assert (ctx.position, ctx.dashboard_version, ctx.queue_position) == (1, 7, 2)
+        assert 2 not in app.restored
+        await flush(app)

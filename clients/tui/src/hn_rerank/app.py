@@ -2078,12 +2078,14 @@ class Reader(App[None]):
         self.forget_outgrown_summaries(feed)
         self.set_feed(feed)
         self.last_error = None
-        if feed.ready:
-            present = {story.id for story in feed.stories}
-            self.restored = {
-                sid: story for sid, story in self.restored.items() if sid not in present
-            }
-        else:
+        # A returned card is server-served even while the next deck is still
+        # ranking. Only missing undo rows are local insertions; excluding a
+        # returned row as restored would compress subsequent Queue ranks.
+        present = {story.id for story in feed.stories}
+        self.restored = {
+            sid: story for sid, story in self.restored.items() if sid not in present
+        }
+        if not feed.ready:
             # Until the reranked deck lands, it may lack undone stories.
             for restored in self.restored.values():
                 self.restore_story(restored)
