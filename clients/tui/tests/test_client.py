@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -36,7 +37,7 @@ def sample_feed(version: int = 0, target: int = 0, window: Window = "1w") -> Fee
             "hn",
             100,
             10,
-            i,
+            int(time.time()) if i != 3 else int(time.time()) - 31 * 86400,
             float(4 - i),
         )
         for i in (1, 2, 3)

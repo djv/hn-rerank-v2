@@ -483,7 +483,7 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
             "hn",
             1,
             0,
-            0,
+            int(time.time()),
             float(100 - i),
         )
 

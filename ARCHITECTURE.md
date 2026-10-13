@@ -977,11 +977,24 @@ Popular cards per window, without shuffling or changing server ranking.
 Queue events preserve `sort_mode` as the origin view and `position` as its
 served rank (including Explore's index in the server order). Explore on the
 `views` surface instead reports the index in its client-shuffled order.
-The first shown feed freezes each window's queue for the profile's session;
-later refreshes append only new Recommended cards, keeping original origins
-and ranks. Window switches preserve snapshots; reconnects clear them.
+Each window retains session-scoped rounds. A round freezes the current
+composition, excluding voted/unavailable/aged-out ids and every earlier round's
+ids. Only after the latest round is exhausted does the current feed build the
+next nonempty round. Empty refills show a headed Caught up notice; later new
+cards resume automatically. Stored FeedStory data survives served-view churn
+and updates when a newer feed includes the card. Actual story timestamps decide
+aging within nested recent windows; Archive never ages out. Window switches
+preserve rounds; reconnects and profile switches clear them.
+Each QueueEntry freezes `served_version` from its building feed. Queue events
+send that as `dashboard_version`, preserving trial credit keyed by
+(dashboard_version, window, story_id); views events use the current version.
+Served ranks exclude client-inserted undo rows. Only Queue votes record queue
+origin metadata for undo. Reports must split Explore positions by `surface`,
+treating `surface=''` (old rows) as views. Startup daily assignment is held for
+the session, so midnight-crossing sessions must be analyzed by actual surface
+or assigned default, rather than event date.
 Optional `surface` (`queue` or `views`) and `queue_position` mark the reading
-surface and full frozen/extended queue slot, including voted and aged-out cards.
+surface and global slot across all rounds, including voted and aged-out cards.
 Queue events require a non-negative signed-64-bit queue position; other
 surfaces omit it. Older clients omit both fields and store `surface=''`
 and NULL position. Both columns are added without rewriting existing rows.

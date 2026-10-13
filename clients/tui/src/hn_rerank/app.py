@@ -68,7 +68,7 @@ from .models import (
     FeedStory,
     terminal_safe,
 )
-from .queue import QueueEntry, default_sort, extend_queue, queue_entries
+from .queue import QueueEntry, build_round, default_sort, in_window
 
 DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
 # Quit always exits: at most 3 s after the first q, whatever is still saving.
@@ -839,6 +839,8 @@ class Reader(App[None]):
         self.queue_origins: dict[int, QueueEntry] = {}
         # Each shown window keeps its queue for this profile's session.
         self.queue_snapshots: dict[str, list[QueueEntry]] = {}
+        self.queue_rounds: dict[str, list[list[QueueEntry]]] = {}
+        self.queue_stories: dict[str, dict[int, FeedStory]] = {}
         self.restored: dict[int, FeedStory] = {}
         self.history: list[FeedStory] = []
         # The window and views (sorts) each voted story was listed in, so
@@ -1047,7 +1049,14 @@ class Reader(App[None]):
             return
         counts = self.feed.feedback_counts if self.feed else {}
         line = Text()
-        line.append(f"{len(self.stories)} shown", style=PALETTE["soft"])
+        if self.feed and self.query_one("#sort", Select).value == "queue":
+            rounds = self.queue_rounds.get(self.feed.window, [])
+            line.append(
+                f"Round {len(rounds)} · {len(self.stories)} cards",
+                style=PALETTE["soft"],
+            )
+        else:
+            line.append(f"{len(self.stories)} shown", style=PALETTE["soft"])
         line.append(" · ", style=PALETTE["sep"])
         line.append(f"+{counts.get('up', 0)}", style=PALETTE["good"])
         line.append(" ", style=PALETTE["sep"])
@@ -1139,6 +1148,8 @@ class Reader(App[None]):
         self.history.clear()
         self.vote_views.clear()
         self.queue_snapshots.clear()
+        self.queue_rounds.clear()
+        self.queue_stories.clear()
         self.queue_origins.clear()
         self.reset_summaries()
         # Profile-scoped regeneration/stats state must not leak across
@@ -1233,16 +1244,56 @@ class Reader(App[None]):
         previous = {s.id: s for s in self.stories}
         sort = str(self.query_one("#sort", Select).value)
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
-        lookup = {**self.restored, **lookup}
+        expired_restored: set[int] = set()
         if self.feed is not None:
-            snapshot = self.queue_snapshots.get(self.feed.window)
-            entries = (
-                queue_entries(self.feed)
-                if snapshot is None
-                else extend_queue(snapshot, self.feed)
+            window = self.feed.window
+            now = time.time()
+            # The server already serves only current stories: the age check
+            # applies to cards kept from older decks, not the current feed.
+            served = set(lookup)
+            expired_restored = {
+                sid
+                for sid, story in self.restored.items()
+                if sid not in served and not in_window(story.time, window, now)
+            }
+            lookup = {
+                sid: story
+                for sid, story in lookup.items()
+                if sid not in expired_restored
+            }
+            self.restored = {
+                sid: story
+                for sid, story in self.restored.items()
+                if sid not in expired_restored
+            }
+            lookup = {**self.restored, **lookup}
+            stored = self.queue_stories.setdefault(window, {})
+            stored.update({sid: lookup[sid] for sid in stored if sid in lookup})
+            frozen = {**stored, **lookup}
+            excluded = (
+                self.rated
+                | self.unavailable
+                | expired_restored
+                | {
+                    sid
+                    for sid, story in frozen.items()
+                    if sid not in served and not in_window(story.time, window, now)
+                }
             )
-            self.queue_snapshots[self.feed.window] = entries
+            rounds = self.queue_rounds.get(window, [])
+            if not rounds or all(entry.story_id in excluded for entry in rounds[-1]):
+                rounds = build_round(rounds, self.feed, excluded, set(self.restored))
+                self.queue_rounds[window] = rounds
+            entries = [entry for batch in rounds for entry in batch]
+            for entry in entries:
+                if entry.story_id in lookup:
+                    stored[entry.story_id] = lookup[entry.story_id]
+            self.queue_snapshots[window] = entries
             self.queue_origins = {entry.story_id: entry for entry in entries}
+            if sort == "queue":
+                lookup = {
+                    sid: story for sid, story in stored.items() if sid not in excluded
+                }
         else:
             self.queue_origins = {}
         self.view_key = f"{self.selected_window()}:{sort}"
@@ -1262,6 +1313,7 @@ class Reader(App[None]):
             and open_id not in {s.id for s in self.stories}
             and open_id not in self.rated
             and open_id not in self.unavailable
+            and open_id not in expired_restored
         ):
             carried = lookup.get(open_id, previous.get(open_id))
             if carried is not None:
@@ -1375,19 +1427,22 @@ class Reader(App[None]):
         if self.feed is None or not self.query("#headlines"):
             return None
         try:
-            listed = self.stories.index(story)
+            self.stories.index(story)
         except ValueError:
             return None
-        position = self.view_ranks.get(story.id, listed)
+        position = self.view_ranks.get(story.id)
+        if position is None:
+            # Carried views rows have no position in this version's order.
+            return None
         sort = str(self.query_one("#sort", Select).value)
         origin = self.queue_origins.get(story.id) if sort == "queue" else None
         if sort == "queue" and origin is None:
-            # A carried open row has left the new queue; don't invent origin data.
+            # Only queued entries have a served origin and version.
             return None
         return DwellContext(
             story_id=story.id,
             position=origin.served_rank if origin else position,
-            dashboard_version=self.feed.version,
+            dashboard_version=origin.served_version if origin else self.feed.version,
             sort_mode=origin.origin if origin else sort,
             surface="queue" if origin else "views",
             queue_position=position if origin else None,
@@ -1543,6 +1598,16 @@ class Reader(App[None]):
         api = self.api
         await asyncio.sleep(1.0)
         selected = self.selected() if self.query("#headlines") else None
+        origin = (
+            self.queue_origins.get(event.story_id) if event.surface == "queue" else None
+        )
+        shown_version = (
+            origin.served_version
+            if origin
+            else self.feed.version
+            if self.feed
+            else None
+        )
         if (
             api is None
             or api is not self.api
@@ -1552,7 +1617,7 @@ class Reader(App[None]):
             or selected is None
             or selected.id != event.story_id
             or self.feed is None
-            or self.feed.version != event.dashboard_version
+            or shown_version != event.dashboard_version
             or str(self.query_one("#sort", Select).value)
             != ("queue" if event.surface == "queue" else event.sort_mode)
             or self.feed.window != event.window
@@ -2054,6 +2119,11 @@ class Reader(App[None]):
 
     def patch_counts(self, story_id: int, points: int, comments: int | None) -> None:
         """Show the counts a summary reply carried; the feed's may be older."""
+        for stored in self.queue_stories.values():
+            if story_id in stored:
+                stored[story_id] = replace(
+                    stored[story_id], points=points, comments=comments
+                )
         for feed in self.feeds.values():
             for i, item in enumerate(feed.stories):
                 if item.id == story_id:
@@ -2472,7 +2542,7 @@ class Reader(App[None]):
                 key for key, order in self.feed.orders.items() if story.id in order
             ]
             origin = self.queue_origins.get(story.id)
-            if origin is not None:
+            if origin is not None and self.query_one("#sort", Select).value == "queue":
                 if origin.origin not in views:
                     views.append(origin.origin)
                 views.append("queue")
@@ -2577,7 +2647,9 @@ class Reader(App[None]):
                 (
                     entry
                     for entry in self.queue_snapshots.get(window, [])
-                    if entry.story_id == story.id and entry.origin == key
+                    if "queue" in keys
+                    and entry.story_id == story.id
+                    and entry.origin == key
                 ),
                 None,
             )
@@ -2773,7 +2845,7 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "summary")
         view = str(self.query_one("#sort", Select).value)
         reasons = {
-            "queue": "Queue freezes each window's first shown deck: Recommended, then Discover, Unsure and Interest from Explore, then up to five additional Popular cards. Refreshes append only new Recommended cards at the end; original slots stay fixed. Voting through it ends at Caught up for this window. Startup alternates Queue and Recommended by UTC day.",
+            "queue": "Queue freezes each window's first shown deck: Recommended, then Discover, Unsure and Interest from Explore, then up to five additional Popular cards. After the latest round is exhausted, the current feed starts another round of unseen cards; original slots stay fixed. Voting through it ends at Caught up for this window. Startup alternates Queue and Recommended by UTC day.",
             "recommended": "Recommended orders stories by the model's learned preferences from your votes. When a story unlike your up-votes scores well, the last card is a ✨ Discover pick.",
             "popular": "Popular orders eligible HN stories by points and age; older stories lose weight.",
             "explore": "Explore offers discovery picks, including unfamiliar stories and interests Recommended misses. Its order is shuffled.",
@@ -2858,7 +2930,7 @@ class Reader(App[None]):
             "- `u`: undo latest vote\n\n"
             "## Sort\n\n"
             "- `s`: cycle sort (Queue → Recommended → Popular → Explore)\n"
-            "- Queue: each window's first shown Recommended, then Explore by badge, then up to five additional Popular cards; frozen order, no shuffle. Refreshes append only new Recommended cards.\n"
+            "- Queue: each window's first shown Recommended, then Explore by badge, then up to five additional Popular cards; frozen order, no shuffle. Exhausting a round starts another from the current feed, skipping all earlier cards.\n"
             "- Startup: Queue on odd UTC ordinal days, Recommended on even days.\n"
             "- `h` / `l`: previous / next sort\n"
             "- `d` / `D`: next / previous time window (12 hours → 1 day →"
