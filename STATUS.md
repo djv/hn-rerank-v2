@@ -77,6 +77,8 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   an undone card now clears its local restoration marker, preserving new
   round composition/ranks. Regression failed before correction; focused29,
   backend1445/1 skipped, standalone TUI274/1 skipped, Ruff/ty/format passed.
+  Saved/pushed as `19fdec0`; backend CI38471831094 and Terminal client
+  CI38471831076 both passed. Laptop/VPS main are synced; local tree clean.
   Evidence: `docs/evaluations/single-queue-20261013/SERVED-RANK-FIX.md`.
   Client fix loads on a fresh `hn` launch; no server restart or historical
   telemetry rewrite. Normal-use verification of the edge remains pending.
@@ -458,7 +460,8 @@ ranking research remains paused and production trial configuration unchanged.
 - Single queue: approved Muse review and rollout are complete. The first
   normal session on2026-10-13 verified Queue progression and trial mapping.
   The served-rank client correction loads on the user's next `hn` launch.
-  Continue normal sessions and assess usability/card quality; do not change
+  Restart `hn` to load `19fdec0` if not already restarted, then continue
+  normal sessions and assess usability/card quality; do not change
   the ranker from one session's vote mix. Day-alternating use began2026-10-13.
 - Stopping design: user chose (2026-10-13) to wait for the November5
   result before deciding. After it, if the user chooses continuation, define a separate

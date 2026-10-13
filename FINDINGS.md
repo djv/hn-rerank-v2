@@ -2,6 +2,12 @@
 
 ## Queue served-rank follow-up — 2026-10-13
 
+Final `ss` check: `19fdec0` is pushed and synced on laptop/VPS main; backend
+CI38471831094 and Terminal client CI38471831076 both passed. Runtime remains
+PID121960 with its20:59:38 UTC start, active; bounded warning journal empty.
+No further service restart, database write or ranking change. Pending:
+user's fresh reader launch and normal-use verification of the rare undo edge.
+
 Corrected the earlier ready-feed race claim after inspecting live source:
 `set_feed` does not rebuild, so that path already passed. The new regression
 failed on a still-ranking response returning an undone card: expected slots
