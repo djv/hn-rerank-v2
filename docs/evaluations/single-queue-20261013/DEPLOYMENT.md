@@ -15,8 +15,8 @@ remaining findings and agent verification are in `MUSE-ASSESSMENT.md`.
   concurrent load is recorded in the assessment; no test weakened.
 - Root/standalone Ruff and ty passed; 14 touched Python files format-clean.
 - Standalone wheel built; installed wheel `--version` reported 0.1.0.
-- GitHub main backend CI run `38467165477` passed; Terminal client run
-  `38467165458` was still running at the first post-smoke check.
+- GitHub main backend CI run `38467165477` and Terminal client run
+  `38467165458` passed, including standalone build and wheel startup.
 
 ## Backup and preservation
 

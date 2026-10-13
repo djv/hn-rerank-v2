@@ -64,7 +64,8 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Approved Muse result review: PASS, no High issues. Agent assessment:
   `docs/evaluations/single-queue-20261013/MUSE-ASSESSMENT.md`. Standalone
   CI import errors corrected with the user's approval; VPS backend 1445/1
-  skipped, TUI 272/1 skipped, lint/types/format clean. Restarted once at
+  skipped, TUI 272/1 skipped, lint/types/format clean; main backend and
+  Terminal client CI green. Restarted once at
   20:59:38 UTC; all five existing-profile windows ready, summary generation
   and repeat cache hit verified, new-process warning journal empty.
   Import AI exit3 NOT_APPLICABLE (issue476 voted). Deployment evidence:
