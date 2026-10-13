@@ -2756,7 +2756,8 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         "occurred_at",
     }
     if not required.issubset(raw_event) or bool(
-        set(raw_event) - (required | {"duration_ms", "badges"})
+        set(raw_event)
+        - (required | {"duration_ms", "badges", "surface", "queue_position"})
     ):
         raise ValueError("event has unexpected or missing fields")
 
@@ -2831,6 +2832,16 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
     if event_type != "dwell" and duration_ms is not None:
         raise ValueError("only dwell events may include duration_ms")
 
+    surface = raw_event.get("surface", "")
+    if "surface" in raw_event and surface not in ("queue", "views"):
+        raise ValueError("surface must be queue or views")
+    queue_position = raw_event.get("queue_position")
+    if surface == "queue":
+        if type(queue_position) is not int or not 0 <= queue_position < 2**63:
+            raise ValueError("queue events require a valid queue_position")
+    elif "queue_position" in raw_event:
+        raise ValueError("only queue events may include queue_position")
+
     # The card's badge kinds as shown (optional: older clients omit them),
     # so per-badge outcomes can be read from the ledger.
     badges = raw_event.get("badges", [])
@@ -2861,6 +2872,8 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         occurred_at=timestamp,
         duration_ms=duration_ms,
         badges=",".join(dict.fromkeys(cast("list[str]", badges))),
+        surface=cast(str, surface),
+        queue_position=cast(int | None, queue_position),
     )
 
 

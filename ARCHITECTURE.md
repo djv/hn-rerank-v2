@@ -971,6 +971,21 @@ revision is still current, preserving a later choice on the same story.
 
 ### 4.4 Interaction ledger
 
+The terminal Queue sort composes served Recommended, badge-grouped Explore
+(Discover, Unsure, Interest, then other kinds), and up to five additional
+Popular cards per window, without shuffling or changing server ranking.
+Queue events preserve `sort_mode` as the origin view and `position` as its
+served rank (including Explore's index in the server order). Explore on the
+`views` surface instead reports the index in its client-shuffled order.
+The first shown feed freezes each window's queue for the profile's session;
+later refreshes append only new Recommended cards, keeping original origins
+and ranks. Window switches preserve snapshots; reconnects clear them.
+Optional `surface` (`queue` or `views`) and `queue_position` mark the reading
+surface and full frozen/extended queue slot, including voted and aged-out cards.
+Queue events require a non-negative signed-64-bit queue position; other
+surfaces omit it. Older clients omit both fields and store `surface=''`
+and NULL position. Both columns are added without rewriting existing rows.
+
 The browser records only explicit deck interactions: card impressions, dwell
 intervals, article opens, and comments opens. Events are batched in memory and
 sent to same-origin `POST /api/interaction` with `navigator.sendBeacon` (falling

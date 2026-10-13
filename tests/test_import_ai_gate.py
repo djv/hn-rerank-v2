@@ -102,7 +102,12 @@ def test_duplicate_url_ids_share_visibility_and_history(
             db.upsert_feedback(user.id, 100, "neutral")
         elif state == "seen":
             db.execute(
-                "INSERT INTO interaction_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """INSERT INTO interaction_events (
+                    event_id, client_session_id, user_id, story_id, event_type,
+                    dashboard_version, position, sort_mode, age_filter,
+                    source_filter, ranker_arm, occurred_at, duration_ms,
+                    received_at, badges
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     "seen",
                     "session",
@@ -317,7 +322,12 @@ def test_gate_applicability_and_ingestion(tmp_path: Path, state: str) -> None:
         db.upsert_feedback(user.id, story.id, "neutral")
     if state == "seen":
         db.execute(
-            "INSERT INTO interaction_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """INSERT INTO interaction_events (
+                event_id, client_session_id, user_id, story_id, event_type,
+                dashboard_version, position, sort_mode, age_filter,
+                source_filter, ranker_arm, occurred_at, duration_ms,
+                received_at, badges
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 "seen",
                 "session",
