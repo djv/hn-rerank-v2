@@ -41,6 +41,10 @@ Votes counted only when cast after the card's first impression.
 - AINews (rss_ainews) all-time: 19 up / 27 neutral / 5 down (37% up, 10%
   down), better than Recommended's average; the last eight votes were 7
   neutral, 1 down. Keep; recheck in a month.
+- Skips carry no signal: training uses votes only, and unvoted stories stay
+  in the pool and reappear (92 of 397 Popular stories since 2026-10-05 were
+  shown in more than one session). The user prefers voting on every card to
+  move on (2026-10-13), so hide-seen and skip-as-weak-down were declined.
 - Dwell vs votes (125 cards, 87 voted; dwell capped at 90 s per segment):
   dwell AUC up-vs-rest 0.66, not-down-vs-down 0.82; the served model's
   prob_up gives 0.785 and 0.82. Neutrals in the longer-dwell half have mean
