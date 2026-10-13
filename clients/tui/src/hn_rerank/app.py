@@ -5,7 +5,9 @@ import random
 import time
 import unicodedata
 import webbrowser
+from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
@@ -66,6 +68,7 @@ from .models import (
     FeedStory,
     terminal_safe,
 )
+from .queue import QueueEntry, default_sort, extend_queue, queue_entries
 
 DEFAULT_SERVER = "https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/"
 # Quit always exits: at most 3 s after the first q, whatever is still saving.
@@ -499,6 +502,11 @@ EMPTY_NOTICE = (
     "Try another sort or time window, or press **r** to refresh."
 )
 
+QUEUE_NOTICE = (
+    "# Caught up for this window\n\nTry another sort or time window, "
+    "or press **r** to refresh."
+)
+
 
 def feed_failure_notice(detail: str) -> str:
     return (
@@ -786,8 +794,10 @@ class Reader(App[None]):
         prefetch: int = DEFAULT_PREFETCH,
         prefetch_generate: int = DEFAULT_PREFETCH_GENERATE,
         window_file: Path | None = None,
+        utc_clock: Callable[[], datetime] | None = None,
     ) -> None:
         super().__init__()
+        self.startup_sort = default_sort(utc_clock() if utc_clock else None)
         # The last window picked opens next time; None (tests) keeps 1w and
         # never writes.
         self.window_file = window_file
@@ -821,10 +831,14 @@ class Reader(App[None]):
         # when the user leaves that view, so each visit gets a fresh order.
         self.explore_orders: dict[str, list[int]] = {}
         self.view_key: str | None = None
+        self.summary_view_key: str | None = None
         # Each story's slot in the current view's full order (voted and
         # unavailable stories included): the served rank that impressions
         # and dwell report, so a vote does not shift later cards' positions.
         self.view_ranks: dict[int, int] = {}
+        self.queue_origins: dict[int, QueueEntry] = {}
+        # Each shown window keeps its queue for this profile's session.
+        self.queue_snapshots: dict[str, list[QueueEntry]] = {}
         self.restored: dict[int, FeedStory] = {}
         self.history: list[FeedStory] = []
         # The window and views (sorts) each voted story was listed in, so
@@ -912,11 +926,12 @@ class Reader(App[None]):
             yield Tabs(
                 *(Tab(s.title(), id=f"sort-{s}") for s in self.SORT_CYCLE),
                 id="sort-tabs",
+                active=f"sort-{self.startup_sort}",
             )
             yield Static("Sort", classes="filter-caption")
             yield Dropdown(
                 [(s.title(), s) for s in self.SORT_CYCLE],
-                value="recommended",
+                value=self.startup_sort,
                 allow_blank=False,
                 id="sort",
             )
@@ -1123,6 +1138,8 @@ class Reader(App[None]):
         self.restored.clear()
         self.history.clear()
         self.vote_views.clear()
+        self.queue_snapshots.clear()
+        self.queue_origins.clear()
         self.reset_summaries()
         # Profile-scoped regeneration/stats state must not leak across
         # reconnect: A's declined offer would suppress B's first check
@@ -1180,6 +1197,11 @@ class Reader(App[None]):
 
     def view_order(self, sort: str) -> list[int]:
         """Story order for a sort of the current window as the user sees it."""
+        if sort == "queue":
+            entries = (
+                self.queue_snapshots.get(self.feed.window, []) if self.feed else []
+            )
+            return [entry.story_id for entry in entries]
         order = self.feed.orders.get(sort, []) if self.feed else []
         if sort != "explore" or self.feed is None:
             return order
@@ -1211,17 +1233,30 @@ class Reader(App[None]):
         previous = {s.id: s for s in self.stories}
         sort = str(self.query_one("#sort", Select).value)
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
+        lookup = {**self.restored, **lookup}
+        if self.feed is not None:
+            snapshot = self.queue_snapshots.get(self.feed.window)
+            entries = (
+                queue_entries(self.feed)
+                if snapshot is None
+                else extend_queue(snapshot, self.feed)
+            )
+            self.queue_snapshots[self.feed.window] = entries
+            self.queue_origins = {entry.story_id: entry for entry in entries}
+        else:
+            self.queue_origins = {}
         self.view_key = f"{self.selected_window()}:{sort}"
         order = self.view_order(sort)
         self.view_ranks = {sid: rank for rank, sid in enumerate(order)}
         self.stories = [
             lookup[sid]
             for sid in order
-            if sid not in self.rated and sid not in self.unavailable
+            if sid in lookup and sid not in self.rated and sid not in self.unavailable
         ][:VIEW_LIMIT]
         open_id = self.summary_story_id
         if (
             self.stories
+            and sort != "queue"
             and not explicit
             and open_id is not None
             and open_id not in {s.id for s in self.stories}
@@ -1267,7 +1302,7 @@ class Reader(App[None]):
             self.workers.cancel_group(self, "summary")
             self._stop_dwell()
             self.query_one("#summary", Markdown).update(
-                EMPTY_NOTICE
+                (QUEUE_NOTICE if sort == "queue" else EMPTY_NOTICE)
                 if self.feed is not None
                 else feed_failure_notice(self.last_error)
                 if self.last_error
@@ -1344,11 +1379,18 @@ class Reader(App[None]):
         except ValueError:
             return None
         position = self.view_ranks.get(story.id, listed)
+        sort = str(self.query_one("#sort", Select).value)
+        origin = self.queue_origins.get(story.id) if sort == "queue" else None
+        if sort == "queue" and origin is None:
+            # A carried open row has left the new queue; don't invent origin data.
+            return None
         return DwellContext(
             story_id=story.id,
-            position=position,
+            position=origin.served_rank if origin else position,
             dashboard_version=self.feed.version,
-            sort_mode=str(self.query_one("#sort", Select).value),
+            sort_mode=origin.origin if origin else sort,
+            surface="queue" if origin else "views",
+            queue_position=position if origin else None,
             window=self.feed.window,
             badges=tuple(badge.kind for badge in story.badge_details),
         )
@@ -1371,6 +1413,8 @@ class Reader(App[None]):
             occurred_at=occurred_at,
             event_type=event_type,
             badges=list(ctx.badges),
+            surface=ctx.surface,
+            queue_position=ctx.queue_position,
             duration_ms=duration_ms,
         )
 
@@ -1468,9 +1512,12 @@ class Reader(App[None]):
         story = self.selected()
         if self.help_open:
             return
-        if story and story.id != self.summary_story_id:
+        if story and (
+            story.id != self.summary_story_id or self.summary_view_key != self.view_key
+        ):
             self.query_one("#story-heading", Static).update(self.heading(story))
             self.summary_story_id = story.id
+            self.summary_view_key = self.view_key
             self.selection_serial += 1
             if self.feed is not None:
                 ctx = self._dwell_ctx(story)
@@ -1506,7 +1553,8 @@ class Reader(App[None]):
             or selected.id != event.story_id
             or self.feed is None
             or self.feed.version != event.dashboard_version
-            or str(self.query_one("#sort", Select).value) != event.sort_mode
+            or str(self.query_one("#sort", Select).value)
+            != ("queue" if event.surface == "queue" else event.sort_mode)
             or self.feed.window != event.window
         ):
             return
@@ -1966,7 +2014,10 @@ class Reader(App[None]):
         self.set_feed(feed)
         self.last_error = None
         if feed.ready:
-            self.restored.clear()
+            present = {story.id for story in feed.stories}
+            self.restored = {
+                sid: story for sid, story in self.restored.items() if sid not in present
+            }
         else:
             # Until the reranked deck lands, it may lack undone stories.
             for restored in self.restored.values():
@@ -2130,7 +2181,12 @@ class Reader(App[None]):
         finally:
             self.window_prefetching = False
 
-    SORT_CYCLE: ClassVar[tuple[str, ...]] = ("recommended", "popular", "explore")
+    SORT_CYCLE: ClassVar[tuple[str, ...]] = (
+        "queue",
+        "recommended",
+        "popular",
+        "explore",
+    )
 
     def action_cycle_window(self, delta: int = 1) -> None:
         """Move the window selector by *delta* steps, wrapping at either end."""
@@ -2412,9 +2468,17 @@ class Reader(App[None]):
         self.restored.pop(story.id, None)
         self.history.append(story)
         if self.feed is not None:
+            views = [
+                key for key, order in self.feed.orders.items() if story.id in order
+            ]
+            origin = self.queue_origins.get(story.id)
+            if origin is not None:
+                if origin.origin not in views:
+                    views.append(origin.origin)
+                views.append("queue")
             self.vote_views[story.id] = (
                 self.feed.window,
-                [key for key, order in self.feed.orders.items() if story.id in order],
+                views,
             )
         self.rebuild(next_id)
 
@@ -2504,8 +2568,21 @@ class Reader(App[None]):
         now = time.time()
         scale = GRAVITY_TIME_SCALE.get(window, 1.0)
         for key in keys:
+            if key == "queue":
+                continue  # Queue is derived client-side, never a server order.
             order = feed.orders.setdefault(key, [])
             if story.id in order:
+                continue
+            saved = next(
+                (
+                    entry
+                    for entry in self.queue_snapshots.get(window, [])
+                    if entry.story_id == story.id and entry.origin == key
+                ),
+                None,
+            )
+            if saved is not None:
+                order.insert(min(saved.served_rank, len(order)), story.id)
                 continue
             by_gravity = key == "popular"
 
@@ -2696,6 +2773,7 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "summary")
         view = str(self.query_one("#sort", Select).value)
         reasons = {
+            "queue": "Queue freezes each window's first shown deck: Recommended, then Discover, Unsure and Interest from Explore, then up to five additional Popular cards. Refreshes append only new Recommended cards at the end; original slots stay fixed. Voting through it ends at Caught up for this window. Startup alternates Queue and Recommended by UTC day.",
             "recommended": "Recommended orders stories by the model's learned preferences from your votes. When a story unlike your up-votes scores well, the last card is a ✨ Discover pick.",
             "popular": "Popular orders eligible HN stories by points and age; older stories lose weight.",
             "explore": "Explore offers discovery picks, including unfamiliar stories and interests Recommended misses. Its order is shuffled.",
@@ -2779,7 +2857,9 @@ class Reader(App[None]):
             "- `1` / `2` / `3`: up / neutral / down (advances to next story)\n"
             "- `u`: undo latest vote\n\n"
             "## Sort\n\n"
-            "- `s`: cycle sort (Recommended → Popular → Explore)\n"
+            "- `s`: cycle sort (Queue → Recommended → Popular → Explore)\n"
+            "- Queue: each window's first shown Recommended, then Explore by badge, then up to five additional Popular cards; frozen order, no shuffle. Refreshes append only new Recommended cards.\n"
+            "- Startup: Queue on odd UTC ordinal days, Recommended on even days.\n"
             "- `h` / `l`: previous / next sort\n"
             "- `d` / `D`: next / previous time window (12 hours → 1 day →"
             " 1 week → 1 month → Archive)\n"

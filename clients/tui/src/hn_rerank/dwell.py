@@ -18,6 +18,8 @@ class DwellContext:
     sort_mode: str
     window: str
     badges: tuple[str, ...] = field(default_factory=tuple)
+    surface: str = "views"
+    queue_position: int | None = None
 
 
 @dataclass(frozen=True)

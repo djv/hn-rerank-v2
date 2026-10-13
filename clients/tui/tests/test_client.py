@@ -601,7 +601,7 @@ async def test_rapid_filter_changes_settle(
             for value in ("popular", "explore", "popular", "explore"):
                 app.query_one("#sort-tabs", Tabs).active = f"sort-{value}"
         await settle(pilot)
-        expected = "popular" if origin == "cycle" else "explore"
+        expected = "recommended" if origin == "cycle" else "explore"
         assert app.query_one("#sort", Select).value == expected
         assert app.query_one("#sort-tabs", Tabs).active == f"sort-{expected}"
         settled = rebuilds
@@ -621,6 +621,7 @@ async def test_s_cycles_sort_modes(tmp_path: Path) -> None:
         for expected, story_ids in (
             ("popular", [1]),
             ("explore", [2]),
+            ("queue", [1, 2]),
             ("recommended", [1, 2]),
         ):
             await pilot.press("s")
@@ -700,7 +701,7 @@ async def test_explore_order_is_stable_within_a_visit(
         app.rebuild()
         assert [s.id for s in app.stories] == first[1:]
         app.rated.clear()
-        await pilot.press("s", "s", "s")  # full cycle back to explore
+        await pilot.press("s", "s", "s", "s")  # full cycle back to explore
         await settle(pilot)
         assert str(app.query_one("#sort", Select).value) == "explore"
         assert [s.id for s in app.stories] != first
@@ -1022,9 +1023,16 @@ async def test_h_and_l_step_through_sorts_and_wrap(tmp_path: Path) -> None:
         app.query_one(OptionList).focus()
         sort = app.query_one("#sort", Select)
         seen = []
-        for key in "lllhh":
+        for key in "llllhh":
             await pilot.press(key)
             await pilot.pause()
             seen.append(str(sort.value))
-        assert seen == ["popular", "explore", "recommended", "explore", "popular"]
-        assert app.query_one("#sort-tabs", Tabs).active == "sort-popular"
+        assert seen == [
+            "popular",
+            "explore",
+            "queue",
+            "recommended",
+            "queue",
+            "explore",
+        ]
+        assert app.query_one("#sort-tabs", Tabs).active == "sort-explore"

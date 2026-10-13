@@ -123,3 +123,30 @@ Empty filters and feed failures get headed notices in the reading pane rather
 than a bare line; the setup form is a bordered card on a dimmed scrim; the
 reading pane caps at 100 columns with a hairline under the headline; votes
 confirm in the status line.
+
+### Queue sort and daily comparison
+
+Queue plays each window's served Recommended cards, then Explore grouped as
+Discover, Unsure (`uncertain`), Interest, and other badge kinds, then the first
+five additional Popular stories. Duplicates and unavailable stories are skipped.
+Queue keeps served order within each group and never shuffles. Voting advances
+through the full queue; undo returns a story to its queue slot. Each window's
+first shown feed freezes its queue for the session. Later refreshes append only
+new Recommended cards at the end, retaining every original slot, origin, and
+served rank. New Explore and Popular cards are not appended. Aged-out cards are
+skipped; switching windows retains their snapshots, and reconnecting clears them.
+At the end the reader shows **Caught up for this window**. The `s`, `h`, and `l` keys and sort
+tabs/dropdown still reach Recommended, Popular, and Explore.
+
+The startup sort alternates by UTC ordinal day: odd days open Queue, even days
+open Recommended. The choice is made at launch, for the live comparison.
+
+All four reading events (impression, dwell, article open, comments open) carry
+`surface="queue"` and `queue_position` in Queue. `queue_position` is the slot in
+the full frozen and extended queue, including voted and skipped stories.
+`sort_mode` and `position` retain the origin view and that view's served rank.
+For Explore cards in Queue, this is the index in the server's Explore order;
+in the Explore view it is the index in the client-shuffled list.
+Other sorts send `surface="views"` and
+omit `queue_position`. Deploy the server's additive event-field support with
+this client; older servers reject these events (reading remains best effort).

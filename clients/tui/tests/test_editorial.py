@@ -492,7 +492,7 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
     fake.feed = replace(
         fake.feed,
         stories=[story(i) for i in ids],
-        orders={sort: ids for sort in Reader.SORT_CYCLE},
+        orders={sort: ids for sort in Reader.SORT_CYCLE if sort != "queue"},
     )
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
