@@ -48,6 +48,13 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   and sequential methods are unvalidated, not approved for implementation.
   No stopping rule, trial date/arm, runtime or capture job changed.
   Evidence: `docs/evaluations/stopping-rule-review-20261013/ASSESSMENT.md`.
+- Single-queue plan 2026-10-13 (user's original idea: one stream, no
+  sections): `docs/evaluations/single-queue-20261013/PLAN.md`. Independent
+  Claude cloud review said "revise"; the agent verified its code claims. The
+  user chose client-first: Step 1 after 2026-11-05 is a client-only Queue
+  sort (Recommended -> Explore -> top Popular -> done), with day-alternating
+  live comparison; Step 2 is a serve-time interleaved queue only if Step 1
+  sticks. Nothing built.
 - Reading-signal review 2026-10-13 (FINDINGS "First reading-signal
   review"): Recommended 41% up / 9% down vs Popular 62% down in the user's
   last three TUI sessions. TUI `position` fixed to served rank (583d0bd);
@@ -448,6 +455,8 @@ ranking research remains paused and production trial configuration unchanged.
 - Discover: read the result about 2026-11-02 (PLAN.md Phase 2: Discover
   up-rate, novel up-votes per week, Explore down-rate), next to the trial
   report.
+- After 2026-11-05 and Diversity Phase 0b: build single-queue Step 1
+  (PLAN.md above), then start its day-alternating test.
 - After 2026-11-05: replay rank caps and score bars on `deck_scores`
   (FINDINGS "Short-window Recommended: score bar check").
 - After the trial ends (2026-11-05): merge `muse-primary-fallback`, set
