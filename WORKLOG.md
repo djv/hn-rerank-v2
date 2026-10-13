@@ -12128,3 +12128,13 @@ Read-only post-job coverage exceeds 99.99% across 17 feedback profiles; all
 active at 794caa4 without another restart or extra job. Updated STATUS.md,
 FINDINGS.md and DEPLOYMENT.md; fresh summary generation and physical TUI
 remain untested. User `ss` saves this documentation follow-up.
+
+## 2026-10-13 — Stopping-rule review handoff saved
+
+One user-authorized Claude cloud review assessed continuous trial collection
+and evidence-based stopping. Agent verified findings and rejected the missing
+far-card-test claim. Review/assessment saved as 10be4fa; STATUS.md and FINDINGS.md
+now distinguish the original November 5 snapshot/report from a prospective,
+unapproved continuation. Outcome/exposure, useful effect, dependence and
+stopping/safeguard choices remain unresolved. No code, runtime, trial or DB
+change. Documentation-only diff checks; no repeated code gates.

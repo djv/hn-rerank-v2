@@ -38,6 +38,16 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Stopping-rule review completed (user `rv`, 2026-10-13): one independent
+  Claude cloud review and agent source verification, saved/pushed as
+  `10be4fa`. Recommendation: preserve the original November5 snapshot/report,
+  accept an inconclusive result, and define any continuation prospectively.
+  Current per-vote test ignores clustering and skipped-card exposure; mutable
+  feedback still requires snapshots. Missing far-card-test claim rejected:
+  storage and report-exclusion tests already exist. Proposed sample targets
+  and sequential methods are unvalidated, not approved for implementation.
+  No stopping rule, trial date/arm, runtime or capture job changed.
+  Evidence: `docs/evaluations/stopping-rule-review-20261013/ASSESSMENT.md`.
 - Resume check 2026-10-13: service remains active at b1897f4, started
   October12 16:09:54 UTC; recent warning journal empty. Corrected Import AI
   gate (source hash matched current laptop checkout) ran from the preserved
@@ -384,6 +394,9 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 Final trial reproducibility requires an endpoint snapshot before later
 vote edits/undo; capture is documented but not scheduled. Reporting code
 and verification are complete. No trial winner is established.
+Evidence-based continuation remains a reviewed proposal, not an authorized
+design: outcome/exposure unit, useful effect, dependence treatment,
+stopping/cap and harm/diversity guardrails are unresolved.
 None for the far card or warm-start test. The recorded seed's failure is
 fixed with tighter test-only convergence; full backend gates pass.
 The Muse-fallback deploy waits for the trial to end (no restart before
@@ -398,6 +411,13 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Stopping design: if the user chooses continuation, define a separate
+  prospective stage and its useful-improvement/uncertainty target, exposure
+  and attribution rules, dependence treatment, stopping/cap and safeguards.
+  Preserve the original November5 snapshot/report and do not pool repeated
+  ordinary p-value checks into a winner claim. No winner is required at the
+  original endpoint. Review examples are not validated sample sizing.
+  See `docs/evaluations/stopping-rule-review-20261013/ASSESSMENT.md`.
 - Import AI gate: run against the next fresh unseen/unvoted issue. Issue476
   is already voted, so the current live check cannot establish an unseen PASS.
   Use the actual service DB; no history reset or new timer.

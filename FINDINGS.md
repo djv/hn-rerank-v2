@@ -1,5 +1,35 @@
 # HN Rerank findings
 
+## Trial stopping-rule review and save — 2026-10-13
+
+The user asked whether the arms can keep collecting until enough evidence
+exists, then requested `rv`. One Claude cloud review completed:
+https://claude.ai/code/session_015L8mTPGhnMKiBuqE9ugy7K
+Original report and verified assessment are saved in
+docs/evaluations/stopping-rule-review-20261013/, committed/pushed10be4fa.
+
+Verified limitations: per-vote pooled z-test ignores deck/session clustering;
+credited upvote rate excludes ignored exposure; feedback is mutable;
+new-stage --since excludes votes attributed to pre-boundary decks. A fixed
+date preserves the chosen stopping rule but does not validate all statistical
+assumptions. Existing protocol already permits an inconclusive November5
+result. The agent revised its earlier checkpoint suggestion: retain the
+original boundary snapshot/report and define continuation prospectively.
+
+Rejected missing far-card regression finding: tests/test_far_card.py:368-415
+covers storage and report exclusion. Reading telemetry also exists outside
+the supplied review bundle. Reviewer line references, generic power/sample
+examples, automatic deck-level sequential validity and one-sided practical
+tie suggestion were not accepted without qualification. Full assessment
+records those corrections and primary-source checks.
+
+User `ss` saves this handoff. No change to reviewed files, runtime,
+arms/dates, DB, snapshot scheduling, provider work or paused research.
+Continuation needs an agreed estimand/exposure definition, meaningful effect,
+dependence handling, stopping/cap and harm/diversity/tie rules before code.
+Documentation-only verification: diff whitespace check and focused staged
+diff review; prior unchanged code gates reused, no tests rerun.
+
 ## Read-only resume check — 2026-10-13
 
 Laptop checkout ecc7471 was clean. VPS production remains b1897f4, active
