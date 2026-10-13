@@ -1,5 +1,56 @@
 # HN Rerank findings
 
+## First reading-signal review (TUI) — 2026-10-13
+
+Read-only, live VPS DB, profile 151, three TUI sessions since 2026-10-12
+18:00 UTC (latest 12:07–15:23 UTC, about 35 active minutes, 84 cards).
+Votes counted only when cast after the card's first impression.
+
+- Up/neutral/down by view (all three sessions): Recommended 13/16/3 (41% up,
+  9% down; Discover slot 1/0/0); Popular 6/9/25 (62% down); Explore 4/3/7
+  (Discover 1/1/0, Interest 2/2/2, Unsure 1/0/5).
+- Dwell per card (median s): up 22.1, neutral 24.4, down 8.1, unvoted 3.5.
+  Dwell separates "worth a look" from skips/downs but not up from neutral.
+- Idle artifacts: two segments hit exactly the 300 s idle cap (Ask HN
+  "What to Build in the AI Era?", "Will AI kill us all") while the TUI sat
+  open during a break. The terminal keeps focus, so focus loss never fires.
+- `position` is the index in the TUI's current list after voted stories are
+  removed, not the served rank (`app.py` `_dwell_ctx`: `self.stories.index`;
+  `apply_vote` drops rated stories). Many impressions are at position 0.
+  The planned far-card read ("served positions from impressions") cannot use
+  TUI positions as is; Explore is also shuffled client-side.
+- Opens: 2 article_open, 0 comments_open. The `c` binding logs
+  comments_open; the user reads the in-pane summary instead, so comments_open
+  is likely to stay rare rather than broken.
+- AINews digest sections (rss_ainews) drew 4 neutral, 0 up, 1 unvoted in session 3.
+- All TUI events carry `ranker_arm=tui_observed`; trial credit uses decks.
+- Follow-ups done the same day (user chose all four): TUI now reports the
+  served rank as `position` (583d0bd) and the dwell idle cap is 90 s
+  (0e8686e); both are live once the user restarts `hn`. Earlier TUI
+  positions are list indexes; `deck_scores.windows_json` holds each served
+  card's `position` per view/version, so the far-card read can join
+  impressions on (dashboard_version, story_id) instead (not for Explore,
+  which the TUI shuffles).
+- Popular vs other views, all profile-151 impressions since 2026-09-24
+  (votes after first impression in the view, up/neutral/down/unvoted):
+  Popular 65/193/539/121 (8% up, 68% down of votes); Recommended
+  214/288/235/167 (29% up, 32% down); Explore 41/74/208/234; Date 50/71/87/72.
+  Popular is the HN baseline and the "stay current" view, so its downs are
+  expected; it is also a large share of training downs. No change proposed
+  without the user's call on its role.
+- AINews (rss_ainews) all-time: 19 up / 27 neutral / 5 down (37% up, 10%
+  down), better than Recommended's average; the last eight votes were 7
+  neutral, 1 down. Keep; recheck in a month.
+- Dwell vs votes (125 cards, 87 voted; dwell capped at 90 s per segment):
+  dwell AUC up-vs-rest 0.66, not-down-vs-down 0.82; the served model's
+  prob_up gives 0.785 and 0.82. Neutrals in the longer-dwell half have mean
+  prob_up 0.49 vs 0.31 for the shorter half (n=28), consistent with
+  long-dwell neutrals being soft ups, but confounded by view (Recommended
+  cards get more reading). Only 3 of 38 unvoted cards had over 15 s dwell:
+  the user votes on nearly everything read, so dwell adds little label
+  coverage. Dwell is recorded while deciding, so it can only weight labels,
+  not serve as a ranking feature. Too small to act on; rerun ~2026-10-27.
+
 ## Trial stopping-rule review and save — 2026-10-13
 
 The user asked whether the arms can keep collecting until enough evidence

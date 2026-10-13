@@ -48,6 +48,12 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   and sequential methods are unvalidated, not approved for implementation.
   No stopping rule, trial date/arm, runtime or capture job changed.
   Evidence: `docs/evaluations/stopping-rule-review-20261013/ASSESSMENT.md`.
+- Reading-signal review 2026-10-13 (FINDINGS "First reading-signal
+  review"): Recommended 41% up / 9% down vs Popular 62% down in the user's
+  last three TUI sessions. TUI `position` fixed to served rank (583d0bd);
+  dwell idle cap 300 s -> 90 s (0e8686e); TUI gate 252 passed / 1 skipped.
+  Live after the user restarts `hn`. Dwell separates reads from skips/downs
+  (AUC 0.82) but not up from neutral; too small to use yet.
 - Second resume check 2026-10-13 ~15:15 UTC: service still b1897f4, no
   warnings in 12 h. Profile151: 235 dwell, 5,333 impression, 2 article_open,
   still zero comments_open. Import AI RSS newest is still issue476 (voted),
@@ -430,9 +436,12 @@ ranking research remains paused and production trial configuration unchanged.
   Use the actual service DB; no history reset or new timer.
 - Far card: read about 2026-11-02 with Discover (PLAN.md "Far card":
   far-card up- and down-rate vs Recommended cards 9–11, using served
-  positions from impressions; novel up-votes per week; Discover plus the far
+  positions from `deck_scores` cards joined on (dashboard_version,
+  story_id), since TUI impression positions before 583d0bd are list indexes; novel up-votes per week; Discover plus the far
   card combined). Phase 0b (Combo, Far 1) runs 2026-11-05
   (`fu-20261012-104919-066`).
+- Dwell vs votes: rerun the FINDINGS 2026-10-13 check about 2026-10-27
+  (long-dwell neutrals as soft ups; drop 90 s-cap segments).
 - Reading signal: confirm `comments_open` arrives in normal profile151 use
   (dwell and article_open are verified); after about two
   weeks, check how opens and dwell relate to votes before using them.

@@ -1,5 +1,14 @@
 # Worklog: hn-rewrite
 
+## 2026-10-13 — First reading-signal review; TUI position and idle fixes
+
+Reviewed the user's TUI sessions since 2026-10-12 (FINDINGS "First
+reading-signal review"). TUI `position` was the index in the remaining
+list, so votes shifted later cards to 0; it now reports the served rank
+(583d0bd). The dwell idle cap drops from 300 s to 90 s because a reader
+left open logged breaks as reads (0e8686e). TUI suite 252 passed / 1
+skipped; lint, format, ty clean. Live once the user restarts `hn`.
+
 ## 2026-10-12 — Approved ranking-trial reporting corrections
 
 After one Claude cloud review, the user approved fixing final reporting,
