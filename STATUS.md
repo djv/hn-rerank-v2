@@ -54,9 +54,14 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   user chose client-first: Step 1 is a client-only Queue
   sort (Recommended -> Explore -> top Popular -> done), with day-alternating
   live comparison; Step 2 is a serve-time interleaved queue only if Step 1
-  sticks. Step 1 built 2026-10-13 on branch `single-queue` (TUI Queue sort,
-  frozen per window with new Recommended cards appended; server accepts
-  `surface`/`queue_position`); deploy pending the `rv` cloud review.
+  sticks. Step 1 built 2026-10-13 on branch `single-queue` (pushed, not
+  merged or deployed): TUI Queue sort in rounds (each round Recommended ->
+  Explore -> 5 Popular from the then-current feed, card data kept, served
+  deck version sent); server accepts `surface`/`queue_position`. The Claude
+  cloud review said "revise" (H1 frozen cards vanished after reranks, H2
+  version mismatch for trial credit, rounds chosen by the user for M1/M2);
+  all fixed. Gates: backend 1427 passed, TUI 272 passed, ruff/format/ty clean.
+  Unverified: live deploy, and real TUI use of rounds.
 - Reading-signal review 2026-10-13 (FINDINGS "First reading-signal
   review"): Recommended 41% up / 9% down vs Popular 62% down in the user's
   last three TUI sessions. TUI `position` fixed to served rank (583d0bd);
@@ -432,6 +437,14 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Single queue: run the user-approved Muse Spark review of the rounds fix
+  (commits after 3fb6318, against
+  `docs/evaluations/single-queue-20261013/REVIEW-step1-claude-cloud.md`).
+  If it finds no High issue (user 2026-10-13: "deploy if clean"), fix
+  Medium/Low, merge to main, push, pull on the VPS, restart once (the user
+  OK'd it), smoke test, check the new `interaction_events` columns with
+  `sqlite3 -readonly`, then tell the user to restart `hn`. Record the start
+  date of the day-alternating test (about 3 weeks).
 - Stopping design: user chose (2026-10-13) to wait for the November5
   result before deciding. After it, if the user chooses continuation, define a separate
   prospective stage and its useful-improvement/uncertainty target, exposure

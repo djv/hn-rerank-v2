@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-10-13 — Single queue: review fixes, rounds
+
+The cloud review of Step 1 said "revise" (FINDINGS "Single-queue Step 1
+review"). Codex implemented the rounds design. Each round is Recommended,
+Explore and 5 Popular from the current feed. The next round is built when one
+is used up, and a story appears once per window per session. Queued card
+data is kept across reranks. Queue events send the serving deck version.
+Undo, carried rows and the age-out Low findings are fixed. The agent limited
+the client age check to cards missing from the current feed (it had hidden
+served stories with old or unknown times). Gates: backend 1427 passed, TUI
+272 passed, ruff/format/ty clean.
+
 ## 2026-10-13 — Single queue Step 1 (TUI Queue sort, event fields)
 
 Built Step 1 of `docs/evaluations/single-queue-20261013/PLAN.md` with Codex.
