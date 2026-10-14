@@ -43,6 +43,14 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Reader checks (user October14): real tmux PTY fixture verified summary
+  retry, comments-open payload, narrow/wide Queue rendering, Caught up state
+  and quit after a pending save. Focused client70 and current backend5 passed
+  on VPS. Three normal sessions exposed48 unique stories across17 sources;
+  all45 Recommended impressions matched stored ranks. The user reports more
+  varied worthwhile cards and a useful Caught up stopping point. Live
+  comments_open remains absent; the user has not checked c yet. No code or
+  runtime changes. Evidence: `docs/evaluations/reader-check-20261014/RESULT.md`.
 - Terminal reader ANSI themes (user request, October14): `hn` now defaults
   to `editorial-ansi` / `editorial-ansi-light` (terminal's 16 colours, default
   backgrounds) so tmux's inactive-pane fade applies; `--truecolor` keeps the
@@ -498,6 +506,10 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Reader checks: one ordinary c action on a story with a discussion link,
+  then read back live comments_open. Fixture/control checks passed; browser
+  opening and production receipt remain unverified. Current Queue mix has
+  the user's positive normal-use assessment; keep observing without tuning.
 - Queue mix: launch a fresh reader to load the mixed opening and corrected
   explanations; assess cards in normal use. Automated/headless checks passed;
   physical rendering and the user's subjective result remain unverified.
