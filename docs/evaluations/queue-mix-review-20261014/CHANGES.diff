@@ -1,0 +1,279 @@
+commit 485c76eea103ee541cabb1d2f21bc11d49059f7d
+Author:     Dev <dev@example.com>
+AuthorDate: Wed Oct 14 09:59:27 2026 -0400
+Commit:     Dev <dev@example.com>
+CommitDate: Wed Oct 14 09:59:27 2026 -0400
+
+    Mix Explore and Popular into each Queue opening
+
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index 91d870e..ebf8fc8 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -974,6 +974,9 @@ revision is still current, preserving a later choice on the same story.
+ The terminal Queue sort composes served Recommended, badge-grouped Explore
+ (Discover, Unsure, Interest, then other kinds), and up to five additional
+ Popular cards per window, without shuffling or changing server ranking.
++Each round repeats Recommended → Explore → Recommended → Popular, skipping
++exhausted sections, so discovery and popularity appear near the start. Duplicate
++ownership remains Recommended first, then Explore, then Popular.
+ Queue events preserve `sort_mode` as the origin view and `position` as its
+ served rank (including Explore's index in the server order). Explore on the
+ `views` surface instead reports the index in its client-shuffled order.
+diff --git a/STATUS.md b/STATUS.md
+index b369d15..92048b6 100644
+--- a/STATUS.md
++++ b/STATUS.md
+@@ -1,6 +1,6 @@
+ # HN Rerank status
+ 
+-Updated 2026-10-13. Previous handoff (one-classifier research, Why-this-story
++Updated 2026-10-14. Previous handoff (one-classifier research, Why-this-story
+ preview, pending Reddit/Gemma items):
+ [before interleaving](docs/status-archive/before-interleaving-20261007.md).
+ 
+@@ -38,6 +38,16 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
+ flowing after Reddit RSS ends on November 13 (Arctic Shift).
+ 
+ ## Result
++- Queue opening mix (user 2026-10-14): repeat Recommended → Explore →
++  Recommended → Popular in each round, skipping exhausted sections. Same card
++  selection, duplicate ownership, frozen slots and served rank/version metadata.
++  Focused23, full TUI275/1 skipped, root/standalone Ruff/ty and formatting passed;
++  unchanged VPS backend1445/1 skipped passed (existing MLP warning).
++  Read-only real feeds in all five windows composed26
++  unique cards with the chosen opening and correct origins (still warming).
++  Service active; bounded warning journal empty; Import AI NOT_APPLICABLE
++  (issue476 voted). Fresh reader launch loads the client change; physical
++  rendering remains unverified. Details in WORKLOG.md, October14.
+ - Stopping-rule review completed (user `rv`, 2026-10-13): one independent
+   Claude cloud review and agent source verification, saved/pushed as
+   `10be4fa`. Recommendation: preserve the original November5 snapshot/report,
+diff --git a/WORKLOG.md b/WORKLOG.md
+index 1b9504b..d8c913d 100644
+--- a/WORKLOG.md
++++ b/WORKLOG.md
+@@ -1,5 +1,29 @@
+ # Worklog: hn-rewrite
+ 
++## 2026-10-14 — Mix sections near the start of Queue
++
++The user requested an opening that differs from Recommended and chose the
++Recommended-heavy mix: Recommended → Explore → Recommended → Popular, repeated
++with exhausted sections skipped. Each round still selects the same cards,
++keeps section order (including Explore badge groups), gives duplicates to
++Recommended before Explore before Popular, and caps additional Popular at five.
++Only the client composition order changes; frozen slots, origin ranks and
++serving versions remain intact. Existing rounds load the change on a fresh
++reader launch.
++
++The old function reproduced a four-Recommended opening; the corrected function
++mixed both other sections into its first four cards. Focused Queue23 and full
++TUI275/1 skipped passed; root/standalone Ruff and ty and touched-file format
++checks passed. The unchanged backend suite on the VPS passed1445/1 skipped
++with one existing MLP convergence warning. Read-only real API checks of
++all five existing-profile windows composed26 unique cards each with the chosen
++first-four origins and correct served ranks/versions; these feeds were still
++warming (`ready=false`). No feedback or synthetic interactions were sent.
++The VPS service remains active, with no warning journal entries in the bounded
++scan; no server restart is needed. Import AI gate was NOT_APPLICABLE because
++issue476 is already voted, which is not PASS. Physical reader rendering remains
++for normal use.
++
+ ## 2026-10-13 — Queue ranks for returned undo cards
+ 
+ The user approved the served-rank follow-up after a normal Queue session.
+diff --git a/clients/tui/README.md b/clients/tui/README.md
+index a8f65eb..5b5b18f 100644
+--- a/clients/tui/README.md
++++ b/clients/tui/README.md
+@@ -126,13 +126,14 @@ confirm in the status line.
+ 
+ ### Queue sort and daily comparison
+ 
+-Queue plays each window's served Recommended cards, then Explore grouped as
+-Discover, Unsure (`uncertain`), Interest, and other badge kinds, then the first
+-five additional Popular stories. Duplicates and unavailable stories are skipped.
++Queue mixes each window's cards as Recommended → Explore → Recommended → Popular,
++repeating and skipping exhausted sections. Explore is grouped as Discover,
++Unsure (`uncertain`), Interest, and other badge kinds; Popular contributes the
++first five additional stories. Duplicates and unavailable stories are skipped.
+ Queue keeps served order within each group and never shuffles. Voting advances
+ through the full queue; undo returns a story to its queue slot. Each window's
+ queue consists of session-scoped rounds. Each round freezes the current
+-Recommended → badge-grouped Explore → five additional Popular composition,
++mixed Recommended / badge-grouped Explore / five additional Popular composition,
+ skipping voted, unavailable, aged-out stories and all ids in earlier rounds.
+ When the latest round is exhausted, the current feed builds the next round;
+ refreshes never extend an unfinished round. Slots are global across all rounds
+diff --git a/clients/tui/src/hn_rerank/queue.py b/clients/tui/src/hn_rerank/queue.py
+index de01c38..9145686 100644
+--- a/clients/tui/src/hn_rerank/queue.py
++++ b/clients/tui/src/hn_rerank/queue.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++from collections import deque
+ from datetime import UTC, datetime
+ 
+ from .models import Feed, View, Window
+@@ -25,7 +26,7 @@ def default_sort(now: datetime | None = None) -> str:
+ def queue_entries(
+     feed: Feed, excluded: set[int] | None = None, restored: set[int] | None = None
+ ) -> list[QueueEntry]:
+-    """Recommended, badge-grouped Explore, then five additional Popular cards.
++    """Mix Recommended, Explore, Recommended, Popular throughout each round.
+ 
+     Missing stories and duplicates are skipped. For multiple badge kinds,
+     the earliest group wins; every group's internal order is served order.
+@@ -64,7 +65,16 @@ def queue_entries(
+             popular += 1
+             if popular == 5:
+                 break
+-    return entries
++    lanes = {
++        view: deque(entry for entry in entries if entry.origin == view)
++        for view in ("recommended", "explore", "popular")
++    }
++    mixed: list[QueueEntry] = []
++    while any(lanes.values()):
++        for view in ("recommended", "explore", "recommended", "popular"):
++            if lanes[view]:
++                mixed.append(lanes[view].popleft())
++    return mixed
+ 
+ 
+ def build_round(
+diff --git a/clients/tui/tests/test_queue.py b/clients/tui/tests/test_queue.py
+index 9572a03..f37c285 100644
+--- a/clients/tui/tests/test_queue.py
++++ b/clients/tui/tests/test_queue.py
+@@ -72,19 +72,57 @@ def test_queue_groups_deduplicates_skips_missing_and_keeps_origins() -> None:
+     assert queue_entries(feed) == [
+         QueueEntry(1, "recommended", 0, 0),
+         QueueEntry(4, "explore", 2, 0),
+-        QueueEntry(5, "explore", 3, 0),
+-        QueueEntry(3, "explore", 1, 0),
+-        QueueEntry(2, "explore", 0, 0),
+-        QueueEntry(6, "explore", 4, 0),
+         QueueEntry(7, "popular", 3, 0),
++        QueueEntry(5, "explore", 3, 0),
+         QueueEntry(8, "popular", 5, 0),
++        QueueEntry(3, "explore", 1, 0),
+         QueueEntry(9, "popular", 6, 0),
++        QueueEntry(2, "explore", 0, 0),
+         QueueEntry(10, "popular", 7, 0),
++        QueueEntry(6, "explore", 4, 0),
+         QueueEntry(11, "popular", 8, 0),
+     ]
+     assert feed.orders == before
+ 
+ 
++def test_queue_mixes_other_sections_into_recommended_opening() -> None:
++    feed = replace(
++        queue_feed(),
++        stories=[story(sid) for sid in range(1, 15)],
++        orders={
++            "recommended": [1, 2, 3, 4, 5, 6],
++            "explore": [7, 8, 9],
++            "popular": [1, 7, 10, 11, 12, 13, 14],
++        },
++        version=42,
++    )
++    entries = queue_entries(feed)
++    assert [entry.story_id for entry in entries] == [
++        1,
++        7,
++        2,
++        10,
++        3,
++        8,
++        4,
++        11,
++        5,
++        9,
++        6,
++        12,
++        13,
++        14,
++    ]
++    assert all(entry.served_version == 42 for entry in entries)
++    # After exclusions, fill each lane from the remaining served cards.
++    assert [entry.story_id for entry in queue_entries(feed, {1, 7, 10})][:4] == [
++        2,
++        8,
++        3,
++        11,
++    ]
++
++
+ @given(
+     ids=st.sets(st.integers(1, 30), max_size=30),
+     recommended=st.lists(st.integers(1, 35), max_size=40),
+@@ -113,7 +151,7 @@ def test_queue_invariants(
+     entries = queue_entries(feed)
+     result = [item.story_id for item in entries]
+     prefix = list(dict.fromkeys(sid for sid in recommended if sid in ids))
+-    assert result[: len(prefix)] == prefix
++    assert [item.story_id for item in entries if item.origin == "recommended"] == prefix
+     assert len(result) == len(set(result))
+     assert set(result) <= ids
+     assert {sid for sid in explore if sid in ids} <= set(result)
+@@ -249,7 +287,7 @@ async def test_queue_events_keep_origin_and_full_positions(
+         popular = next(item for item in app.stories if item.id == 7)
+         ctx = app._dwell_ctx(popular)
+         assert ctx is not None
+-        assert (ctx.sort_mode, ctx.position, ctx.queue_position) == ("popular", 2, 6)
++        assert (ctx.sort_mode, ctx.position, ctx.queue_position) == ("popular", 2, 2)
+         app.query_one("#sort", Select).value = "recommended"
+         await settle(pilot)
+         app.rated.clear()
+@@ -425,8 +463,8 @@ async def test_rounds_reach_churned_cards_then_fresh_explore_and_popular(
+         app.query_one(OptionList).focus()
+         expected = [
+             (1, "recommended", 0),
+-            (4, "recommended", 1),
+             (2, "explore", 0),
++            (4, "recommended", 1),
+             (3, "popular", 0),
+             (5, "recommended", 0),
+             (6, "explore", 0),
+@@ -436,7 +474,7 @@ async def test_rounds_reach_churned_cards_then_fresh_explore_and_popular(
+             selected = app.selected()
+             assert selected is not None and selected.id == sid
+             if sid == 4:
+-                assert selected.points == 101  # present cards refresh their data
++                assert selected.points == 102  # present cards refresh their data
+             if sid == 2:
+                 assert selected.points == 100  # churned cards retain frozen data
+             ctx = app._dwell_ctx(selected)
+@@ -456,7 +494,7 @@ async def test_rounds_reach_churned_cards_then_fresh_explore_and_popular(
+             await settle(pilot)
+             app.refresh_feed(announce=False)
+             await settle(pilot)
+-        assert app.view_order("queue") == [1, 4, 2, 3, 5, 6, 7]
++        assert app.view_order("queue") == [1, 2, 4, 3, 5, 6, 7]
+         assert len(app.queue_rounds["1w"]) == 2
+         assert not app.stories
+         assert app.query_one("#summary", Markdown)._markdown.startswith(
+@@ -520,16 +558,16 @@ async def test_queue_keeps_missing_cards_and_restores_missing_undo() -> None:
+             replace(fake.feed, stories=[story(4)], orders={"recommended": [4]})
+         )
+         app.rebuild()
+-        assert [item.id for item in app.stories] == [2, 3, 4]
++        assert [item.id for item in app.stories] == [3, 2, 4]
+         assert app.view_ranks[4] == 3
+         app.apply_undo(first)
+         await settle(pilot)
+-        assert [item.id for item in app.stories] == [1, 2, 3, 4]
++        assert [item.id for item in app.stories] == [1, 3, 2, 4]
+         # A later ready deck may still omit the undone story.
+         fake.feed = replace(fake.feed, stories=[story(4)], orders={"recommended": [4]})
+         app.refresh_feed(announce=False)
+         await settle(pilot)
+-        assert [item.id for item in app.stories] == [1, 2, 3, 4]
++        assert [item.id for item in app.stories] == [1, 3, 2, 4]
+         assert app.view_ranks[1] == 0
+         await flush(app)
+ 
