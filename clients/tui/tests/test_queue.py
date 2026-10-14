@@ -72,17 +72,55 @@ def test_queue_groups_deduplicates_skips_missing_and_keeps_origins() -> None:
     assert queue_entries(feed) == [
         QueueEntry(1, "recommended", 0, 0),
         QueueEntry(4, "explore", 2, 0),
-        QueueEntry(5, "explore", 3, 0),
-        QueueEntry(3, "explore", 1, 0),
-        QueueEntry(2, "explore", 0, 0),
-        QueueEntry(6, "explore", 4, 0),
         QueueEntry(7, "popular", 3, 0),
+        QueueEntry(5, "explore", 3, 0),
         QueueEntry(8, "popular", 5, 0),
+        QueueEntry(3, "explore", 1, 0),
         QueueEntry(9, "popular", 6, 0),
+        QueueEntry(2, "explore", 0, 0),
         QueueEntry(10, "popular", 7, 0),
+        QueueEntry(6, "explore", 4, 0),
         QueueEntry(11, "popular", 8, 0),
     ]
     assert feed.orders == before
+
+
+def test_queue_mixes_other_sections_into_recommended_opening() -> None:
+    feed = replace(
+        queue_feed(),
+        stories=[story(sid) for sid in range(1, 15)],
+        orders={
+            "recommended": [1, 2, 3, 4, 5, 6],
+            "explore": [7, 8, 9],
+            "popular": [1, 7, 10, 11, 12, 13, 14],
+        },
+        version=42,
+    )
+    entries = queue_entries(feed)
+    assert [entry.story_id for entry in entries] == [
+        1,
+        7,
+        2,
+        10,
+        3,
+        8,
+        4,
+        11,
+        5,
+        9,
+        6,
+        12,
+        13,
+        14,
+    ]
+    assert all(entry.served_version == 42 for entry in entries)
+    # After exclusions, fill each lane from the remaining served cards.
+    assert [entry.story_id for entry in queue_entries(feed, {1, 7, 10})][:4] == [
+        2,
+        8,
+        3,
+        11,
+    ]
 
 
 @given(
@@ -113,7 +151,7 @@ def test_queue_invariants(
     entries = queue_entries(feed)
     result = [item.story_id for item in entries]
     prefix = list(dict.fromkeys(sid for sid in recommended if sid in ids))
-    assert result[: len(prefix)] == prefix
+    assert [item.story_id for item in entries if item.origin == "recommended"] == prefix
     assert len(result) == len(set(result))
     assert set(result) <= ids
     assert {sid for sid in explore if sid in ids} <= set(result)
@@ -249,7 +287,7 @@ async def test_queue_events_keep_origin_and_full_positions(
         popular = next(item for item in app.stories if item.id == 7)
         ctx = app._dwell_ctx(popular)
         assert ctx is not None
-        assert (ctx.sort_mode, ctx.position, ctx.queue_position) == ("popular", 2, 6)
+        assert (ctx.sort_mode, ctx.position, ctx.queue_position) == ("popular", 2, 2)
         app.query_one("#sort", Select).value = "recommended"
         await settle(pilot)
         app.rated.clear()
@@ -425,8 +463,8 @@ async def test_rounds_reach_churned_cards_then_fresh_explore_and_popular(
         app.query_one(OptionList).focus()
         expected = [
             (1, "recommended", 0),
-            (4, "recommended", 1),
             (2, "explore", 0),
+            (4, "recommended", 1),
             (3, "popular", 0),
             (5, "recommended", 0),
             (6, "explore", 0),
@@ -436,7 +474,7 @@ async def test_rounds_reach_churned_cards_then_fresh_explore_and_popular(
             selected = app.selected()
             assert selected is not None and selected.id == sid
             if sid == 4:
-                assert selected.points == 101  # present cards refresh their data
+                assert selected.points == 102  # present cards refresh their data
             if sid == 2:
                 assert selected.points == 100  # churned cards retain frozen data
             ctx = app._dwell_ctx(selected)
@@ -456,7 +494,7 @@ async def test_rounds_reach_churned_cards_then_fresh_explore_and_popular(
             await settle(pilot)
             app.refresh_feed(announce=False)
             await settle(pilot)
-        assert app.view_order("queue") == [1, 4, 2, 3, 5, 6, 7]
+        assert app.view_order("queue") == [1, 2, 4, 3, 5, 6, 7]
         assert len(app.queue_rounds["1w"]) == 2
         assert not app.stories
         assert app.query_one("#summary", Markdown)._markdown.startswith(
@@ -520,16 +558,16 @@ async def test_queue_keeps_missing_cards_and_restores_missing_undo() -> None:
             replace(fake.feed, stories=[story(4)], orders={"recommended": [4]})
         )
         app.rebuild()
-        assert [item.id for item in app.stories] == [2, 3, 4]
+        assert [item.id for item in app.stories] == [3, 2, 4]
         assert app.view_ranks[4] == 3
         app.apply_undo(first)
         await settle(pilot)
-        assert [item.id for item in app.stories] == [1, 2, 3, 4]
+        assert [item.id for item in app.stories] == [1, 3, 2, 4]
         # A later ready deck may still omit the undone story.
         fake.feed = replace(fake.feed, stories=[story(4)], orders={"recommended": [4]})
         app.refresh_feed(announce=False)
         await settle(pilot)
-        assert [item.id for item in app.stories] == [1, 2, 3, 4]
+        assert [item.id for item in app.stories] == [1, 3, 2, 4]
         assert app.view_ranks[1] == 0
         await flush(app)
 

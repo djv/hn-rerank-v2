@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 from datetime import UTC, datetime
 
 from .models import Feed, View, Window
@@ -25,7 +26,7 @@ def default_sort(now: datetime | None = None) -> str:
 def queue_entries(
     feed: Feed, excluded: set[int] | None = None, restored: set[int] | None = None
 ) -> list[QueueEntry]:
-    """Recommended, badge-grouped Explore, then five additional Popular cards.
+    """Mix Recommended, Explore, Recommended, Popular throughout each round.
 
     Missing stories and duplicates are skipped. For multiple badge kinds,
     the earliest group wins; every group's internal order is served order.
@@ -64,7 +65,16 @@ def queue_entries(
             popular += 1
             if popular == 5:
                 break
-    return entries
+    lanes = {
+        view: deque(entry for entry in entries if entry.origin == view)
+        for view in ("recommended", "explore", "popular")
+    }
+    mixed: list[QueueEntry] = []
+    while any(lanes.values()):
+        for view in ("recommended", "explore", "recommended", "popular"):
+            if lanes[view]:
+                mixed.append(lanes[view].popleft())
+    return mixed
 
 
 def build_round(

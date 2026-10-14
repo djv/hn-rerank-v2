@@ -126,13 +126,14 @@ confirm in the status line.
 
 ### Queue sort and daily comparison
 
-Queue plays each window's served Recommended cards, then Explore grouped as
-Discover, Unsure (`uncertain`), Interest, and other badge kinds, then the first
-five additional Popular stories. Duplicates and unavailable stories are skipped.
+Queue mixes each window's cards as Recommended → Explore → Recommended → Popular,
+repeating and skipping exhausted sections. Explore is grouped as Discover,
+Unsure (`uncertain`), Interest, and other badge kinds; Popular contributes the
+first five additional stories. Duplicates and unavailable stories are skipped.
 Queue keeps served order within each group and never shuffles. Voting advances
 through the full queue; undo returns a story to its queue slot. Each window's
 queue consists of session-scoped rounds. Each round freezes the current
-Recommended → badge-grouped Explore → five additional Popular composition,
+mixed Recommended / badge-grouped Explore / five additional Popular composition,
 skipping voted, unavailable, aged-out stories and all ids in earlier rounds.
 When the latest round is exhausted, the current feed builds the next round;
 refreshes never extend an unfinished round. Slots are global across all rounds

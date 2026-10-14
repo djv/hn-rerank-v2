@@ -1,5 +1,29 @@
 # Worklog: hn-rewrite
 
+## 2026-10-14 — Mix sections near the start of Queue
+
+The user requested an opening that differs from Recommended and chose the
+Recommended-heavy mix: Recommended → Explore → Recommended → Popular, repeated
+with exhausted sections skipped. Each round still selects the same cards,
+keeps section order (including Explore badge groups), gives duplicates to
+Recommended before Explore before Popular, and caps additional Popular at five.
+Only the client composition order changes; frozen slots, origin ranks and
+serving versions remain intact. Existing rounds load the change on a fresh
+reader launch.
+
+The old function reproduced a four-Recommended opening; the corrected function
+mixed both other sections into its first four cards. Focused Queue23 and full
+TUI275/1 skipped passed; root/standalone Ruff and ty and touched-file format
+checks passed. The unchanged backend suite on the VPS passed1445/1 skipped
+with one existing MLP convergence warning. Read-only real API checks of
+all five existing-profile windows composed26 unique cards each with the chosen
+first-four origins and correct served ranks/versions; these feeds were still
+warming (`ready=false`). No feedback or synthetic interactions were sent.
+The VPS service remains active, with no warning journal entries in the bounded
+scan; no server restart is needed. Import AI gate was NOT_APPLICABLE because
+issue476 is already voted, which is not PASS. Physical reader rendering remains
+for normal use.
+
 ## 2026-10-13 — Queue ranks for returned undo cards
 
 The user approved the served-rank follow-up after a normal Queue session.

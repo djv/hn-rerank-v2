@@ -974,6 +974,9 @@ revision is still current, preserving a later choice on the same story.
 The terminal Queue sort composes served Recommended, badge-grouped Explore
 (Discover, Unsure, Interest, then other kinds), and up to five additional
 Popular cards per window, without shuffling or changing server ranking.
+Each round repeats Recommended → Explore → Recommended → Popular, skipping
+exhausted sections, so discovery and popularity appear near the start. Duplicate
+ownership remains Recommended first, then Explore, then Popular.
 Queue events preserve `sort_mode` as the origin view and `position` as its
 served rank (including Explore's index in the server order). Explore on the
 `views` surface instead reports the index in its client-shuffled order.

@@ -1,6 +1,6 @@
 # HN Rerank status
 
-Updated 2026-10-13. Previous handoff (one-classifier research, Why-this-story
+Updated 2026-10-14. Previous handoff (one-classifier research, Why-this-story
 preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
@@ -38,6 +38,16 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Queue opening mix (user 2026-10-14): repeat Recommended → Explore →
+  Recommended → Popular in each round, skipping exhausted sections. Same card
+  selection, duplicate ownership, frozen slots and served rank/version metadata.
+  Focused23, full TUI275/1 skipped, root/standalone Ruff/ty and formatting passed;
+  unchanged VPS backend1445/1 skipped passed (existing MLP warning).
+  Read-only real feeds in all five windows composed26
+  unique cards with the chosen opening and correct origins (still warming).
+  Service active; bounded warning journal empty; Import AI NOT_APPLICABLE
+  (issue476 voted). Fresh reader launch loads the client change; physical
+  rendering remains unverified. Details in WORKLOG.md, October14.
 - Stopping-rule review completed (user `rv`, 2026-10-13): one independent
   Claude cloud review and agent source verification, saved/pushed as
   `10be4fa`. Recommendation: preserve the original November5 snapshot/report,
