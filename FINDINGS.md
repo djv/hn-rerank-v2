@@ -1,5 +1,48 @@
 # HN Rerank findings
 
+## Queue mix final handoff — 2026-10-14
+
+User choice: Recommended → Explore → Recommended → Popular, repeating and
+skipping exhausted sections, rather than starting with every Recommended card.
+`485c76e` changes only Queue order; selection, five-additional-Popular limit,
+badge grouping, duplicate ownership and frozen origin ranks/versions stay intact.
+`f3a1849` saves the authorized independent Claude cloud review. The agent verified
+one Low stale-help finding; `af77888` corrects Help and Why this story.
+Review evidence: `docs/evaluations/queue-mix-review-20261014/ASSESSMENT.md`.
+
+Final `ss` found Terminal client CI38576532046 failed after275/1 skipped passed:
+`queue.py` had I001 for the new `deque` import. Explicit local I001 reproduced
+it. Backend-workspace lint had not enabled that rule; earlier `uv run --project
+clients/tui` checks inside the workspace were not truly standalone. The review's
+style nit was therefore a confirmed CI blocker. `8204d7f` corrects the import
+order without changing behavior.
+
+Fresh isolated package on VPS, outside the backend workspace:
+- Python3.14.2 Queue23 and full275/1 skipped passed; Ruff, touched-file
+  format, ty and source/wheel builds passed.
+- Installed-wheel `--version` and headless Reader startup passed on Python3.12,
+  outside the source tree, with an isolated config path and no backend numpy.
+- Root lint/types and three touched-Python format checks passed locally.
+- Earlier Python3.12 local full275/1 skipped and both rendered Queue panel
+  assertions passed; no full-suite rerun needed for documentation alone.
+- Unchanged backend1445/1 skipped passed with the existing MLP warning;
+  backend CI38578794034 (`af77888`) passed. Code `8204d7f` backend
+  CI38579339215 and Terminal client CI38579339058 both passed. The latter
+  verifies the isolated Python3.12 suite, lint/types/build and installed-wheel
+  startup outside the source tree. macOS was not part of this push run.
+
+Laptop/VPS main synced to `8204d7f` before this documentation-only handoff.
+Live boundaries: earlier existing-profile GETs in all five windows composed26
+unique cards each with the chosen opening and original rank/version mapping;
+feeds were still warming. Import AI gate exit3 because issue476 was already
+voted, not PASS. Service rechecked active, PID121960, same October13
+20:59:38 UTC start; bounded warning journal empty.
+No server restart, database mutation, feedback, synthetic live interactions,
+provider summary request or personal reader restart occurred. VPS untracked
+`VPS-COLD-ARCHIVE-20261011.json` is preserved. No owned watcher remains.
+Next: normal use from a fresh reader launch; physical rendering and subjective
+feed quality remain unverified. No trial configuration or analysis changed.
+
 ## Queue served-rank follow-up — 2026-10-13
 
 Final `ss` check: `19fdec0` is pushed and synced on laptop/VPS main; backend

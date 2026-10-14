@@ -26,6 +26,11 @@ first feed for new profiles (parked by the user 2026-10-12, in `~/TASKS.md`). Se
 table, live since 2026-10-12) supports all three.
 
 ## Objective
+Queue opening mix, in-app explanations and standalone CI correction are complete.
+Final handoff saves package verification and green code CI, preserving the trial
+and unrelated work. Normal-use rendering and subjective card quality remain
+for the user's next fresh reader session.
+
 Make the feed less same-y without losing hits (Goals above). Discover is
 live in Explore. The far card (Recommended's last card) went live
 2026-10-12; read both about 2026-11-02.
@@ -38,23 +43,25 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
-- Queue mix review follow-up (user `rv`, then `ok`, October14): Claude cloud
-  found no ordering/undo/telemetry bug and one verified Low stale-explanation
-  issue. Both in-app Help and Why this story now describe the approved mix.
-  Five relevant regressions, rendered-panel smoke, lint/types/format passed;
-  full client275/1 skipped passed. Fresh reader launch loads the copy correction.
-  Evidence:
-  `docs/evaluations/queue-mix-review-20261014/ASSESSMENT.md`.
-- Queue opening mix (user 2026-10-14): repeat Recommended → Explore →
-  Recommended → Popular in each round, skipping exhausted sections. Same card
-  selection, duplicate ownership, frozen slots and served rank/version metadata.
-  Focused23, full TUI275/1 skipped, root/standalone Ruff/ty and formatting passed;
-  unchanged VPS backend1445/1 skipped passed (existing MLP warning).
-  Read-only real feeds in all five windows composed26
-  unique cards with the chosen opening and correct origins (still warming).
-  Service active; bounded warning journal empty; Import AI NOT_APPLICABLE
-  (issue476 voted). Fresh reader launch loads the client change; physical
-  rendering remains unverified. Details in WORKLOG.md, October14.
+- Queue opening mix complete (October14): each round repeats Recommended →
+  Explore → Recommended → Popular, skipping exhausted sections. Card selection,
+  duplicate ownership, frozen slots and original rank/version metadata remain.
+  Approved Claude cloud review found no ordering/undo/telemetry bug; both stale
+  in-app descriptions were corrected in `af77888`. Final `ss` found the review's
+  import-order nit was a standalone CI blocker, corrected in `8204d7f`.
+  Isolated VPS client: Queue23, full275/1 skipped, Ruff/ty/format/build passed
+  (Python3.14.2); installed-wheel version/headless startup passed outside the
+  source tree on Python3.12 without backend dependencies. Earlier local
+  rendered-panel smoke and five relevant regressions passed. Root Ruff/ty/format
+  passed; unchanged backend1445/1 skipped passed, backend CI for `af77888` green.
+  Code `8204d7f` backend CI38579339215 and Terminal client CI38579339058 passed,
+  including the isolated Python3.12 suite/build and installed-wheel startup.
+  Earlier real-feed checks composed26 unique cards
+  per window with the mixed opening and correct metadata (feeds still warming).
+  Service active, bounded warning journal empty; Import AI NOT_APPLICABLE
+  (issue476 voted), not PASS. No server restart or data/history edit.
+  Review: `docs/evaluations/queue-mix-review-20261014/ASSESSMENT.md`.
+  Final evidence: FINDINGS "Queue mix final handoff".
 - Stopping-rule review completed (user `rv`, 2026-10-13): one independent
   Claude cloud review and agent source verification, saved/pushed as
   `10be4fa`. Recommendation: preserve the original November5 snapshot/report,
@@ -454,6 +461,8 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
   Ruff, touched-file format, and ty clean. Deployed 2026-10-09; scope above.
 
 ## Blocker
+None for the Queue mix: reviewed findings and standalone CI failure are fixed.
+Normal-use rendering and subjective assessment remain observations, not blockers.
 Final trial reproducibility requires an endpoint snapshot before later
 vote edits/undo; capture is documented but not scheduled. Reporting code
 and verification are complete. No trial winner is established.
@@ -474,10 +483,13 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- Queue mix: launch a fresh reader to load the mixed opening and corrected
+  explanations; assess cards in normal use. Automated/headless checks passed;
+  physical rendering and the user's subjective result remain unverified.
 - Single queue: approved Muse review and rollout are complete. The first
   normal session on2026-10-13 verified Queue progression and trial mapping.
   The served-rank client correction loads on the user's next `hn` launch.
-  Restart `hn` to load `19fdec0` if not already restarted, then continue
+  A fresh reader loads the served-rank correction and the October14 mix; continue
   normal sessions and assess usability/card quality; do not change
   the ranker from one session's vote mix. Day-alternating use began2026-10-13.
 - Stopping design: user chose (2026-10-13) to wait for the November5

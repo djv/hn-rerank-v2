@@ -1,5 +1,17 @@
 # Worklog: hn-rewrite
 
+## 2026-10-14 — Queue mix final handoff
+
+Code `8204d7f` is pushed and laptop/VPS main synced. Backend CI38579339215 and
+Terminal client CI38579339058 both passed, including isolated Python3.12
+tests/lint/types/build and installed-wheel startup. The actual standalone VPS
+verification also passed275/1 skipped on Python3.14.2. STATUS/FINDINGS now
+record the completed mix, review corrections, CI evidence and remaining normal
+reader observation. No service restart, data/history edit or personal reader
+restart. Active service remains PID121960 with its October13 20:59:38 UTC start;
+bounded warning journal empty. VPS untracked archive remains preserved.
+No owned watcher remains. No code or test rerun for this documentation handoff.
+
 ## 2026-10-14 — Standalone Queue import lint correction
 
 The final `ss` inspection found Terminal client CI38576532046 failed on

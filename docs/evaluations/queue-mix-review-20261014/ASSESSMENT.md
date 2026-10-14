@@ -58,3 +58,17 @@ both Queue panels passed; full client275/1 skipped passed. Root and
 standalone Ruff/ty and changed-file formatting passed. The unchanged backend
 gate from the preceding implementation is reused. No card composition,
 telemetry, service or database behavior changed; no further review was launched.
+
+## Final standalone CI correction
+
+The user's `ss` authorized finalization. Terminal client CI38576532046 failed
+on I001 after275 tests passed: the import-order observation was a CI blocker,
+not only a style nit. The earlier root-workspace `--project clients/tui` lint
+checks did not reproduce isolation. Explicit I001 reproduced the error; commit
+`8204d7f` places `collections.deque` before `dataclasses.dataclass`.
+An actually isolated VPS client package passed Queue23, full275/1 skipped,
+Ruff/format/ty/build (Python3.14.2). Installed-wheel version and headless startup
+passed outside the source tree on Python3.12, without backend dependencies.
+Code `8204d7f` backend CI38579339215 and Terminal client CI38579339058 passed,
+including isolated Python3.12 tests/build and installed-wheel startup. No
+runtime logic or trial behavior changed. macOS remains outside this push run.
