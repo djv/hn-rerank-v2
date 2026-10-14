@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-10-14 — Standalone Queue import lint correction
+
+The final `ss` inspection found Terminal client CI38576532046 failed on
+`queue.py` import ordering after all275 tests passed. Root-workspace lint
+did not enable I001; earlier `uv run --project clients/tui` checks were still
+inside that workspace and were not equivalent to the isolated CI package.
+The review's import-order nit was therefore a CI blocker. Reproduced with
+explicit I001 locally; moved `collections.deque` before `dataclasses.dataclass`.
+No behavior changed. Isolated VPS package (outside the backend workspace,
+Python3.14.2): Queue23 and full275/1 skipped, Ruff/format/ty and wheel build
+passed. Root Ruff/ty and changed-file format checks also passed. Installed
+wheel version and headless startup passed outside the source tree on Python3.12,
+without backend dependencies or a personal profile. New pushed CI remains
+pending at this commit.
+
 ## 2026-10-14 — Correct the in-app Queue explanations
 
 The independent Claude cloud review found one Low issue: Help and Why this

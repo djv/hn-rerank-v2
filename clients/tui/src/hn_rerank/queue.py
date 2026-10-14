@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections import deque
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from .models import Feed, View, Window
