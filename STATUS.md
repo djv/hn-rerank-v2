@@ -43,6 +43,14 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Terminal reader ANSI themes (user request, October14): `hn` now defaults
+  to `editorial-ansi` / `editorial-ansi-light` (terminal's 16 colours, default
+  backgrounds) so tmux's inactive-pane fade applies; `--truecolor` keeps the
+  editorial themes. `7e3b52b`; TUI 278/1 skipped, Ruff/format/ty clean, backend
+  and Terminal client CI green. The user's reader was restarted with it: live
+  capture had no truecolor SGR, the inactive pane fades, and the user approved
+  the look. Open (optional): dimmed text is barely legible while the pane is
+  inactive. Evidence: FINDINGS "Terminal reader ANSI themes".
 - Next-priorities review (user `rv`, October14): snapshot preservation takes
   priority; capture at/after the November5 endpoint before further voting,
   with actual time/hash recorded. Capture remains unscheduled. Latest live

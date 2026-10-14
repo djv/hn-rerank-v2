@@ -1,5 +1,36 @@
 # HN Rerank findings
 
+## Terminal reader ANSI themes — 2026-10-14
+
+Question: why the TUI did not fade like other tmux panes. `~/bin/theme-mode`
+writes tmux `window-style 'fg=default,bg=<faded>,dim'` (inactive) and
+`window-active-style` with kitty's bg; tmux substitutes those colours only for
+cells drawn in the default background (tmux `tty_attributes` replaces colour 8
+only). Textual's editorial themes painted truecolor backgrounds on every cell,
+so nothing changed. Other panes (Claude Code, Codex) leave the default bg.
+
+Change `7e3b52b`: palettes for every editorial role in Rich ANSI names
+(Textual `ansi_*` for CSS), `Theme(ansi=True)` on Textual's builtin ANSI base
+variables; clock picks the ANSI pair when `Reader(ansi=True)` (CLI default,
+`--truecolor` opts out; tests keep truecolor). Light ANSI has no pale grey in
+the GitHub-style kitty palette, so its selected row has no band. Unfocused
+headline border became `blank $hn-bg` (a solid line in `ansi_default` would
+draw in the foreground); the focused narrow Select uses a new `accent-fg`.
+
+Evidence:
+- TUI suite 278/1 skipped; new tests cover palette role parity, ANSI theme
+  choice per clock, default backgrounds and standard-only span colours, and
+  the `--truecolor` flag. Ruff, format, ty clean; CI for `7e3b52b` green.
+- Isolated tmux (`-L`) runs of the offline reader captured no `38;2`/`48;2`
+  or 256-colour SGR in dark or light; pyte renders with the kitty palettes
+  (active and simulated `#585858` inactive bg) looked right.
+- Live: the user's reader (pane `work:2.2`, alias `hn`) was quit with `q`
+  and relaunched; capture had no truecolor SGR, and a kitty screenshot showed
+  the inactive pane on tmux's grey. The user: "good theme".
+- Open: while inactive, bright_black titles and blue links are low contrast
+  on the grey. Options: lighter dim roles, or switch to the dark ANSI palette
+  on focus loss (Claude Code switches via DEC 2031 notices).
+
 ## pg_vectorsearch / RaBitQ assessment — 2026-10-14
 
 Question (user, from the HN story 50086165): can hn-rerank use Timescale's
