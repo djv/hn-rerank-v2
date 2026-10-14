@@ -48,4 +48,13 @@ the full suites were not repeated for this read-only review. Physical reader
 rendering remains unverified. No service restart, database write, feedback,
 synthetic telemetry or second review occurred. Reviewed files remain unchanged.
 
-Next step: fix the two in-app descriptions only if separately authorized.
+## Follow-up resolution
+
+The user's subsequent `ok` authorized correction of the two in-app
+descriptions. Both now describe the approved mix and exhausted-section
+skipping, badge-grouped Explore and the five-additional-Popular cap. Five
+existing help/why/dwell regressions and a headless Reader smoke rendering
+both Queue panels passed; full client275/1 skipped passed. Root and
+standalone Ruff/ty and changed-file formatting passed. The unchanged backend
+gate from the preceding implementation is reused. No card composition,
+telemetry, service or database behavior changed; no further review was launched.

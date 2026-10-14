@@ -2847,7 +2847,7 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "summary")
         view = str(self.query_one("#sort", Select).value)
         reasons = {
-            "queue": "Queue freezes each window's first shown deck: Recommended, then Discover, Unsure and Interest from Explore, then up to five additional Popular cards. After the latest round is exhausted, the current feed starts another round of unseen cards; original slots stay fixed. Voting through it ends at Caught up for this window. Startup alternates Queue and Recommended by UTC day.",
+            "queue": "Queue mixes Recommended → Explore → Recommended → Popular, repeating and skipping exhausted sections. Explore is grouped as Discover, Unsure, Interest, then other badges; each round includes up to five additional Popular cards. Each window's round freezes its cards and slots. After the latest round is exhausted, the current feed starts another round of unseen cards; original slots stay fixed. Voting through it ends at Caught up for this window. Startup alternates Queue and Recommended by UTC day.",
             "recommended": "Recommended orders stories by the model's learned preferences from your votes. When a story unlike your up-votes scores well, the last card is a ✨ Discover pick.",
             "popular": "Popular orders eligible HN stories by points and age; older stories lose weight.",
             "explore": "Explore offers discovery picks, including unfamiliar stories and interests Recommended misses. Its order is shuffled.",
@@ -2932,7 +2932,7 @@ class Reader(App[None]):
             "- `u`: undo latest vote\n\n"
             "## Sort\n\n"
             "- `s`: cycle sort (Queue → Recommended → Popular → Explore)\n"
-            "- Queue: each window's first shown Recommended, then Explore by badge, then up to five additional Popular cards; frozen order, no shuffle. Exhausting a round starts another from the current feed, skipping all earlier cards.\n"
+            "- Queue: mixes Recommended → Explore → Recommended → Popular, repeating and skipping exhausted sections. Explore is grouped by badge; each round includes up to five additional Popular cards. Frozen order, no shuffle. Exhausting a round starts another from the current feed, skipping all earlier cards.\n"
             "- Startup: Queue on odd UTC ordinal days, Recommended on even days.\n"
             "- `h` / `l`: previous / next sort\n"
             "- `d` / `D`: next / previous time window (12 hours → 1 day →"

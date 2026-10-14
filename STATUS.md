@@ -38,6 +38,13 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Queue mix review follow-up (user `rv`, then `ok`, October14): Claude cloud
+  found no ordering/undo/telemetry bug and one verified Low stale-explanation
+  issue. Both in-app Help and Why this story now describe the approved mix.
+  Five relevant regressions, rendered-panel smoke, lint/types/format passed;
+  full client275/1 skipped passed. Fresh reader launch loads the copy correction.
+  Evidence:
+  `docs/evaluations/queue-mix-review-20261014/ASSESSMENT.md`.
 - Queue opening mix (user 2026-10-14): repeat Recommended → Explore →
   Recommended → Popular in each round, skipping exhausted sections. Same card
   selection, duplicate ownership, frozen slots and served rank/version metadata.

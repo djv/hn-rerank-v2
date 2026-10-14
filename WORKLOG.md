@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-10-14 — Correct the in-app Queue explanations
+
+The independent Claude cloud review found one Low issue: Help and Why this
+story still described the previous sequential Queue order. The user's `ok`
+approved the correction. Both panels now describe Recommended → Explore →
+Recommended → Popular, skipping exhausted sections, with badge-grouped Explore
+and up to five additional Popular cards per round. Selection and telemetry
+logic are unchanged. Five existing help/why/dwell regressions and a headless
+Reader smoke rendering both Queue panels passed; full client275/1 skipped
+passed. Root/standalone Ruff/ty and changed-file format checks passed. The
+unchanged backend gate from the preceding Queue implementation is reused;
+no service restart, database change or personal reader restart is needed.
+Review and source verification:
+`docs/evaluations/queue-mix-review-20261014/ASSESSMENT.md`.
+
 ## 2026-10-14 — Mix sections near the start of Queue
 
 The user requested an opening that differs from Recommended and chose the
