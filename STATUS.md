@@ -43,6 +43,13 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Next-priorities review (user `rv`, October14): snapshot preservation takes
+  priority; capture at/after the November5 endpoint before further voting,
+  with actual time/hash recorded. Capture remains unscheduled. Latest live
+  Reddit refresh (15:38 UTC) recovered with zero failed feeds; monitor ordinary
+  refreshes. Reviewer Queue-rank/attribution concerns were resolved against
+  existing restoration logic and origin telemetry. No code/runtime/trial
+  changes. Evidence: `docs/evaluations/next-priorities-review-20261014/`.
 - Queue opening mix complete (October14): each round repeats Recommended →
   Explore → Recommended → Popular, skipping exhausted sections. Card selection,
   duplicate ownership, frozen slots and original rank/version metadata remain.
