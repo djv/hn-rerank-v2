@@ -1,5 +1,20 @@
 # Worklog: hn-rewrite
 
+## 2026-10-14 — Readable inactive pane
+
+With the ANSI themes, tmux's light-mode fade (`#585858`, theme-mode's "Dim
+more") hid the dimmed titles and links: `bright_black` is `#57606a` there. On
+focus loss (`App.app_focus`, so a key press after a lost focus-in also
+restores) the reader asks tmux for this pane's `window-style` bg and, when its
+luminance is below 0.3 (dark themes: 0.04–0.3), switches to
+`editorial-ansi-faded` (brighter greys and hues) or the monochrome
+`editorial-ansi-light-faded` (`bright_white` text); focus restores the theme,
+and a clock change while inactive re-evaluates. Outside tmux, or under a
+light fade, nothing changes. Checks: TUI 289 passed/1 skipped; ruff, format,
+ty clean; isolated tmux server with focus events captured `97m` text after
+blur and the original colours after focus, and a kitty-palette render showed
+the titles readable. Left: Markdown code blocks keep their own syntax colours.
+
 ## 2026-10-14 — Terminal reader ANSI themes
 
 The user asked why the TUI did not fade like other tmux panes. `~/bin/theme-mode`

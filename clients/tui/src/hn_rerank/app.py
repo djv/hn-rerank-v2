@@ -186,15 +186,57 @@ ANSI_LIGHT_PALETTE: dict[str, str] = {
     "select-bg": "default",
     "select-fg": "default",
 }
+# While the pane is inactive, tmux paints its `window-style` background under
+# every default-background cell. On a mid grey (theme-mode's fade) the light
+# palette's dark text and the dark palette's greys and hues all but vanish, so
+# the reader switches to light text until it regains focus.
+ANSI_FADED_DARK_PALETTE: dict[str, str] = {
+    **ANSI_DARK_PALETTE,
+    "muted": "white",
+    "faint": "white",
+    "accent": "bright_yellow",
+    "link": "bright_blue",
+    "good": "bright_green",
+    "bad": "bright_red",
+}
+# The light terminal palette's only colour that reads on a mid grey is white,
+# so the faded light theme is monochrome; the `>` marker and bold title still
+# mark the selected row.
+ANSI_FADED_LIGHT_PALETTE: dict[str, str] = {
+    **ANSI_DARK_PALETTE,
+    **dict.fromkeys(
+        (
+            "fg",
+            "title-dim",
+            "soft",
+            "muted",
+            "faint",
+            "accent",
+            "link",
+            "good",
+            "warn",
+            "bad",
+            "select-fg",
+        ),
+        "bright_white",
+    ),
+    "select-bg": "default",
+}
 PALETTES: dict[str, dict[str, str]] = {
     "editorial": DARK_PALETTE,
     "editorial-light": LIGHT_PALETTE,
     "editorial-ansi": ANSI_DARK_PALETTE,
     "editorial-ansi-light": ANSI_LIGHT_PALETTE,
+    "editorial-ansi-faded": ANSI_FADED_DARK_PALETTE,
+    "editorial-ansi-light-faded": ANSI_FADED_LIGHT_PALETTE,
 }
 ANSI_THEMES: dict[str, str] = {
     "editorial": "editorial-ansi",
     "editorial-light": "editorial-ansi-light",
+}
+FADED_THEMES: dict[str, str] = {
+    "editorial-ansi": "editorial-ansi-faded",
+    "editorial-ansi-light": "editorial-ansi-light-faded",
 }
 # Rich Text styles are baked at render time, so they read the active palette.
 PALETTE: dict[str, str] = dict(DARK_PALETTE)
@@ -205,9 +247,50 @@ def theme_for_hour(hour: int) -> str:
     return "editorial-light" if hour in LIGHT_HOURS else "editorial"
 
 
+def relative_luminance(colour: str) -> float:
+    """WCAG relative luminance of a `#rrggbb` colour."""
+    channels = [int(colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+    r, g, b = (
+        c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels
+    )
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def fades_to_light_text(background: str, *, dark: bool) -> bool:
+    """Whether light text reads better than the palette's own on an inactive
+    pane `background`. Below luminance 0.3 white beats the light palette's grey
+    titles; the dark palette only struggles on mid greys, not near-black."""
+    luminance = relative_luminance(background)
+    return luminance < 0.3 and (not dark or luminance >= 0.04)
+
+
+def tmux_inactive_background() -> str | None:
+    """The `#rrggbb` background tmux paints under this pane while it is
+    inactive, or None outside tmux or when the style sets no hex colour."""
+    import os
+    import re
+    import subprocess
+
+    pane = os.environ.get("TMUX_PANE")
+    if not os.environ.get("TMUX") or not pane:
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", "show-options", "-pAv", "-t", pane, "window-style"],
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"\bbg=(#[0-9a-fA-F]{6})\b", result.stdout)
+    return match.group(1) if match else None
+
+
 def editorial_theme(name: str) -> Theme:
     p = PALETTES[name]
-    ansi = name in ANSI_THEMES.values()
+    ansi = name in ANSI_THEMES.values() or name in FADED_THEMES.values()
     if ansi:
         # Textual spells terminal colours `ansi_<rich name>`.
         p = {key: f"ansi_{value}" for key, value in p.items()}
@@ -862,10 +945,14 @@ class Reader(App[None]):
         window_file: Path | None = None,
         utc_clock: Callable[[], datetime] | None = None,
         ansi: bool = False,
+        inactive_background: Callable[[], str | None] = tmux_inactive_background,
     ) -> None:
         super().__init__()
         # Terminal-colour themes; False keeps the truecolor editorial pair.
         self.ansi_themes = ansi
+        self.inactive_background = inactive_background
+        # The theme to restore on focus while the faded variant shows.
+        self.faded_from: str | None = None
         self.startup_sort = default_sort(utc_clock() if utc_clock else None)
         # The last window picked opens next time; None (tests) keeps 1w and
         # never writes.
@@ -1039,8 +1126,34 @@ class Reader(App[None]):
         if name == self.clock_theme:
             return
         self.clock_theme = name
+        faded = self.faded_from is not None
+        self.faded_from = None
         self.theme = name
         PALETTE.update(PALETTES[name])
+        if faded:
+            self.fade(inactive=True)
+
+    def fade(self, *, inactive: bool) -> None:
+        """Show light text while tmux paints its inactive-pane grey under the
+        reader, and restore the previous theme when focus returns."""
+        if not inactive:
+            if self.faded_from is not None:
+                theme, self.faded_from = self.faded_from, None
+                self.theme = theme
+            return
+        faded = FADED_THEMES.get(self.theme)
+        if faded is None or self.faded_from is not None:
+            return
+        background = self.inactive_background()
+        dark = not self.theme.endswith("-light")
+        if background is None or not fades_to_light_text(background, dark=dark):
+            return
+        self.faded_from = self.theme
+        self.theme = faded
+
+    def watch_app_focus(self, focus: bool) -> None:
+        # The reactive also turns True on a key press after a lost focus-in.
+        self.fade(inactive=not focus)
 
     def restyle(self) -> None:
         """Re-render Rich-styled text (headlines, heading, counts) in the
