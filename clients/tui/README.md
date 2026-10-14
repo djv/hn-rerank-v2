@@ -108,11 +108,16 @@ the previous / next sort.
 Resize and focus changes preserve reading position. Run the offline preview from
 the repository root with `uv run python -m clients.tui.tests.preview --headless`.
 
-The reader follows the local clock: a light paper theme from 06:00 to 19:59,
-the dark editorial theme otherwise (checked every minute; a theme picked from
-the command palette holds until the next boundary). Unselected headlines are
-dimmed, so the selected row (a lifted band plus the `>` marker) reads first. The
-filter bar and a one-row docked footer share a tint slightly off the page color. The footer carries the current
+The reader follows the local clock: a light theme from 06:00 to 19:59, the dark
+theme otherwise (checked every minute; a theme picked from the command palette
+holds until the next boundary). By default it draws in the terminal's own 16
+ANSI colours and leaves every background at the terminal default, so it follows
+the terminal's palette and tmux's inactive-pane style fades it like any other
+pane. `--truecolor` switches to the editorial truecolor themes, which paint
+their own paper and dark backgrounds. Unselected headlines are dimmed, so the
+selected row (the `>` marker, plus a lifted band in the dark and truecolor
+themes) reads first. In the truecolor themes the filter bar and a one-row docked
+footer share a tint slightly off the page color. The footer carries the current
 filter's counts on the left (`2 shown · +0 ~0 −0`) and context-sensitive keys on
 the right; when both do not fit, the keys shrink step by step down to `? help`,
 then the status is cut with `…`. Failures appear there with a `✗` prefix and replace the counts until

@@ -164,7 +164,7 @@ async def test_refresh_clears_the_summary_cache() -> None:
 def test_cli_prefetch_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     import hn_rerank.__main__ as main_module
 
-    captured: dict[str, int] = {}
+    captured: dict[str, int | bool] = {}
 
     class FakeReader:
         def __init__(
@@ -173,8 +173,10 @@ def test_cli_prefetch_flag(monkeypatch: pytest.MonkeyPatch) -> None:
             prefetch: int = 2,
             prefetch_generate: int = 3,
             window_file: Path | None = None,
+            ansi: bool = False,
         ) -> None:
             captured["prefetch"] = prefetch
+            captured["ansi"] = ansi
 
         def run(self) -> None:
             pass
@@ -183,6 +185,11 @@ def test_cli_prefetch_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "argv", ["hn-rerank", "--prefetch", "5"])
     main_module.main()
     assert captured["prefetch"] == 5
+    # The terminal's ANSI colours are the default; --truecolor opts out.
+    assert captured["ansi"] is True
+    monkeypatch.setattr(sys, "argv", ["hn-rerank", "--truecolor"])
+    main_module.main()
+    assert captured["ansi"] is False
     monkeypatch.setattr(sys, "argv", ["hn-rerank", "--prefetch", "-1"])
     with pytest.raises(SystemExit):
         main_module.main()

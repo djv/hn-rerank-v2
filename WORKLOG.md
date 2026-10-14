@@ -1,5 +1,22 @@
 # Worklog: hn-rewrite
 
+## 2026-10-14 — Terminal reader ANSI themes
+
+The user asked why the TUI did not fade like other tmux panes. `~/bin/theme-mode`
+fades inactive panes by setting tmux `window-style` bg, which only reaches
+cells drawn in the terminal's default background; the editorial themes paint
+truecolor backgrounds everywhere. New `editorial-ansi` / `editorial-ansi-light`
+themes (`clients/tui/src/hn_rerank/app.py`) map every palette role to the 16
+terminal colours with default backgrounds and are now the CLI default;
+`--truecolor` keeps the old themes (`Reader(ansi=False)`, which tests use).
+The light ANSI palette has no pale grey, so its selected row has no band.
+The headline list's unfocused border is `blank` (an invisible solid border
+would draw in the default foreground under ANSI), and the focused narrow
+Select uses a new `accent-fg` role. Checks: TUI suite 278 passed/1 skipped,
+ruff and ty clean. An isolated tmux run captured no truecolor or 256-colour
+SGR in either mode; renders with the kitty palettes looked right. Not yet
+observed in the user's live tmux session (the running reader needs a restart).
+
 ## 2026-10-14 — Queue mix final handoff
 
 Code `8204d7f` is pushed and laptop/VPS main synced. Backend CI38579339215 and

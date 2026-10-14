@@ -7,11 +7,15 @@ from typing import cast
 
 import httpx
 import pytest
-from rich.color import Color
+from rich.color import Color, ColorType
+from rich.style import Style
 from rich.text import Text
 from textual.widgets import Button, Input, Markdown, OptionList, Select, Static, Tabs
 
 from hn_rerank.app import (
+    ANSI_DARK_PALETTE,
+    ANSI_LIGHT_PALETTE,
+    DARK_PALETTE,
     EMPTY_NOTICE,
     LIGHT_PALETTE,
     VIEW_LIMIT,
@@ -884,3 +888,48 @@ async def test_short_pane_keeps_footer_and_heading_compact() -> None:
         app.status_mode = "context"
         app.context_status()
         assert "Enter/Esc back" in str(hints.content)
+
+
+def test_ansi_palettes_cover_every_editorial_role() -> None:
+    roles = set(DARK_PALETTE)
+    assert set(LIGHT_PALETTE) == roles
+    assert set(ANSI_DARK_PALETTE) == roles
+    assert set(ANSI_LIGHT_PALETTE) == roles
+
+
+def _span_colours(app: Reader) -> list[Color]:
+    listing = app.query_one(OptionList)
+    spans = [
+        span
+        for index in range(listing.option_count)
+        for span in cast(Text, listing.get_option_at_index(index).prompt).spans
+    ]
+    styles = [Style.parse(str(span.style)) for span in spans]
+    return [style.color for style in styles if style.color is not None]
+
+
+@pytest.mark.parametrize(
+    ("clock", "expected"),
+    [("editorial", "editorial-ansi"), ("editorial-light", "editorial-ansi-light")],
+)
+async def test_ansi_reader_uses_terminal_colours(
+    monkeypatch: pytest.MonkeyPatch, clock: str, expected: str
+) -> None:
+    """ANSI mode leaves the page at the terminal default, so tmux's inactive-pane
+    style and the terminal theme show through, and headline text uses only the
+    16 terminal colours."""
+    monkeypatch.setattr("hn_rerank.app.theme_for_hour", lambda _hour: clock)
+    app = Reader(api=EditorialServer().api(), ansi=True)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        assert app.theme == expected
+        assert app.current_theme.ansi
+        for selector in ("Screen", "#headlines", "#summary", "#filters", "#footer"):
+            node = app.screen if selector == "Screen" else app.query_one(selector)
+            assert node.styles.background.ansi == -1, selector
+        colours = _span_colours(app)
+        assert colours
+        assert {colour.type for colour in colours} <= {
+            ColorType.STANDARD,
+            ColorType.DEFAULT,
+        }

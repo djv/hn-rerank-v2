@@ -19,7 +19,7 @@ from textual.app import App, ComposeResult
 from textual.binding import BindingType
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.theme import Theme
+from textual.theme import BUILTIN_THEMES, Theme
 from textual.timer import Timer
 from textual.widgets import (
     Button,
@@ -137,9 +137,64 @@ LIGHT_PALETTE: dict[str, str] = {
     "select-fg": "#1F1D1A",
     "overlay": "rgba(60,50,40,0.35)",
 }
+# Text on an accent fill (the focused narrow-layout Select).
+DARK_PALETTE["accent-fg"] = DARK_PALETTE["bg"]
+LIGHT_PALETTE["accent-fg"] = LIGHT_PALETTE["bg"]
+# ANSI palettes use the terminal's own 16 colours (Rich names) and leave every
+# background at the terminal default, so tmux's inactive-pane style and the
+# terminal's light/dark theme reach the reader like any other pane. Grey steps
+# follow the GitHub-style kitty palettes: color7 is lighter than color8 in the
+# dark theme and the reverse in the light one.
+ANSI_DARK_PALETTE: dict[str, str] = {
+    "bg": "default",
+    "fg": "default",
+    "title-dim": "white",
+    "soft": "white",
+    "muted": "bright_black",
+    "faint": "bright_black",
+    "sep": "black",
+    "accent": "yellow",
+    "accent-fg": "black",
+    "link": "blue",
+    "good": "green",
+    "warn": "bright_yellow",
+    "bad": "red",
+    "surface": "default",
+    "panel": "default",
+    "bar": "default",
+    "chrome": "default",
+    "modal": "default",
+    "button-focus": "default",
+    "border": "black",
+    "rule": "black",
+    "select-bg": "black",
+    "select-fg": "bright_white",
+    "overlay": "default",
+}
+ANSI_LIGHT_PALETTE: dict[str, str] = {
+    **ANSI_DARK_PALETTE,
+    "title-dim": "bright_black",
+    "soft": "bright_black",
+    "muted": "white",
+    "faint": "white",
+    "sep": "white",
+    "accent-fg": "bright_white",
+    "border": "white",
+    "rule": "white",
+    # The light palette has no pale grey for a band; the selected row keeps
+    # the page colour and reads by its `>` marker and bold title.
+    "select-bg": "default",
+    "select-fg": "default",
+}
 PALETTES: dict[str, dict[str, str]] = {
     "editorial": DARK_PALETTE,
     "editorial-light": LIGHT_PALETTE,
+    "editorial-ansi": ANSI_DARK_PALETTE,
+    "editorial-ansi-light": ANSI_LIGHT_PALETTE,
+}
+ANSI_THEMES: dict[str, str] = {
+    "editorial": "editorial-ansi",
+    "editorial-light": "editorial-ansi-light",
 }
 # Rich Text styles are baked at render time, so they read the active palette.
 PALETTE: dict[str, str] = dict(DARK_PALETTE)
@@ -152,6 +207,14 @@ def theme_for_hour(hour: int) -> str:
 
 def editorial_theme(name: str) -> Theme:
     p = PALETTES[name]
+    ansi = name in ANSI_THEMES.values()
+    if ansi:
+        # Textual spells terminal colours `ansi_<rich name>`.
+        p = {key: f"ansi_{value}" for key, value in p.items()}
+    dark = not name.endswith("-light")
+    base = (
+        BUILTIN_THEMES["ansi-dark" if dark else "ansi-light"].variables if ansi else {}
+    )
     return Theme(
         name=name,
         primary=p["muted"],
@@ -161,11 +224,14 @@ def editorial_theme(name: str) -> Theme:
         background=p["bg"],
         surface=p["surface"],
         panel=p["panel"],
+        boost=p["bg"] if ansi else None,
         error=p["bad"],
         success=p["good"],
         warning=p["warn"],
-        dark=p is DARK_PALETTE,
+        dark=dark,
+        ansi=ansi,
         variables={
+            **base,
             "scrollbar": p["border"],
             "scrollbar-hover": p["sep"],
             "scrollbar-active": p["accent"],
@@ -702,8 +768,8 @@ class Reader(App[None]):
     SelectCurrent .arrow { padding: 0 1 0 0; }
     SelectCurrent Static#label { width: auto; }
     Select:focus-within > SelectCurrent { background: $hn-accent; }
-    Select:focus-within Static#label { color: $hn-bg; }
-    Select:focus-within .arrow { color: $hn-bg; }
+    Select:focus-within Static#label { color: $hn-accent-fg; }
+    Select:focus-within .arrow { color: $hn-accent-fg; }
     .narrow #filters { height: 1; }
     Tabs { width: auto; }
     #sort-tabs { width: 45; }
@@ -715,7 +781,7 @@ class Reader(App[None]):
     #panes { height: 1fr; }
     /* Wide layout: list a third, reading pane two thirds. */
     #headlines { width: 1fr; height: 1fr; background: $hn-bg;
-                 border: solid $hn-bg; padding: 0; }
+                 border: blank $hn-bg; padding: 0; }
     #headlines:focus { border: solid $hn-accent; }
     #headlines > .option-list--option { padding: 0 1; }
     #headlines > .option-list--separator { color: $hn-rule; }
@@ -795,8 +861,11 @@ class Reader(App[None]):
         prefetch_generate: int = DEFAULT_PREFETCH_GENERATE,
         window_file: Path | None = None,
         utc_clock: Callable[[], datetime] | None = None,
+        ansi: bool = False,
     ) -> None:
         super().__init__()
+        # Terminal-colour themes; False keeps the truecolor editorial pair.
+        self.ansi_themes = ansi
         self.startup_sort = default_sort(utc_clock() if utc_clock else None)
         # The last window picked opens next time; None (tests) keeps 1w and
         # never writes.
@@ -965,6 +1034,8 @@ class Reader(App[None]):
         """Follow the local clock, but only when the clock's pick changes, so a
         theme chosen from the command palette holds until the next boundary."""
         name = theme_for_hour(time.localtime().tm_hour)
+        if self.ansi_themes:
+            name = ANSI_THEMES[name]
         if name == self.clock_theme:
             return
         self.clock_theme = name
