@@ -1,5 +1,24 @@
 # HN Rerank findings
 
+## pg_vectorsearch / RaBitQ assessment — 2026-10-14
+
+Question (user, from the HN story 50086165): can hn-rerank use Timescale's
+pg_vectorsearch (alpha PRISM index: IVF partitions + hierarchical routing +
+RaBitQ 1-bit quantization with error-bound pruning and full-precision rerank;
+Postgres 18+, ≤1968 dims, post-filtering only)?
+
+Answer: no. hn-rerank is SQLite, and `CandidatePool` already holds the
+384-d embedding matrix in memory; exact brute-force similarity over tens of
+thousands of stories is milliseconds, while ANN indexes pay off at millions.
+Speed claims (6 ms at 100M, ~4× less memory than HNSW, >20× faster builds)
+are vendor-blog only; the README has no numbers.
+
+If memory ever binds: store float16/int8 first (2–4× smaller, negligible
+accuracy loss). RaBitQ (32× smaller) only helps when scanning millions.
+Either change alters the kNN/SVM features, so re-run the ranking evaluation
+including the topic-spread (sameness) guardrail. Live row count was not
+checked (VPS path lookup failed).
+
 ## Queue mix final handoff — 2026-10-14
 
 User choice: Recommended → Explore → Recommended → Popular, repeating and
