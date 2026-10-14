@@ -43,6 +43,13 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Gemini/Muse worker benchmark (October14): six isolated VPS tasks through
+  pi; both completed repair and simplification/research, both timed out on
+  property coverage. Gemini's completed artifacts passed all gates; Muse
+  repair needs formatting, simplification passed. Retain Muse default on
+  this small sample; Gemini is a useful alternative. No project code,
+  production service, DB, trial, or persistent default changed. Evidence:
+  `docs/evaluations/gemini-worker-benchmark-20261014/REPORT.md`.
 - Reader checks (user October14): real tmux PTY fixture verified summary
   retry, comments-open payload, narrow/wide Queue rendering, Caught up state
   and quit after a pending save. Focused client70 and current backend5 passed

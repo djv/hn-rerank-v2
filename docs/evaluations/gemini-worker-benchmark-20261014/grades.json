@@ -1,0 +1,433 @@
+[
+  {
+    "model": "gemini",
+    "case": "repair",
+    "timing": {
+      "model": "gemini",
+      "case": "repair",
+      "started_at": "2026-10-14T20:10:56.247961+00:00",
+      "elapsed_seconds": 133.59,
+      "exit_code": 0,
+      "timed_out": false
+    },
+    "usage": {
+      "events": {
+        "session": 1,
+        "agent_start": 1,
+        "turn_start": 11,
+        "message_start": 23,
+        "message_end": 23,
+        "message_update": 87,
+        "tool_execution_start": 10,
+        "tool_execution_end": 10,
+        "turn_end": 11,
+        "tool_execution_update": 28,
+        "agent_end": 1,
+        "agent_settled": 1
+      },
+      "tokens": {
+        "input": 33106,
+        "output": 4159,
+        "cacheRead": 79345,
+        "cacheWrite": 0,
+        "reasoning": 1814,
+        "totalTokens": 116610
+      },
+      "catalog_cost_usd": 0.2315
+    },
+    "git_status": "## main\n M src/hn_rerank/queue.py\n?? NOTE.md\n?? README.md\n?? final-answer.txt\n?? tests/test_worker_repair.py\n?? timing.json\n?? worker.jsonl\n",
+    "oracle": {
+      "examples": 1040,
+      "mismatch_count": 0,
+      "examples_failed": []
+    },
+    "suite": {
+      "exit_code": 0,
+      "tail": "nment instead\nbringing up nodes...\nbringing up nodes...\n\n..................................................s..................... [ 24%]\n........................................................................ [ 48%]\n........................................................................ [ 72%]\n........................................................................ [ 96%]\n.........                                                                [100%]\n296 passed, 1 skipped in 138.46s (0:02:18)\n"
+    },
+    "ruff": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "ty": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "format": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\n2 files already formatted\n"
+    }
+  },
+  {
+    "model": "muse",
+    "case": "repair",
+    "timing": {
+      "model": "muse",
+      "case": "repair",
+      "started_at": "2026-10-14T20:10:56.248438+00:00",
+      "elapsed_seconds": 190.82,
+      "exit_code": 0,
+      "timed_out": false
+    },
+    "usage": {
+      "events": {
+        "session": 1,
+        "agent_start": 1,
+        "turn_start": 24,
+        "message_start": 52,
+        "message_end": 52,
+        "message_update": 210,
+        "tool_execution_start": 26,
+        "tool_execution_end": 26,
+        "turn_end": 24,
+        "tool_execution_update": 42,
+        "agent_end": 1,
+        "agent_settled": 1
+      },
+      "tokens": {
+        "input": 62687,
+        "output": 11803,
+        "cacheRead": 1142055,
+        "cacheWrite": 0,
+        "reasoning": 6603,
+        "totalTokens": 1216545
+      },
+      "catalog_cost_usd": 0.0109
+    },
+    "git_status": "## main\n M src/hn_rerank/queue.py\n?? NOTE.md\n?? README.md\n?? final-answer.txt\n?? tests/test_worker_repair.py\n?? timing.json\n?? worker.jsonl\n",
+    "oracle": {
+      "examples": 1040,
+      "mismatch_count": 0,
+      "examples_failed": []
+    },
+    "suite": {
+      "exit_code": 0,
+      "tail": "nment instead\nbringing up nodes...\nbringing up nodes...\n\n..................................................s..................... [ 24%]\n........................................................................ [ 48%]\n........................................................................ [ 73%]\n........................................................................ [ 97%]\n.......                                                                  [100%]\n294 passed, 1 skipped in 139.10s (0:02:19)\n"
+    },
+    "ruff": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "ty": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "format": {
+      "exit_code": 1,
+      "tail": "rget the active environment instead\nunformatted: File would be reformatted\n  --> tests/test_worker_repair.py:49:16\n   |\n48 |     assert all(entry.served_version == 0 for entry in entries)\n   -     assert all(entry.served_version is not None and entry.served_version >= 0 for entry in entries)\n49 +     assert all(\n50 +         entry.served_version is not None and entry.served_version >= 0\n51 +         for entry in entries\n52 +     )\n53 |\n   |\n\n1 file would be reformatted, 1 file already formatted\n"
+    }
+  },
+  {
+    "model": "gemini",
+    "case": "tests",
+    "timing": {
+      "model": "gemini",
+      "case": "tests",
+      "started_at": "2026-10-14T20:13:09.835780+00:00",
+      "elapsed_seconds": 600.03,
+      "exit_code": 143,
+      "timed_out": true
+    },
+    "usage": {
+      "events": {
+        "session": 1,
+        "agent_start": 1,
+        "turn_start": 16,
+        "message_start": 32,
+        "message_end": 32,
+        "message_update": 223,
+        "tool_execution_start": 15,
+        "tool_execution_end": 15,
+        "turn_end": 15,
+        "tool_execution_update": 19
+      },
+      "tokens": {
+        "input": 78652,
+        "output": 44419,
+        "cacheRead": 243047,
+        "cacheWrite": 0,
+        "reasoning": 36297,
+        "totalTokens": 366118
+      },
+      "catalog_cost_usd": 1.2516
+    },
+    "git_status": "## main\n?? README.md\n?? final-answer.txt\n?? tests/test_worker_invariants.py\n?? timing.json\n?? worker.jsonl\n",
+    "oracle": {
+      "examples": 1040,
+      "mismatch_count": 0,
+      "examples_failed": []
+    },
+    "suite": {
+      "exit_code": 0,
+      "tail": "tive environment instead\nbringing up nodes...\nbringing up nodes...\n\n......................................................s................. [ 24%]\n........................................................................ [ 49%]\n........................................................................ [ 73%]\n........................................................................ [ 98%]\n.....                                                                    [100%]\n292 passed, 1 skipped in 50.34s\n"
+    },
+    "ruff": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "ty": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "format": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\n2 files already formatted\n"
+    },
+    "mutations": {
+      "caught": 4,
+      "total": 6,
+      "mutants": {
+        "ignored_exclusions": {
+          "detected": true,
+          "exit_code": 1,
+          "tail": "y=False),\nE                excluded=set(),\nE                restored=set()),\nE           )\n\ntests/test_worker_invariants.py:131: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_worker_invariants.py::test_queue_entries_behavioral_contracts\nFAILED tests/test_worker_invariants.py::test_build_round_multi_round_contracts\nFAILED tests/test_worker_invariants.py::test_restored_vs_excluded_rank_and_popular_cap_contracts\n3 failed in 26.59s\n"
+        },
+        "ignored_restorations": {
+          "detected": false,
+          "exit_code": 124,
+          "tail": "TIMEOUT"
+        },
+        "invalid_zero_version": {
+          "detected": true,
+          "exit_code": 1,
+          "tail": "dy=False),\nE                excluded=set(),\nE                restored=set()),\nE           )\n\ntests/test_worker_invariants.py:142: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_worker_invariants.py::test_queue_entries_behavioral_contracts\nFAILED tests/test_worker_invariants.py::test_build_round_multi_round_contracts\nFAILED tests/test_worker_invariants.py::test_restored_vs_excluded_rank_and_popular_cap_contracts\n3 failed in 2.60s\n"
+        },
+        "wrong_popular_cap": {
+          "detected": true,
+          "exit_code": 1,
+          "tail": "        ready=False),\nE            excluded=set(),\nE            restored=set()),\nE       )\n\ntests/test_worker_invariants.py:164: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_worker_invariants.py::test_queue_entries_behavioral_contracts\nFAILED tests/test_worker_invariants.py::test_build_round_multi_round_contracts\nFAILED tests/test_worker_invariants.py::test_restored_vs_excluded_rank_and_popular_cap_contracts\n3 failed in 26.05s\n"
+        },
+        "wrong_badge_priority": {
+          "detected": false,
+          "exit_code": 124,
+          "tail": "TIMEOUT"
+        },
+        "lost_frozen_rounds": {
+          "detected": true,
+          "exit_code": 1,
+          "tail": "ts={},\nE             version=0,\nE             target_version=0,\nE             ready=False),\nE            excluded=set(),\nE            restored=set()),\nE       )\n\ntests/test_worker_invariants.py:325: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_worker_invariants.py::test_build_round_multi_round_contracts\nFAILED tests/test_worker_invariants.py::test_restored_vs_excluded_rank_and_popular_cap_contracts\n2 failed, 1 passed in 26.84s\n"
+        }
+      }
+    }
+  },
+  {
+    "model": "muse",
+    "case": "tests",
+    "timing": {
+      "model": "muse",
+      "case": "tests",
+      "started_at": "2026-10-14T20:14:07.065604+00:00",
+      "elapsed_seconds": 600.06,
+      "exit_code": 143,
+      "timed_out": true
+    },
+    "usage": {
+      "events": {
+        "session": 1,
+        "agent_start": 1,
+        "turn_start": 34,
+        "message_start": 73,
+        "message_end": 73,
+        "message_update": 271,
+        "tool_execution_start": 38,
+        "tool_execution_end": 37,
+        "turn_end": 33,
+        "tool_execution_update": 78
+      },
+      "tokens": {
+        "input": 129399,
+        "output": 45762,
+        "cacheRead": 1711249,
+        "cacheWrite": 0,
+        "reasoning": 26226,
+        "totalTokens": 1886410
+      },
+      "catalog_cost_usd": 0.0255
+    },
+    "git_status": "## main\n M src/hn_rerank/queue.py\n?? README.md\n?? final-answer.txt\n?? tests/test_worker_invariants.py\n?? timing.json\n?? worker.jsonl\n",
+    "oracle": {
+      "examples": 1040,
+      "mismatch_count": 652,
+      "examples_failed": [
+        "queue_entries example 1",
+        "build_round example 1",
+        "queue_entries example 3",
+        "build_round example 3",
+        "queue_entries example 4",
+        "build_round example 4",
+        "queue_entries example 12",
+        "build_round example 12"
+      ]
+    },
+    "suite": {
+      "exit_code": 1,
+      "tail": "fo ============================\nFAILED tests/test_queue.py::test_queue_groups_deduplicates_skips_missing_and_keeps_origins\nFAILED tests/test_queue.py::test_queue_events_keep_origin_and_full_positions\nFAILED tests/test_worker_invariants.py::test_restored_compresses_excluded_preserves_gaps\nFAILED tests/test_worker_invariants.py::test_queue_entries_behavioral_contracts\nFAILED tests/test_worker_invariants.py::test_build_round_behavioral_contracts\n5 failed, 288 passed, 1 skipped in 115.83s (0:01:55)\n"
+    },
+    "ruff": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "ty": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "format": {
+      "exit_code": 1,
+      "tail": "integers(0, 8), label=\"target_version\")\n--------------------------------------------------------------------------------\n357 |     if prior_entries:\n    -         chunk = max(1, (len(prior_entries) + max(1, n_batches)) // max(1, n_batches + 1))\n358 +         chunk = max(\n359 +             1, (len(prior_entries) + max(1, n_batches)) // max(1, n_batches + 1)\n360 +         )\n361 |         for start in range(0, len(prior_entries), chunk):\n    |\n\n1 file would be reformatted, 1 file already formatted\n"
+    },
+    "mutations": {
+      "caught": 2,
+      "total": 6,
+      "mutants": {
+        "ignored_exclusions": {
+          "detected": false,
+          "exit_code": 124,
+          "tail": "TIMEOUT"
+        },
+        "ignored_restorations": {
+          "detected": false,
+          "exit_code": 124,
+          "tail": "TIMEOUT"
+        },
+        "invalid_zero_version": {
+          "detected": false,
+          "exit_code": 124,
+          "tail": "TIMEOUT"
+        },
+        "wrong_popular_cap": {
+          "detected": true,
+          "exit_code": 1,
+          "tail": " (2, 1),\n            (3, 2),\n            (4, 3),\n            (5, 4),\n        ]\nE       assert [(1, 0), (2, ...3, 2), (4, 3)] == [(1, 0), (2, ...4, 3), (5, 4)]\nE         \nE         Right contains one more item: (5, 4)\nE         Use -v to get more diff\n\ntests/test_worker_invariants.py:490: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_worker_invariants.py::test_popular_limit_and_mixing_and_empty_orders\n1 failed, 3 passed in 2.70s\n"
+        },
+        "wrong_badge_priority": {
+          "detected": false,
+          "exit_code": 124,
+          "tail": "TIMEOUT"
+        },
+        "lost_frozen_rounds": {
+          "detected": true,
+          "exit_code": 1,
+          "tail": " assert len(second) == 2\nE       AssertionError: assert 1 == 2\nE        +  where 1 = len([[QueueEntry(story_id=8, origin='recommended', served_rank=0, served_version=1)]])\n\ntests/test_worker_invariants.py:529: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_worker_invariants.py::test_build_round_behavioral_contracts\nFAILED tests/test_worker_invariants.py::test_popular_limit_and_mixing_and_empty_orders\n2 failed, 2 passed in 36.10s\n"
+        }
+      }
+    }
+  },
+  {
+    "model": "muse",
+    "case": "simplify",
+    "timing": {
+      "model": "muse",
+      "case": "simplify",
+      "started_at": "2026-10-14T20:24:07.130964+00:00",
+      "elapsed_seconds": 226.41,
+      "exit_code": 0,
+      "timed_out": false
+    },
+    "usage": {
+      "events": {
+        "session": 1,
+        "agent_start": 1,
+        "turn_start": 29,
+        "message_start": 65,
+        "message_end": 65,
+        "message_update": 277,
+        "tool_execution_start": 34,
+        "tool_execution_end": 34,
+        "turn_end": 29,
+        "tool_execution_update": 48,
+        "agent_end": 1,
+        "agent_settled": 1
+      },
+      "tokens": {
+        "input": 134948,
+        "output": 23407,
+        "cacheRead": 1708621,
+        "cacheWrite": 0,
+        "reasoning": 14357,
+        "totalTokens": 1866976
+      },
+      "catalog_cost_usd": 0.0216
+    },
+    "git_status": "## main\n M src/hn_rerank/queue.py\n?? EVIDENCE.md\n?? NOTE.md\n?? README.md\n?? final-answer.txt\n?? tests/test_worker_simplify.py\n?? timing.json\n?? worker.jsonl\n",
+    "oracle": {
+      "examples": 1040,
+      "mismatch_count": 0,
+      "examples_failed": []
+    },
+    "suite": {
+      "exit_code": 0,
+      "tail": "tive environment instead\nbringing up nodes...\nbringing up nodes...\n\n.......................................................s................ [ 24%]\n........................................................................ [ 48%]\n........................................................................ [ 73%]\n........................................................................ [ 97%]\n.......                                                                  [100%]\n294 passed, 1 skipped in 49.76s\n"
+    },
+    "ruff": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "ty": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "format": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\n2 files already formatted\n"
+    }
+  },
+  {
+    "model": "gemini",
+    "case": "simplify",
+    "timing": {
+      "model": "gemini",
+      "case": "simplify",
+      "started_at": "2026-10-14T20:23:09.868752+00:00",
+      "elapsed_seconds": 520.8,
+      "exit_code": 0,
+      "timed_out": false
+    },
+    "usage": {
+      "events": {
+        "session": 1,
+        "agent_start": 1,
+        "turn_start": 25,
+        "message_start": 55,
+        "message_end": 55,
+        "message_update": 245,
+        "tool_execution_start": 28,
+        "tool_execution_end": 28,
+        "turn_end": 25,
+        "tool_execution_update": 72,
+        "agent_end": 1,
+        "agent_settled": 1
+      },
+      "tokens": {
+        "input": 143333,
+        "output": 26806,
+        "cacheRead": 1754580,
+        "cacheWrite": 0,
+        "reasoning": 17431,
+        "totalTokens": 1924719
+      },
+      "catalog_cost_usd": 1.4604
+    },
+    "git_status": "## main\n M src/hn_rerank/queue.py\n?? EVIDENCE.md\n?? NOTE.md\n?? README.md\n?? final-answer.txt\n?? tests/test_worker_simplify.py\n?? timing.json\n?? worker.jsonl\n",
+    "oracle": {
+      "examples": 1040,
+      "mismatch_count": 0,
+      "examples_failed": []
+    },
+    "suite": {
+      "exit_code": 0,
+      "tail": "tive environment instead\nbringing up nodes...\nbringing up nodes...\n\n........................................................s............... [ 24%]\n........................................................................ [ 49%]\n........................................................................ [ 73%]\n........................................................................ [ 98%]\n.....                                                                    [100%]\n292 passed, 1 skipped in 45.10s\n"
+    },
+    "ruff": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/agent-benchmarks/gemini-worker-20261014-02/baseline/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "ty": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/agent-benchmarks/gemini-worker-20261014-02/baseline/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\nAll checks passed!\n"
+    },
+    "format": {
+      "exit_code": 0,
+      "tail": "warning: `VIRTUAL_ENV=/home/dev/agent-benchmarks/gemini-worker-20261014-02/baseline/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead\n2 files already formatted\n"
+    }
+  }
+]

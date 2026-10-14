@@ -4376,3 +4376,21 @@ Positional `INSERT INTO interaction_events VALUES` exists only in tests that
 list their columns. The user chose rounds for M1/M2. The agent's own fix:
 the client age check applies only to cards no longer in the current feed,
 since the server already serves only current stories.
+
+## Gemini versus Muse worker benchmark — 2026-10-14
+
+User requested Gemini benchmarking and clarified pi is preferred for the
+interactive TUI; OpenCode CLI is acceptable for headless benchmarks/research.
+The scored comparison used pi 1.1.0 on the VPS, isolated TUI source snapshots
+at 11ec7b820c4f3c2a6ffefb4750e493468f13798f, Argon high versus Spark xhigh.
+Each model completed repair and simplification/research; both exceeded the
+ten-minute property-test deadline. Gemini completed artifacts passed all
+gates; Muse repair failed only formatting, simplification passed all gates.
+Both completed repairs/refactors matched 1,040 reference cases. Muse's
+test-writing mutation probe was interrupted before restoration, leaving an
+unsafe partial checkout; its new tests separately pass on correct baseline.
+The six tasks do not establish a broad winner or additional property coverage.
+Recommendation: retain Muse default and use Gemini selectively; no default
+or production change made. All own worker/grader/test jobs verified exited;
+final VPS load 0.83, available RAM 4.6 GiB. Report and structured grades:
+`docs/evaluations/gemini-worker-benchmark-20261014/`.
