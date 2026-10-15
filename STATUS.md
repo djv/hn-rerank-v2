@@ -26,10 +26,11 @@ first feed for new profiles (parked by the user 2026-10-12, in `~/TASKS.md`). Se
 table, live since 2026-10-12) supports all three.
 
 ## Objective
-Queue opening mix, in-app explanations and standalone CI correction are complete.
-Final handoff saves package verification and green code CI, preserving the trial
-and unrelated work. Normal-use rendering and subjective card quality remain
-for the user's next fresh reader session.
+Review the broader server, ranking, telemetry, and client behavior, with a
+read-only VPS health check. No application code or runtime state was changed.
+Next: decide which verified review findings to fix; the live trial report still
+needs an explicit endpoint/capture decision and should use the preserved
+November 5 snapshot protocol below.
 
 Make the feed less same-y without losing hits (Goals above). Discover is
 live in Explore. The far card (Recommended's last card) went live
@@ -43,6 +44,29 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Codebase review (user `rv`, continued with Go Muse Spark via pi, 2026-10-14):
+  verified token-reservation leakage after LLM errors (`llm_limiter.py:99-108`),
+  side-vector norm shrinkage for uncovered stories when side embeddings are
+  enabled (`pipeline/side_embeddings.py:48-54,179-188`), and web dwell position
+  being clamped to zero after voting removes the active story (`templates/index.html:1858-1875`,
+  vote/render at `1565-1575`, `1208-1220`). No High-severity source bug was
+  independently confirmed. Web logs impressions immediately, unlike TUI's
+  one-second gate; whether this is a defect depends on the intended measurement
+  policy. A proposed TUI queue-undo rank finding was not confirmed: origin-view
+  `served_rank` is restored in that view, while Queue composition is separate.
+  Other verified lower-priority risks include oversized web dwell after a tab is
+  left open beyond 24h (server rejects durations >86,400,000 ms) and mutable
+  trial feedback making retrospective reports non-reproducible. Full evidence:
+  `FINDINGS.md`, section "Codebase review — server, ranking, clients".
+- VPS read-only check: service active at PID 121960, started 2026-10-13 20:59:38
+  UTC on checkout `8371de7`; no warning-level service journal entries in the
+  preceding 24h; side-embedding timer completed normally with zero pending
+  vectors (`17,522/17,522`). Recent hot refreshes completed. Import AI gate and
+  trial report were not completed in this review; no live ranking-pass claim is
+  made. No database reads/writes beyond service metadata/journal were performed.
+- Finalized the review handoff only; no code, runtime, profile feedback, trial
+  configuration, or database changes. Test suites were not rerun (documentation
+  only); `git diff --check` is the gate for this handoff.
 - Gemini/Muse worker benchmark (October14): six isolated VPS tasks through
   pi; both completed repair and simplification/research, both timed out on
   property coverage. Gemini's completed artifacts passed all gates; Muse

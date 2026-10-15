@@ -1,5 +1,74 @@
 # HN Rerank findings
 
+## Codebase review — server, ranking, clients — 2026-10-14
+
+User requested a broad review of server, logic, ranking, clients, and a
+read-only live VPS check. Three independent first-pass reviews were followed by
+Go Muse Spark review via pi after the user reported Claude cloud review credits
+were finished. Review outputs were verified against the current checkout;
+cloud-review session output was not used as evidence.
+
+### Verified issues
+
+- **Medium — LLM token reservations leak on error responses.**
+  `llm_limiter.py:99-108` refunds `reserved_tokens` only when `used_tokens` is
+  present. The server's error/exception paths do not report usage, leaving the
+  reservation deducted. Reproduction: initialize the limiter from provider
+  headers with 1,000 tokens, reserve 600, record a 500 with no usage; the bucket
+  remains at 400. Repeated provider failures can cause local token waits even
+  though the request consumed no tokens. Verified in `server.py`'s chat and
+  responses call paths. No fix was applied.
+- **Medium when enabled — uncovered side vectors shrink the combined vector.**
+  `pipeline/side_embeddings.py:48-54,179-188` joins a unit primary vector with
+  a zero side vector and divides by `sqrt(2)`, yielding norm `1/sqrt(2)` for
+  uncovered stories, versus 1 for covered stories. Reproduced with one covered
+  and one uncovered row. This changes SVM similarity when side embeddings are
+  enabled; production default has the feature disabled.
+- **Medium — web dwell position can be falsely recorded as rank zero.**
+  `templates/index.html:1565-1575,1208-1220,1858-1875`: voting removes the
+  active story from `visible` during render, then `setActive` closes the old
+  interaction. Its `findIndex` returns -1 and `Math.max(0, position)` records
+  position 0 regardless of the story's served position. Position telemetry is
+  therefore corrupted for a voted card's closing dwell.
+- **Low/Medium — web dwell can exceed the server's accepted duration.**
+  `templates/index.html:1931-1935` sends raw elapsed `performance.now()` time;
+  `server.py:2822-2829` rejects durations above 86,400,000 ms. Leaving a tab
+  with an active card for over 24 hours and then changing cards produces a
+  rejected interaction batch. The web queue drops the entire submitted batch
+  on a non-429 4xx (`index.html:1903-1910`), losing other events in that batch.
+- **Low — trial report is not reproducible from mutable feedback alone.**
+  `scripts/interleave_report.py:241-249` selects current feedback by
+  `updated_at`; `database.py` upserts update that timestamp and undo deletes
+  the row. A later re-vote/undo can change the historical result. Existing
+  calibration exclusion does not snapshot votes. Use the documented endpoint
+  DB snapshot protocol; do not reinterpret a mutable live report as a frozen
+  endpoint result.
+
+### Claims checked / limits
+
+- No High-severity issue was independently confirmed. The codebase has no
+  `pipeline/evaluation.py` or `scripts/report_ranking_trial.py`; actual trial
+  reporter is `scripts/interleave_report.py`.
+- TUI `editorial-ansi-light-faded` does set `dark=True` (`app.py:291-315`), a
+  genuine low-impact built-in-widget-theme mismatch. Kitty color 15 `#8c959f`
+  against `#585858` has approximately 2.34:1 contrast (not 1.05:1; that earlier
+  estimate was incorrect).
+- The suggested TUI Queue undo served-rank defect was not confirmed: the saved
+  origin lane rank is inserted into that origin view, while Queue rounds remain
+  separately composed and retain their own positions. Vote serialization,
+  dwell bounds in TUI, impression delay/guards, and summary/request guards were
+  checked without a verified defect.
+- Web impressions are recorded immediately on selection (`index.html:1925-1929`),
+  unlike the TUI's one-second gate. This is a measurement-policy discrepancy;
+  absent an explicit web threshold requirement it is not classified as a bug.
+- Read-only VPS evidence on 2026-10-14: checkout `8371de7`, service active
+  (PID 121960, started 20:59:38 UTC), zero warning-level service journal entries
+  in the prior 24h, side-embedding timer successful with zero missing vectors
+  (17,522 total). `hot_refresh` completed at 20:34 and 20:44 UTC. The Import AI
+  gate was not run. An initial `interleave_report.py` invocation omitted its
+  required `--since`, so no live trial report was produced. No DB was opened
+  during this handoff; no live gate or trial-pass result is claimed.
+
 ## Terminal reader ANSI themes — 2026-10-14
 
 Question: why the TUI did not fade like other tmux panes. `~/bin/theme-mode`
