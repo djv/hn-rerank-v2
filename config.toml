@@ -23,19 +23,20 @@ tldr_probe_max_threads_per_regen = 20
 # Tap-time Firebase probe budget per open (young HN threads only); the regen
 # probe above keeps its own 10s default. Miss/failure serves cached.
 tldr_tap_probe_timeout_seconds = 3.0
-# Live team-draft interleaving of production with the joined-classifier
-# challengers (shortlist #2/#4) in profile 151's Recommended views, 28 days
-# from the first interleaved deck (docs/evaluations/model-ablation-20261007/
-# INTERLEAVING.md). Remove the line to stop.
-interleave_user_ids = [151]
 # Reddit top lists and threads from the Arctic Shift archive instead of
 # Reddit RSS (retired 2026-11-13); user switched 2026-10-08. Remove the line
 # to go back to RSS while it lasts (ARCHITECTURE.md 3.4.4).
 reddit_source = "arctic_shift"
 
 [hn_rewrite.model]
+# One joined logistic classifier (shortlist #2, all features) replaced the
+# SVM + linear blend for every profile on 2026-10-16, when the user ended the
+# interleaving trial early (docs/evaluations/model-ablation-20261007/
+# INTERLEAVING.md). Rollback: delete `classifier`, set linear_blend_enabled
+# true and restart.
+classifier = "joined_logistic"
 svm_c = 4.0
-linear_blend_enabled = true
+linear_blend_enabled = false
 svm_precomputed_enabled = true
 svm_precomputed_chunk_size = 512
 # Rank on stored + embeddinggemma vectors side by side (2026-10-02); vectors
