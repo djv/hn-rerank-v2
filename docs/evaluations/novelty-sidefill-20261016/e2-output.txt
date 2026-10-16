@@ -1,0 +1,27 @@
+training votes: 4430 (951 up / 1868 down), REVOTE-window excluded
+pool: 10743 production candidates, 10743 with stored embeddings
+side coverage: pool 10561/10743, union 0.988 (gate 0.98)
+  age <30m    n=    0 covered=nan
+  age 30-60m  n=    0 covered=nan
+  age 1-6h    n=   25 covered=1.000
+  age 6-24h   n=  181 covered=1.000
+  age 1-3d    n=  500 covered=1.000
+  age >3d     n=10037 covered=0.982
+  src hn_live  n= 4284 covered=1.000
+  src archive  n= 4000 covered=0.955
+  src reddit   n= 1361 covered=1.000
+  src rss      n= 1098 covered=1.000
+baseline scored (10743 stories)
+F=30min: hidden=0 (already missing a side vector: 0)
+  zero   dPct med n/a mean n/a dScore med n/a mean n/a spear 1.000 nonhidMaxdR 0 12h:0in,0drop/0in,0drop 1d:0in,0drop/0in,0drop
+  renorm dPct med n/a mean n/a dScore med n/a mean n/a spear 1.000 nonhidMaxdR 0 12h:0in,0drop/0in,0drop 1d:0in,0drop/0in,0drop
+  knn    dPct med n/a mean n/a dScore med n/a mean n/a spear 1.000 nonhidMaxdR 0 12h:0in,0drop/0in,0drop 1d:0in,0drop/0in,0drop
+F=60min: hidden=0 (already missing a side vector: 0)
+  zero   dPct med n/a mean n/a dScore med n/a mean n/a spear 1.000 nonhidMaxdR 0 12h:0in,0drop/0in,0drop 1d:0in,0drop/0in,0drop
+  renorm dPct med n/a mean n/a dScore med n/a mean n/a spear 1.000 nonhidMaxdR 0 12h:0in,0drop/0in,0drop 1d:0in,0drop/0in,0drop
+  knn    dPct med n/a mean n/a dScore med n/a mean n/a spear 1.000 nonhidMaxdR 0 12h:0in,0drop/0in,0drop 1d:0in,0drop/0in,0drop
+F=120min: hidden=2 (already missing a side vector: 0)
+  zero   dPct med -15.216 mean -15.216 dScore med -0.136 mean -0.136 spear 1.000 nonhidMaxdR 5 12h:0in,0drop/1in,0drop 1d:0in,0drop/0in,0drop
+  renorm dPct med -14.369 mean -14.369 dScore med -0.128 mean -0.128 spear 1.000 nonhidMaxdR 5 12h:0in,0drop/1in,0drop 1d:0in,0drop/0in,0drop
+  knn    dPct med -12.828 mean -12.828 dScore med -0.112 mean -0.112 spear 1.000 nonhidMaxdR 5 12h:0in,0drop/1in,0drop 1d:0in,0drop/0in,0drop
+wrote 10743 per-story rows to /home/dev/hnx-20261016/e2.json

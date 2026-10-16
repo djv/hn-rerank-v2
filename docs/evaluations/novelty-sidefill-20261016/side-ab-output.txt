@@ -1,0 +1,18 @@
+== impressions (holdout-after 1790914680 = 2026-10-02 04:18 UTC, 8 blocks, profile 151)
+view: raw
+report             scorer                                       auc_rest auc_down      map   ndcg12   ndcg40   rec100  down@40   compos  wins pool_auc
+side-ab-impression production                                      0.791    0.891    0.413    0.474    0.524    0.908    0.147    0.611          0.786   
+side-ab-impression prod[side_embedding_enabled=false]              0.776    0.880    0.373    0.405    0.484    0.899    0.128    0.582   2/8    0.773   
+side-ab-impression random                                          0.503    0.488    0.170    0.161    0.196    0.531    0.438    0.318   0/8    0.506   
+side-ab-impression candidate_order                                 0.618    0.672    0.251    0.231    0.307    0.802    0.341    0.413   0/8    0.618   
+side-ab-impression gravity                                         0.373    0.323    0.132    0.113    0.136    0.375    0.584    0.234   0/8    0.373   
+side-ab-impression centroid_up_minus_down                          0.675    0.750    0.279    0.332    0.371    0.749    0.194    0.493   1/8    0.674   
+== heldout-feedback (holdout-after 1790914680 = 2026-10-02 04:18 UTC, 8 blocks, profile 151)
+view: raw
+report             scorer                                       auc_rest auc_down      map   ndcg12   ndcg40   rec100  down@40   compos  wins pool_auc
+side-ab-heldout-fe production                                      0.791    0.890    0.439    0.488    0.545    0.956    0.169    0.619          0.786   
+side-ab-heldout-fe prod[side_embedding_enabled=false]              0.776    0.879    0.404    0.441    0.514    0.960    0.159    0.595   3/8    0.772   
+side-ab-heldout-fe random                                          0.503    0.488    0.201    0.189    0.231    0.640    0.569    0.311   0/8    0.506   
+side-ab-heldout-fe candidate_order                                 0.618    0.672    0.251    0.231    0.307    0.802    0.341    0.413   0/8    0.618   
+side-ab-heldout-fe gravity                                         0.373    0.323    0.152    0.127    0.144    0.512    0.631    0.233   0/8    0.373   
+side-ab-heldout-fe centroid_up_minus_down                          0.675    0.750    0.315    0.357    0.409    0.855    0.278    0.496   1/8    0.674   
