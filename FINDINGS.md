@@ -4489,3 +4489,23 @@ Recommendation: retain Muse default and use Gemini selectively; no default
 or production change made. All own worker/grader/test jobs verified exited;
 final VPS load 0.83, available RAM 4.6 GiB. Report and structured grades:
 `docs/evaluations/gemini-worker-benchmark-20261014/`.
+
+## ML model quality review (30x Muse) — 2026-10-16
+
+- User `rv 30x muse` on ML ranking quality. 30 Go Muse Spark runs via pi
+  (xhigh, read-only tools), each on its own copy of tracked tree `ef7dc5d`
+  without DB; angles labels/features/eval/diversity/coldstart/code x5. All
+  completed first try (an earlier launch failed before any model call: missing
+  runs dir). Laptop load peaked 6.2, 4.2 GiB available.
+- Main-agent verified: side zero-fill still live (`side_embeddings.py:179-188`,
+  11/30); `neutral_weight` never read (`config.py:36`, 11/30); cluster
+  similarity [389] has no train-time self-exclusion (7/30, ~1/200 self weight
+  for profile 151); dummy absent-class rows enter the scaler fit
+  (`ranking.py:1575-1603`, only no-neutral profiles); tier-1 gravity is
+  points/age^1.8 (`ranking.py:1769-1777`) so score-0 sources sink for new
+  users; zero-vote `rank_stories` sorts by raw points (`ranking.py:1886`)
+  unlike the served cold deck; ARCHITECTURE 3.3 C=0.1 is stale (live 4.0
+  since `26b9474`).
+- Re-proposed but already rejected: training URL dedup (2026-09-22
+  confirmation), recency decay. Unverified single-run claims are listed in the
+  report. Report and raw runs: `docs/evaluations/ml-quality-review-20261016/`.

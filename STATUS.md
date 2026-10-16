@@ -44,6 +44,15 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- ML quality review (user `rv 30x muse`, 2026-10-16): 30 Spark runs, six
+  angles. Verified: side-vector zero-fill still demotes the newest stories
+  (`pipeline/side_embeddings.py:179-188`, cheap fix); the scorer's meta
+  features all reward closeness to past ups (sameness lives in post-passes);
+  offline eval is judged-only with current-text leakage and no spread/novelty
+  gate; cold feed's gravity sinks score-0 RSS. Minor: dead `neutral_weight`,
+  cluster feature lacks train-time self-exclusion, ARCHITECTURE 3.3 C=0.1 vs
+  live 4.0. Dedup/recency decay re-proposed but already rejected. No code,
+  runtime or trial change. `docs/evaluations/ml-quality-review-20261016/REPORT.md`.
 - TUI "Could not reach server" (2026-10-16 01:00 UTC): Tailscale Funnel's
   public ingress was dropping TLS while the server and tailnet path were
   fine. It recovered a few minutes after a VPS `tailscaled` restart; no
@@ -541,6 +550,9 @@ startup provider warming was authorized.
 ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
+- ML quality (after 2026-11-05, research still paused): candidate order from
+  the review: side-vector fallback fix, exposure-aware eval gate with
+  spread/novel-up metrics, then Combo and a novelty term. User decides.
 - Reader checks: one ordinary c action on a story with a discussion link,
   then read back live comments_open. Fixture/control checks passed; browser
   opening and production receipt remain unverified. Current Queue mix has
