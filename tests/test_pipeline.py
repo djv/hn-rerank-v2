@@ -229,6 +229,7 @@ def test_config_load_checked_in_config_contains_only_runtime_overrides():
     assert config.model.joined_features == "all"
     assert config.model.linear_blend_enabled is False
     assert config.interleave_user_ids == ()
+    assert config.model.unsure_calibration_since == 1792153125.0
     assert config.model.svm_gamma == 0.03
     assert len(config.rss.feeds) >= 40
 

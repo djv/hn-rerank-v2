@@ -1392,6 +1392,19 @@ class Database:
                 for row in cursor.fetchall()
             ]
 
+    def get_feedback_times(
+        self, user_id: int, since: float = 0.0
+    ) -> dict[int, tuple[Action, float]]:
+        """story_id -> (action, updated_at) for the user's votes last
+        changed at or after *since*."""
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT story_id, action, updated_at FROM feedback "
+                "WHERE user_id = ? AND updated_at >= ?",
+                (user_id, since),
+            ).fetchall()
+        return {int(r[0]): (r[1], float(r[2])) for r in rows}
+
     def get_feedback_stories(
         self, user_id: int, actions: tuple[str, ...]
     ) -> list[Story]:

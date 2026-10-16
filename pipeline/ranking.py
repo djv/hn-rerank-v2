@@ -40,6 +40,7 @@ from .config import (
 from . import linear_blend
 from .interleave import PRODUCTION_ARM, team_draft
 from . import joined_classifier
+from .unsure_calibration import PlattCalibrator, calibrator_for
 from .joined_classifier import JoinedLogistic
 from .model_manifest import ModelManifest, verify_model_dir
 
@@ -1963,6 +1964,24 @@ def get_entropy(r: RankedStory) -> float:
     return ent
 
 
+def unsure_entropy(r: RankedStory, calibrator: PlattCalibrator | None) -> float:
+    """Unsure's ranking key: ``get_entropy`` of the story's probabilities,
+    Platt-calibrated when *calibrator* is given and the three are a finite
+    distribution with down or neutral mass."""
+    if (
+        calibrator is None
+        or r.prob_down is None
+        or r.prob_neutral is None
+        or r.prob_up is None
+    ):
+        return get_entropy(r)
+    probs = calibrator.calibrated(r.prob_down, r.prob_neutral, r.prob_up)
+    if probs is None:
+        return get_entropy(r)
+    down, neutral, up = probs
+    return get_entropy(replace(r, prob_down=down, prob_neutral=neutral, prob_up=up))
+
+
 def hn_gravity(points: int, posted: int, now: float, time_scale: float = 1.0) -> float:
     """HN front-page gravity, points / (age_hours / time_scale + 2) ** 1.8;
     ``time_scale`` 1 is HN's own and the tier-1 blend of ``_score_and_rank``,
@@ -2130,13 +2149,16 @@ class ExploreContext:
     ``interest_centers``); ``interest_sizes`` counts the upvotes in each. No
     interests (empty ``interest_sizes``), no Interest picks. ``has_upvotes``
     is whether the user has any up-vote embeddings; when False,
-    ``closest_up`` stays None so no far card is placed."""
+    ``closest_up`` stays None so no far card is placed. With
+    ``unsure_calibrator``, Unsure ranks by the entropy of calibrated
+    probabilities (``unsure_entropy``); the cards keep their raw ones."""
 
     cand_closest_up: NDArray[np.float32]
     cand_interest: NDArray[np.int64]
     interest_sizes: NDArray[np.int64]
     row_of: Mapping[int, int]
     has_upvotes: bool = True
+    unsure_calibrator: PlattCalibrator | None = None
 
 
 def assemble_window_deck(
@@ -2228,7 +2250,9 @@ def assemble_window_deck(
     ] = []
     if explore is not None:
         ctx = explore
-        entropy = {r.story.id: get_entropy(r) for r in by_score}
+        entropy = {
+            r.story.id: unsure_entropy(r, ctx.unsure_calibrator) for r in by_score
+        }
         explore_passes = [
             (
                 lambda r: entropy[r.story.id],
@@ -2783,6 +2807,20 @@ def assemble_ranked_deck(
             cand_interest = np.zeros(len(candidates), dtype=np.int64)
             interest_sizes = np.zeros(0, dtype=np.int64)
 
+    calibrator = None
+    if user_id is not None:
+        with trace.stage("unsure_calibration"):
+            calibrator = calibrator_for(
+                db,
+                user_id,
+                config.model.unsure_calibration_since,
+                config.model.unsure_calibration_min_cards,
+                config.model.unsure_calibration_days,
+            )
+        trace.set_label(
+            "unsure_calibration", f"n{calibrator.n}" if calibrator else "off"
+        )
+
     with trace.stage("window_assembly"):
         deck = assemble_window_deck(
             ranked,
@@ -2794,6 +2832,7 @@ def assemble_ranked_deck(
                 interest_sizes=interest_sizes.astype(np.int64),
                 row_of={s.id: idx for idx, s in enumerate(candidates)},
                 has_upvotes=len(up_embs) > 0,
+                unsure_calibrator=calibrator,
             ),
             is_feedback_match=is_feedback_match,
             trace=trace,

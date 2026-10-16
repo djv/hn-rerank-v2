@@ -35,6 +35,10 @@ reddit_source = "arctic_shift"
 # INTERLEAVING.md). Rollback: delete `classifier`, set linear_blend_enabled
 # true and restart.
 classifier = "joined_logistic"
+# Unsure ranks by Platt-calibrated entropy, fit per user on decks served since
+# the single model went live (2026-10-16 12:18:45 UTC); raw entropy until 100
+# served cards have later votes. Rollback: set 0 and restart.
+unsure_calibration_since = 1792153125.0
 svm_c = 4.0
 linear_blend_enabled = false
 svm_precomputed_enabled = true
