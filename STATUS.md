@@ -38,11 +38,9 @@ Make the feed less same-y without losing hits (Goals above). Discover is
 live in Explore. The far card (Recommended's last card) went live
 2026-10-12; read both about 2026-11-02.
 
-Compare shortlist #2 (one joined logistic classifier, all features) and #4
-(same, no metadata) live against production through team-draft
-interleaving on profile 151's Recommended views for 28 days, plus four
-offline follow-ups the user chose (power replay, fit timing,
-metadata-scale middle variant, short-history curve). Keep Reddit stories
+The single joined logistic classifier (shortlist #2, all features) is
+production for every profile since 2026-10-16: the user ended the
+interleaving trial early (day 8) and chose it. Watch it in normal use. Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
@@ -550,9 +548,9 @@ flowing after Reddit RSS ends on November 13 (Arctic Shift).
 ## Blocker
 None for the Queue mix: reviewed findings and standalone CI failure are fixed.
 Normal-use rendering and subjective assessment remain observations, not blockers.
-Final trial reproducibility requires an endpoint snapshot before later
-vote edits/undo; capture is documented but not scheduled. Reporting code
-and verification are complete. No trial winner is established.
+The trial ended early by the user's choice; its endpoint snapshot and
+report were captured before the switch (INTERLEAVING.md "Early endpoint").
+No statistical winner; the switch is the user's call.
 Evidence-based continuation remains a reviewed proposal, not an authorized
 design: outcome/exposure unit, useful effect, dependence treatment,
 stopping/cap and harm/diversity guardrails are unresolved.
@@ -667,11 +665,8 @@ ranking research remains paused and production trial configuration unchanged.
 - Arctic Shift: check `reddit_refresh_arctic` lines over the next days and
   a Reddit card's tldr-detail (live tap) with archive comments. Rollback:
   delete `reddit_source` in config.toml and restart (RSS until Nov 13).
-- Final analysis at T0 + 28 days, 2026-11-05 04:07 UTC (Nov 4 23:07 ET):
-  freeze a SQLite-consistent endpoint copy before further voting; analyze
-  that copy with the recorded calibration exclusion. Exact commands and
-  capture limits are in INTERLEAVING.md's reporting addendum. No snapshot
-  job is scheduled by this change. Weekly descriptive reports and separate
-  latency safety checks continue; the report now provides down-safety flags.
+- Trial closed 2026-10-16 (early endpoint in INTERLEAVING.md); no 11-05
+  analysis remains. Items that waited for 11-05 (Muse fallback deploy, rank
+  cap replay) no longer wait on the trial, only on the user's OK.
 - Carried over: 1m Popular age-mix check, real-terminal tint/footer check,
   October 21 Gemma 2 future-vote recheck (/home/d/TASKS.md).

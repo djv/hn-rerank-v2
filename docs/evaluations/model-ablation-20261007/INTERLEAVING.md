@@ -248,3 +248,27 @@ optimistic replay's seven-day row (low power). State observed sample size
 and uncertainty at the endpoint; do not extend the trial or change votes
 to reach a desired result. The saved 61-credit snapshot includes the one
 now-confirmed pre-T0 production credit and is historical, not corrected.
+
+## Early endpoint — 2026-10-16 (user decision)
+
+The user ended the trial on day 8.3 of 28 to switch production to the single
+model (`joined_all`) for every profile. This is the "no significant
+difference, adopting the simpler model is the user's call" outcome, taken
+early; it is not a statistical win.
+
+- Snapshot: SQLite `.backup` of the live DB, captured 2026-10-16
+  12:15:44-12:15:49 UTC (`1792152944.25`), before the config switch, in VPS
+  `/home/dev/hn-rewrite/analysis/trial-early-20261016/` (`endpoint.db`,
+  SHA-256 in `endpoint.sha256`, `report.json`). Latest profile-151 vote in
+  it: `1792120285.07`. The VPS rebooted once mid-trial (2026-10-16 02:04 UTC).
+- Command: the addendum's, with `--until 1792152944.25` and the calibration
+  exclusion.
+- `joined_all`: 61 credits vs production 72; up rate 0.426 vs 0.361
+  (difference +0.065, 95% Newcombe [-0.099, +0.226], p = 0.44); down rate
+  0.082 vs 0.194 (one-sided harm p = 0.97); per-deck signs 9 wins, 11 losses
+  (p = 0.82).
+- `joined_no_metadata`: 63 credits; up 0.381 (+0.020, [-0.139, +0.180],
+  p = 0.81); down 0.286 vs 0.194 (harm p = 0.11, no safety stop); decks 13/13.
+- Deployed `f86d5de` (`classifier = "joined_logistic"`, blend off,
+  interleaving off), restarted 12:18:45 UTC; rollback tag
+  `deploy-pre-single-model-20261016` on the VPS.

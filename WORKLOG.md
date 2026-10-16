@@ -1,5 +1,21 @@
 # Worklog: hn-rewrite
 
+## 2026-10-16 — Single model in production, trial ended early
+
+The user ended the interleaving trial on day 8 and chose the joined logistic
+classifier (shortlist #2, all features) for every profile. An early endpoint
+snapshot and report were taken first (INTERLEAVING.md "Early endpoint":
+up 0.43 vs 0.36, CI -0.10..+0.23; down 0.08 vs 0.19; not significant).
+`config.toml` now sets `classifier = "joined_logistic"`,
+`linear_blend_enabled = false` and no `interleave_user_ids`;
+`tests/test_pipeline.py` checks it. Checks: full suite 1,427 passed/18
+skipped, ruff and ty clean (no new diagnostics). Deployed `f86d5de` and
+restarted 12:18:45 UTC: dashboard 200, first profile-151 rerank
+`interleave=off`, `svm_fit_ms` 4,754, cold `rank_total_ms` 41,511, journal
+clean apart from usual feed retries. Import AI gate: NOT_APPLICABLE (issue
+476 already voted). Rollback: VPS tag `deploy-pre-single-model-20261016`,
+or restore `linear_blend_enabled = true`, drop `classifier`, restart.
+
 ## 2026-10-14 — Readable inactive pane
 
 With the ANSI themes, tmux's light-mode fade (`#585858`, theme-mode's "Dim
