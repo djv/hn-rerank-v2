@@ -1,6 +1,6 @@
 # HN Rerank status
 
-Updated 2026-10-14. Previous handoff (one-classifier research, Why-this-story
+Updated 2026-10-16. Previous handoff (one-classifier research, Why-this-story
 preview, pending Reddit/Gemma items):
 [before interleaving](docs/status-archive/before-interleaving-20261007.md).
 
@@ -44,6 +44,10 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- TUI "Could not reach server" (2026-10-16 01:00 UTC): Tailscale Funnel's
+  public ingress was dropping TLS while the server and tailnet path were
+  fine. It recovered a few minutes after a VPS `tailscaled` restart; no
+  code or config changed. Evidence: `FINDINGS.md`, "Funnel ingress outage".
 - Codebase review (user `rv`, continued with Go Muse Spark via pi, 2026-10-14):
   verified token-reservation leakage after LLM errors (`llm_limiter.py:99-108`),
   side-vector norm shrinkage for uncovered stories when side embeddings are

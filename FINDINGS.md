@@ -1,5 +1,31 @@
 # HN Rerank findings
 
+## TUI "Could not reach server" — Funnel ingress outage — 2026-10-16 01:00 UTC
+
+- Symptom: the TUI showed "Could not reach server" for its default
+  `https://ubuntu-8gb-nbg1-1.tailca4726.ts.net:8443/hn/`.
+- Server healthy: `hn_rewrite.service` active, loopback 8766 returned 200,
+  and the same URL returned 200 from the VPS and from the laptop with
+  `curl --resolve HOST:8443:100.110.220.44` (tailnet path).
+- Failing hop: Tailscale Funnel's public ingress. The laptop has
+  `accept-dns=false`, so the hostname resolves to the public Funnel relays
+  (185.40.234.55/.75/.198, 2a00:dd80:20::55/::873/::a8e). Each accepted TCP
+  and then dropped after the TLS ClientHello (`SSL_ERROR_SYSCALL`), from the
+  laptop (via Proton) and from the VPS itself (Hetzner egress), so it was not
+  Wi-Fi adblocking or Proton. tailscaled on the VPS logged no ingress
+  connections; node caps still included `funnel-ports?ports=443,8443,10000`;
+  status.tailscale.com said all systems operational.
+- Tried: Funnel off and on for 8443 (`sudo tailscale serve/funnel --bg
+  --https=8443 http://127.0.0.1:8000`; serve JSON identical afterwards), then
+  `systemctl restart tailscaled` on the VPS (01:12:37 UTC). Neither fixed it
+  immediately. A few minutes later the public path returned 200 over IPv4
+  and IPv6 and the user saw the TUI working. Whether the restart helped
+  is unknown.
+- Quick check next time: `curl -4/-6 https://HOST:8443/hn/` versus
+  `curl --resolve HOST:8443:100.110.220.44 ...`. If only the public path
+  fails, it is Funnel; a laptop `/etc/hosts` entry for the tailnet IP is a
+  workaround the user can approve (declined this time).
+
 ## Codebase review — server, ranking, clients — 2026-10-14
 
 User requested a broad review of server, logic, ranking, clients, and a
