@@ -1,0 +1,36 @@
+Profile 151: 4430 votes, 4430 with stored embeddings (0 skipped), up=951 neutral=1611 down=1868
+
+Near-duplicate pairs (cosine on stored embeddings):
+   cut  pairs conflict up-down up-neut down-neut   same
+  0.90     86    0.419       1      22        13     50
+  0.95      2    0.500       0       1         0      1
+
+Same normalized URL: 8 pairs over 8 groups, conflict share 0.250
+
+Conflict share by vote time gap (pairs >= 0.90):
+   gap  pairs conflict
+   <1d     26    0.346
+  1-7d     22    0.409
+ 7-30d     23    0.522
+  >30d     15    0.400
+
+LOO kNN agreement (neighbour = other up/down votes, score = up-share):
+  k    AUC  mean up-share | true up true down
+  1  0.778                    0.791     0.235
+  5  0.872                    0.744     0.256
+ 15  0.885                    0.703     0.281
+
+Production day-forward, last 30d: 28 days, scored 1647 (up=435 down=1212), up-vs-down AUC 0.878
+Noise-ceiling read (same 30d votes, neighbours still all votes):
+  kNN k=1 AUC 0.772 vs production 0.878
+  kNN k=5 AUC 0.866 vs production 0.878
+  kNN k=15 AUC 0.883 vs production 0.878
+
+Drift over consecutive 30d periods (k=5 up-share AUC):
+period from    n  up down within  cross
+ 2026-07-01  602 214  388  0.892  0.897
+ 2026-07-31  343 181  162  0.849  0.868
+ 2026-08-30  713 284  429  0.834  0.856
+ 2026-09-29 1161 272  889  0.858  0.824
+
+Wrote aggregates + 36 conflicting pair IDs to /home/dev/hnx-20261016/e6.json

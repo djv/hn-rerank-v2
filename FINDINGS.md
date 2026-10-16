@@ -4509,3 +4509,46 @@ final VPS load 0.83, available RAM 4.6 GiB. Report and structured grades:
 - Re-proposed but already rejected: training URL dedup (2026-09-22
   confirmation), recency decay. Unverified single-run claims are listed in the
   report. Report and raw runs: `docs/evaluations/ml-quality-review-20261016/`.
+
+## Novelty term and side zero-fill, exploratory — 2026-10-16
+
+- User asked for exploratory work with Muse workers. Muse wrote
+  `novelty-replay.py` and `side-zero-fill.py` (code-only context); the agent
+  reviewed them and ran them read-only on the VPS DB (nice 19, one thread).
+  Private per-story outputs are in VPS `/home/dev/hnx-20261016/`.
+- Side zero-fill (profile 151, pool 10,743): a hidden story loses about 15
+  percentile points; renorm/kNN fallbacks recover only 0.8/2.4. Uncovered: 182
+  stories, all archive >3 d; no candidate was younger than 1 h, and all under
+  3 d were covered. Low priority; the 2026-10-14 review's freshness framing is
+  not supported at this snapshot.
+- Novelty replay 09-28..10-16 (2,179 first-shown cards, 19 days): λ 0.10-0.15
+  on rank percentiles gives top-12/day ups +0.21/+0.26, downs -0.05/+0.05, novel
+  ups +0.16/+0.26, diversity +0.02/+0.04 (last two CIs exclude 0). It beats a
+  within-day shuffled placebo. Recommended-only: AUC up/down 0.769 → 0.783,
+  top-12 novel +0.05/day. The replay is exposure-limited. Report:
+  `docs/evaluations/novelty-sidefill-20261016/RESULT.md`.
+- The VPS rebooted 2026-10-16 02:04 UTC (kernel 6.8.0-147); `hn_rewrite.service`
+  came back active. This restarted the server during the trial without an agent action.
+
+## Side-vector removal and exploratory round 2 — 2026-10-16
+
+- Side-vector removal A/B (user: "can we do it now"): `eval_ranker_variants.py`
+  production vs `side_embedding_enabled=false`, holdout after 2026-10-02,
+  8 blocks. AUC up vs rest 0.791 vs 0.776, NDCG@12 0.474 vs 0.405; removal
+  wins 2/8 (impressions) and 3/8 (judged-only) blocks. Side vectors stay.
+  `docs/evaluations/novelty-sidefill-20261016/side-ab-output.txt`.
+- Interim trial read (`interleave_report.py`, T0 2026-10-08 04:07 UTC):
+  196 credits; joined_all up 0.43 vs production 0.36 (CI -0.10..+0.23),
+  down 0.08 vs 0.19; no safety stop. Endpoint capture still unscheduled.
+- Round 2 (four Muse writers, Codex writer + four Codex static reviews, all
+  "RUN AFTER FIXES"; the agent fixed or checked each High item):
+  E3 sameness trend: Recommended weekly max-similarity 0.79/0.74/0.77/0.76,
+  user's novel ups 1% to 12.5%. E4: Combo ups 4.47 vs 4.47/day, novel ups
+  0.26 to 0.53; novelty term alone +0.05 ups in Recommended. E5 (after
+  fixes): no under-shown cluster; three over-shown misses, two large ones
+  mostly via Popular. E6: 86 near-duplicate pairs, one up-vs-down conflict;
+  retrospective LOO kNN AUC 0.885; the script's production comparison was
+  invalid (single-day pools) and is withdrawn. E7: raw up/down ECE 0.142;
+  day-forward Platt 0.070, log loss 0.478 to 0.390, Unsure top-10 up rate
+  0.19 to 0.29 (Jaccard 0.23 vs raw). Report:
+  `docs/evaluations/feed-explore-20261016/RESULT.md`.

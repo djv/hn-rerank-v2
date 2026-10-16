@@ -1,0 +1,25 @@
+Static review only; no script execution, database access, or edits.
+
+1. **High — Own-vote leakage.** [revote/sameness-trend.py:128](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:128) retains votes within one second before showing; [line 165](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:165) then includes that story among earlier ups, giving it self-similarity ≈1. This tolerance matches `revote/short-window-scores.py:64`, but becomes leakage here. **Fix:** pass the query story ID and explicitly exclude it from neighbours.
+
+2. **High — Output can overwrite the live DB or disclose IDs to stdout.** [revote/sameness-trend.py:343](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:343) opens arbitrary OUT with `"w"` after closing SQLite. OUT pointing to the DB—or a symlink/hardlink to it—truncates it; `/dev/stdout` prints per-story IDs. **Fix:** exclusively create a new regular private JSON file, with restrictive permissions; reject existing files and special output targets.
+
+3. **Medium — Embedding selection differs from serving.** [revote/sameness-trend.py:136](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:136) chooses the globally most-common model and ignores text hashes. Production selects the configured model and matching content hashes (`pipeline/ranking.py:921–932`; `database.py:1127`). During a model transition this can measure an older embedding space and misleading coverage. **Fix:** use `Config.embedding_model_version`, validate hashes, and count stale vectors as unavailable.
+
+4. **Medium — Malformed embeddings can crash the entire report.** [revote/sameness-trend.py:148](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:148) checks only norm >0: malformed byte lengths fail decoding, inconsistent dimensions fail stacking/dot products, and infinite entries normalize to NaN and fail KMeans. Production/eval explicitly check dimensions and finiteness (`database.py:1081`; `scripts/eval_ranker_variants.py:150–152`). **Fix:** validate byte length, dimension, finite entries and finite positive norm; skip/count invalid vectors without printing IDs.
+
+5. **Medium — Sparse-data handling violates “skip but count.”** [revote/sameness-trend.py:139](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:139) and [line 170](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:170) abort with no embeddings or fewer than two pool vectors, including an all-prevoted pool. **Fix:** retain outcome rows, use null similarities/clusters where unavailable, support one-vector clustering, and write an empty report for an empty pool.
+
+6. **Medium — Offset-aware SINCE is parsed incorrectly.** [revote/sameness-trend.py:42](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:42) replaces an existing timezone rather than converting it, shifting the pool boundary for inputs such as `2026-10-01T00:00:00-04:00`. **Fix:** attach UTC only to naive inputs; preserve/convert aware timestamps.
+
+7. **Medium — Ordinary sparse/constant trends produce invalid JSON.** [revote/sameness-trend.py:73](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:73) returns NaN; [line 343](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:343) emits literal `NaN`, rejected by strict JSON readers. Empty views routinely trigger this. **Fix:** represent undefined correlations as null and serialize with `allow_nan=False`.
+
+8. **Medium — Live reads lack a consistent snapshot.** [revote/sameness-trend.py:100](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:100) performs separate impression, feedback and embedding reads without an explicit transaction. Concurrent voting/embedding replacement can mix states across queries/chunks. **Fix:** begin one read transaction before the first SELECT and retain it through all fetches.
+
+9. **Medium — Avoidable VPS contention risk.** [revote/sameness-trend.py:165](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:165) repeatedly scans float64 reference prefixes for shown stories and again for upvotes ([line 289](/tmp/hnx2-20261016/e3/revote/sameness-trend.py:289)). At 10k stories/4.5k ups, the upper bound is roughly 55 million 384-dimensional comparisons, with no BLAS/OpenMP thread cap. **Fix:** use bounded batched float32 products with timestamp/self masks, and cap numerical-library threads to the VPS budget. Runtime remains unmeasured.
+
+Checks without findings: Wilson formula (`:54–62`), bucket boundaries (`:50–51`), tied Spearman ranks (`:65–68`) and pairwise diagonal exclusion (`:92`) are correct. No bootstrap, AUC, or day-forward training loop exists. Strict timestamp exclusion otherwise works; whole-pool clustering is explicitly required and descriptive. Normal SQL is SELECT-only, and normal stdout contains aggregates without story titles/IDs.
+
+Interpretation caveat: expanding the earlier-up reference set (`:164`) can increase max similarity even under unchanged tastes. Report reference-set sizes and this confound before interpreting the trend as narrowing.
+
+**Verdict: RUN AFTER FIXES — self-exclusion, safe output, embedding provenance/validation, sparse-data handling, timezone parsing, finite JSON, snapshot consistency, and bounded compute.**

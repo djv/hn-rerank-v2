@@ -1,0 +1,8 @@
+TASK E6: revote/label-noise.py — "how noisy are the user's labels, and how close is the model to a plausible ceiling?" No production retraining except as stated.
+
+CLI: `uv run python revote/label-noise.py USER OUT.json`.
+- Votes: the user's feedback with labels up/down/neutral (database.py label mapping), REVOTE window excluded, stored embeddings only (count skips).
+- Near-duplicate pairs: all pairs of voted stories with cosine >= 0.90 and >= 0.95 (stored embeddings; use matrix products in chunks). Report counts, and the share of pairs with conflicting labels (up vs down; up vs neutral; down vs neutral), plus same-URL pairs (normalised with dedup.normalize_url) and their conflict share. Also how conflict share depends on the time gap between the two votes (<1 day, 1-7 days, 7-30, >30).
+- Leave-one-out kNN agreement: for each up or down vote, the label distribution of its k=1,5,15 nearest other votes (cosine); AUC (up vs down) of the LOO kNN up-share score. This is a crude noise-ceiling proxy; compare against the production model's up-vs-down AUC computed day-forward on the last 30 days of votes (reuse short-window-scores.py / novelty-replay.py day-forward pattern: train `_production_scores` on votes before each day, score that day's voted stories).
+- Temporal drift: split votes into consecutive 30-day periods; for each, LOO kNN AUC within the period vs using only votes from other periods as neighbours (does older history predict newer labels as well as recent history?).
+- Print compact tables; OUT.json gets aggregates plus the near-duplicate conflicting pairs' story IDs (private).

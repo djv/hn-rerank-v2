@@ -1,0 +1,64 @@
+Coverage: {'feedback_n': 4459, 'revote_excluded': 29, 'eligible_votes': 1764, 'vote_days': 19, 'known_first_impressions': 2659}
+2026-09-28: train=2666 voted=12 first_shown=37 cal_history=0
+2026-09-29: skipped 3 candidates without a current stored vector
+2026-09-29: train=2678 voted=302 first_shown=429 cal_history=12
+2026-09-30: train=2980 voted=104 first_shown=150 cal_history=314
+2026-10-01: train=3084 voted=49 first_shown=54 cal_history=418
+2026-10-02: train=3133 voted=190 first_shown=229 cal_history=467
+2026-10-03: train=3323 voted=59 first_shown=66 cal_history=657
+2026-10-04: train=3382 voted=149 first_shown=179 cal_history=716
+2026-10-05: train=3531 voted=82 first_shown=124 cal_history=865
+2026-10-06: train=3613 voted=158 first_shown=167 cal_history=947
+2026-10-07: train=3771 voted=60 first_shown=81 cal_history=1105
+2026-10-08: train=3831 voted=78 first_shown=89 cal_history=1165
+2026-10-09: train=3909 voted=57 first_shown=63 cal_history=1243
+2026-10-10: train=3966 voted=43 first_shown=49 cal_history=1300
+2026-10-11: train=4009 voted=33 first_shown=38 cal_history=1343
+2026-10-12: train=4042 voted=42 first_shown=50 cal_history=1376
+2026-10-13: train=4084 voted=118 first_shown=130 cal_history=1418
+2026-10-14: train=4202 voted=106 first_shown=97 cal_history=1536
+2026-10-15: train=4308 voted=106 first_shown=120 cal_history=1642
+2026-10-16: train=4414 voted=16 first_shown=25 cal_history=1748
+raw          n= 1764 ECE=0.1314 LL=0.9829 Brier=0.5842 delta={'ece': 0.0, 'log_loss': 0.0, 'brier': 0.0}
+  class ECE: down=0.1646 neutral=0.1068 up=0.1227
+  up/down n=1242 ECE=0.1420 LL=0.4781 Brier=0.1515 delta={'ece': 0.0, 'log_loss': 0.0, 'brier': 0.0}
+  equal-count bin: down pred/obs/n | neutral pred/obs/n | up pred/obs/n | up/down pred/obs/n
+   1 0.057/0.056/177 | 0.201/0.164/177 | 0.057/0.011/177 | 0.073/0.008/125
+   2 0.060/0.158/177 | 0.220/0.220/177 | 0.059/0.028/177 | 0.075/0.000/125
+   3 0.064/0.299/177 | 0.228/0.254/177 | 0.060/0.023/177 | 0.077/0.024/124
+   4 0.069/0.418/177 | 0.233/0.254/177 | 0.062/0.006/177 | 0.079/0.040/124
+   5 0.183/0.540/176 | 0.238/0.273/176 | 0.066/0.080/176 | 0.083/0.008/124
+   6 0.508/0.642/176 | 0.243/0.335/176 | 0.119/0.165/176 | 0.159/0.169/124
+   7 0.696/0.744/176 | 0.249/0.341/176 | 0.231/0.227/176 | 0.478/0.258/124
+   8 0.707/0.835/176 | 0.456/0.295/176 | 0.652/0.250/176 | 0.825/0.355/124
+   9 0.716/0.841/176 | 0.702/0.409/176 | 0.702/0.364/176 | 0.918/0.524/124
+  10 0.732/0.903/176 | 0.728/0.415/176 | 0.717/0.460/176 | 0.925/0.903/124
+  entropy quintile: n / mean bits / down neutral up
+  Q1  353 1.048 0.674 0.210 0.116
+  Q2  353 1.074 0.555 0.269 0.176
+  Q3  353 1.090 0.484 0.334 0.181
+  Q4  353 1.107 0.473 0.351 0.176
+  Q5  352 1.153 0.528 0.315 0.156
+temperature  n= 1450 ECE=0.1299 LL=0.9413 Brier=0.5630 delta={'ece': 0.000628413544577211, 'log_loss': -0.04575080642970497, 'brier': -0.023912380713284276}
+  class ECE: down=0.1815 neutral=0.0803 up=0.1280
+  up/down n=1004 ECE=0.1695 LL=0.4673 Brier=0.1486 delta={'ece': 0.027045103139194865, 'log_loss': -0.024106536604715068, 'brier': -0.007469998220477558}
+  entropy quintile: n / mean bits / down neutral up
+  Q1  290 1.311 0.683 0.231 0.086
+  Q2  290 1.328 0.555 0.290 0.155
+  Q3  290 1.337 0.493 0.331 0.176
+  Q4  290 1.347 0.493 0.314 0.193
+  Q5  290 1.377 0.441 0.372 0.186
+platt        n= 1450 ECE=0.1028 LL=0.9105 Brier=0.5403 delta={'ece': -0.026439416030009072, 'log_loss': -0.07656332460933457, 'brier': -0.0466072401168629}
+  class ECE: down=0.1420 neutral=0.1315 up=0.0350
+  up/down n=1004 ECE=0.0701 LL=0.3903 Brier=0.1274 delta={'ece': -0.07226702830350419, 'log_loss': -0.10104522714604464, 'brier': -0.028717295817531713}
+  entropy quintile: n / mean bits / down neutral up
+  Q1  290 0.928 0.479 0.386 0.134
+  Q2  290 1.017 0.772 0.179 0.048
+  Q3  290 1.052 0.752 0.210 0.038
+  Q4  290 1.260 0.372 0.376 0.252
+  Q5  290 1.424 0.290 0.386 0.324
+top10 raw/raw: days=19 mean_J=1.0 picks=190 voted=141 up_rate=0.19148936170212766
+top10 temperature/raw: days=17 mean_J=0.7498775734069851 picks=170 voted=128 up_rate=0.1875
+top10 temperature/temperature: days=17 mean_J=0.7498775734069851 picks=170 voted=126 up_rate=0.19047619047619047
+top10 platt/raw: days=17 mean_J=0.2273681720048502 picks=170 voted=128 up_rate=0.1875
+top10 platt/platt: days=17 mean_J=0.2273681720048502 picks=170 voted=142 up_rate=0.2887323943661972

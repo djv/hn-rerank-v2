@@ -30,7 +30,9 @@ Review the broader server, ranking, telemetry, and client behavior, with a
 read-only VPS health check. No application code or runtime state was changed.
 Next: decide which verified review findings to fix; the live trial report still
 needs an explicit endpoint/capture decision and should use the preserved
-November 5 snapshot protocol below.
+November 5 snapshot protocol below. Side vectors stay: the user's removal test
+(2026-10-16) found their gain holds on votes since 2026-10-02 (AUC +0.015,
+removal wins 2-3 of 8 blocks; novelty-sidefill RESULT.md E2b).
 
 Make the feed less same-y without losing hits (Goals above). Discover is
 live in Explore. The far card (Recommended's last card) went live
@@ -44,6 +46,24 @@ metadata-scale middle variant, short-history curve). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Exploratory round 2 (user request "10x muse ... and 5x codex",
+  2026-10-16; Muse/Codex-written scripts, Codex reviews, read-only VPS runs):
+  Recommended is not narrowing (weekly max-similarity flat) and the user's own
+  ups are widening. Combo keeps ups and downs and doubles novel ups in
+  Recommended; a novelty term on top adds little there. No under-shown topic;
+  the large over-shown misses enter via Popular. Raw class probabilities are
+  miscalibrated (up/down ECE 0.14) and raw entropy does not mark mixed
+  stories; day-forward Platt scaling halves ECE and lifts Unsure's up rate
+  among voted 0.19 to 0.29. Interim trial (196 credits): no safety stop.
+  `docs/evaluations/feed-explore-20261016/RESULT.md`.
+- Exploratory follow-ups (user request, 2026-10-16; Muse-written scripts,
+  read-only VPS runs): side zero-fill costs a hidden story about 15 percentile
+  points, but only 1.7% of the pool is uncovered, all >3-day archive; fresh
+  stories were covered, so it is low priority. A small novelty term (λ around 0.1 on
+  rank percentiles) in a 19-day replay kept hits (ups +0.2, downs flat) and
+  added novel ups and spread across views, beating a shuffled placebo. The gain
+  inside Recommended alone is small, and the replay is exposure-limited.
+  `docs/evaluations/novelty-sidefill-20261016/RESULT.md`.
 - ML quality review (user `rv 30x muse`, 2026-10-16): 30 Spark runs, six
   angles. Verified: side-vector zero-fill still demotes the newest stories
   (`pipeline/side_embeddings.py:179-188`, cheap fix); the scorer's meta
@@ -551,8 +571,11 @@ ranking research remains paused and production trial configuration unchanged.
 
 ## Next step
 - ML quality (after 2026-11-05, research still paused): candidate order from
-  the review: side-vector fallback fix, exposure-aware eval gate with
-  spread/novel-up metrics, then Combo and a novelty term. User decides.
+  the review: exposure-aware eval gate with spread/novel-up metrics, then
+  Combo as an interleaving arm (round 2: a novelty term on top adds little
+  inside Recommended), and Platt-calibrate probabilities before Unsure's
+  entropy (cheap, Explore only). Side-vector fix demoted (archive-only
+  exposure). User decides.
 - Reader checks: one ordinary c action on a story with a discussion link,
   then read back live comments_open. Fixture/control checks passed; browser
   opening and production receipt remain unverified. Current Queue mix has
