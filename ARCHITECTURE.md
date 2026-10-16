@@ -422,7 +422,14 @@ the fully scored pool at one `now` for all five windows:
   A card may have all three badges or none. Popular membership and order
   still depend only on HN gravity, not the badges.
 * **Explore** (personalized decks only; the cold deck has none): Unsure
-  (highest entropy; needs SVM probabilities), Discover (since 2026-10-12,
+  (highest entropy; needs SVM probabilities; since 2026-10-16 the entropy
+  of Platt-calibrated probabilities once the profile has
+  `unsure_calibration_min_cards` (100) labelled cards: a per-profile fit of
+  logit(P(up)) against up-vs-rest from the raw P(up) its `deck_scores`
+  decks held and the votes cast after them, last
+  `unsure_calibration_days` (7) days, decks since
+  `unsure_calibration_since`; `pipeline/unsure_calibration.py`, trace label
+  `unsure_calibration`; scores and stored probabilities stay raw), Discover (since 2026-10-12,
   replaces Novel: the window's highest-scored stories with max cosine
   similarity to the user's up-votes below `DISCOVER_MAX_SIM_UP` (0.60), no
   backfill; Phase 0 basis in FINDINGS "Discover Phase 0") and 🎯 Interest,

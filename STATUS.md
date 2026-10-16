@@ -40,10 +40,24 @@ live in Explore. The far card (Recommended's last card) went live
 
 The single joined logistic classifier (shortlist #2, all features) is
 production for every profile since 2026-10-16: the user ended the
-interleaving trial early (day 8) and chose it. Watch it in normal use. Keep Reddit stories
+interleaving trial early (day 8) and chose it. Watch it in normal use.
+Explore's Unsure now ranks by Platt-calibrated entropy (live 2026-10-16
+13:06 UTC, a37786d); it stays on raw entropy until profile 151 has 100
+labelled cards since the switch (trace label `unsure_calibration`). Keep Reddit stories
 flowing after Reddit RSS ends on November 13 (Arctic Shift).
 
 ## Result
+- Calibrated Unsure (user chose "Calibrated Unsure", "Ship Unsure now",
+  "Review first", 2026-10-16): per-profile Platt fit of logit(P(up)) from
+  `deck_scores` probabilities and later votes (7-day window, decks since
+  the 12:18 UTC switch); only Unsure's entropy uses it. Offline on the
+  joined model: up/down ECE 0.095 to 0.034, Unsure top-10 up rate 0.19 to
+  0.30. A six-run Muse panel's findings are fixed or documented
+  (`docs/evaluations/unsure-calibration-review-20261016/`). Checks: 1,443
+  passed, ruff clean, ty at baseline 34. Deployed a37786d (rollback tag
+  `deploy-pre-unsure-calibration-20261016`); first trace
+  `unsure_calibration=off` in 101 ms (23 votes since the switch), dashboard
+  200, no tracebacks. The calibrated path is verified by tests only, not live.
 - Exploratory round 2 (user request "10x muse ... and 5x codex",
   2026-10-16; Muse/Codex-written scripts, Codex reviews, read-only VPS runs):
   Recommended is not narrowing (weekly max-similarity flat) and the user's own
@@ -556,8 +570,8 @@ design: outcome/exposure unit, useful effect, dependence treatment,
 stopping/cap and harm/diversity guardrails are unresolved.
 None for the far card or warm-start test. The recorded seed's failure is
 fixed with tighter test-only convergence; full backend gates pass.
-The Muse-fallback deploy waits for the trial to end (no restart before
-2026-11-05 without the user's OK). No Codex rollout blocker remains. The TUI medium result review is complete
+The Muse-fallback deploy no longer waits for the trial; it needs only the
+user's OK. No Codex rollout blocker remains. The TUI medium result review is complete
 and its introduced findings corrected.
 Codex Forum source-safety rollout is complete at approved target 794caa4.
 The next ordinary side-vector refresh passed the read-only follow-up. Fresh
@@ -571,9 +585,11 @@ ranking research remains paused and production trial configuration unchanged.
 - ML quality (after 2026-11-05, research still paused): candidate order from
   the review: exposure-aware eval gate with spread/novel-up metrics, then
   Combo as an interleaving arm (round 2: a novelty term on top adds little
-  inside Recommended), and Platt-calibrate probabilities before Unsure's
-  entropy (cheap, Explore only). Side-vector fix demoted (archive-only
-  exposure). User decides.
+  inside Recommended). Platt-calibrated Unsure shipped 2026-10-16.
+  Side-vector fix demoted (archive-only exposure). User decides.
+- Calibrated Unsure: once the trace shows `unsure_calibration=n…`, check
+  the fitted slope stays in (0, 5] over days (the fit sees votes its own
+  Unsure picks drew) and compare Unsure's up and down rates before/after.
 - Reader checks: one ordinary c action on a story with a discussion link,
   then read back live comments_open. Fixture/control checks passed; browser
   opening and production receipt remain unverified. Current Queue mix has

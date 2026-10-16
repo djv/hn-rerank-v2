@@ -1,5 +1,19 @@
 # HN Rerank findings
 
+## Calibration on the joined model and calibrated Unsure — 2026-10-16
+
+Source: E7 rerun on the joined classifier (VPS
+`/home/dev/hnx-20261016/e7-joined.{log,json}`, day-forward, read-only).
+Raw up/down ECE 0.095 (blend 0.142); raw entropy quintiles span 0.52–1.50
+bits and the top one is 47% down / 35% neutral / 18% up, so raw entropy
+does not mark mixed stories. Platt on logit(P(up)): ECE 0.034, log loss
+0.343 to 0.310; Unsure top-10 up rate among voted 0.19 to 0.30 (Jaccard
+with raw picks 0.48). Temperature scaling changed nothing (ECE 0.101).
+Deck parsing cost on the VPS: 427 decks / 134,638 cards in 1.84 s (4.3 ms
+per deck); profile 151 writes about 110 decks a day, so a cold 7-day read
+is about 3 s. Shipped as calibrated Unsure (WORKLOG 2026-10-16); review
+dispositions in docs/evaluations/unsure-calibration-review-20261016/.
+
 ## TUI "Could not reach server" — Funnel ingress outage — 2026-10-16 01:00 UTC
 
 - Symptom: the TUI showed "Could not reach server" for its default

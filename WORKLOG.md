@@ -1,5 +1,25 @@
 # Worklog: hn-rewrite
 
+## 2026-10-16 — Calibrated Unsure
+
+Explore's Unsure ranked by raw entropy, whose top quintile on the joined
+model is mostly downvotes (E7 rerun: 47% down, 18% up). New
+`pipeline/unsure_calibration.py` fits, per profile, a Platt curve of
+logit(P(up)) against up-vs-rest from the probabilities recorded in
+`deck_scores` and votes changed after each story's earliest deck
+(`Database.get_feedback_times`), within 7 days and since
+`unsure_calibration_since` (config.toml: the 12:18:45 UTC switch). Fits
+need 100 cards with at least 10 ups and 10 non-ups, must converge and
+have slope in (0, 5]; otherwise Unsure keeps raw entropy. Deck reads are
+incremental with a 300 s re-read and run outside the cache lock. A
+six-run Muse review shaped these bounds
+(docs/evaluations/unsure-calibration-review-20261016/). Checks: 1,443
+passed/18 skipped, ruff clean, ty at 34 (baseline). Deployed a37786d,
+restarted 13:06:48 UTC: dashboard 200, first trace
+`unsure_calibration=off` (101 ms), no tracebacks. Rollback: VPS tag
+`deploy-pre-unsure-calibration-20261016`, or set
+`unsure_calibration_since = 0` and restart.
+
 ## 2026-10-16 — Single model in production, trial ended early
 
 The user ended the interleaving trial on day 8 and chose the joined logistic
