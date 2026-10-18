@@ -1,4 +1,6 @@
-"""Delete all stories matching a given source, preserving feedback-guarded stories.
+"""Delete all stories matching a given source, keeping voted stories.
+
+Votes are never deleted: a story with any feedback row stays, vote included.
 
 Usage:
     uv run python scripts/remove_source_stories.py --source rss_reddit_gis
@@ -12,13 +14,13 @@ import sys
 from database import Database
 
 
-def main() -> None:
+def main(argv: list[str] | None = None, db: Database | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
     parser.add_argument("--yes", action="store_true", help="Skip confirmation")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    db = Database()
+    db = db or Database()
     with db.conn() as conn:
         total = conn.execute(
             "SELECT COUNT(*) FROM stories WHERE source = ?", (args.source,)
@@ -36,7 +38,7 @@ def main() -> None:
         print(f"  Will be deleted:   {to_delete}")
 
         if protected > 0:
-            print(f"\n  Feedback rows that will become orphaned: {protected}")
+            print(f"\n  Voted stories kept: {protected}")
             rows = conn.execute(
                 "SELECT s.id, s.title, f.action FROM stories s "
                 "JOIN feedback f ON s.id = f.story_id "
@@ -57,11 +59,6 @@ def main() -> None:
                 sys.exit(1)
 
         with conn:
-            conn.execute(
-                "DELETE FROM feedback WHERE story_id IN "
-                "(SELECT id FROM stories WHERE source = ?)",
-                (args.source,),
-            )
             cursor = conn.execute(
                 "DELETE FROM stories WHERE source = ? "
                 "AND id NOT IN (SELECT story_id FROM feedback)",

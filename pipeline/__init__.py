@@ -32,6 +32,8 @@ from .config import (
 
 from .ranking import (
     COMMENT_DEPTH_PENALTY,
+    DISCOVER_MAX_SIM_UP,
+    FAR_ARM,
     draft_recommended,
     EXPLORE_PER_BADGE,
     Embedder,
@@ -87,6 +89,7 @@ from .ranking import (
     in_window,
     join_top_comments,
     mmr_filter,
+    place_far_card,
     rerank_candidates,
     source_category_onehot,
     source_category_stack,
@@ -1057,7 +1060,7 @@ def fast_rerank_for_user(
         return WindowDeck()
 
     # Built once per request and threaded into badge assembly so the
-    # Explore passes (Unsure/Novel/Similar) can skip-and-backfill past
+    # Explore passes (Unsure/Discover/Interest) can skip-and-backfill past
     # candidates that duplicate a story the user already voted on, instead
     # of silently losing badge slots to the downstream `canonicalize_hn_dupes`
     # feedback-match drop (see WORKLOG 2026-07-10).
@@ -1095,6 +1098,12 @@ def fast_rerank_for_user(
     if arm_rankings:
         with trace.stage("interleave_draft"):
             final = draft_recommended(final, arm_rankings, np.random.default_rng())
+    with trace.stage("far_card"):
+        final = place_far_card(
+            final,
+            now=time.time(),
+            horizon=float(config.regen_interval_seconds),
+        )
     return final
 
 

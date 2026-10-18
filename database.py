@@ -145,6 +145,7 @@ class CardScore:
     prob_down: float | None
     window_rank: int | None
     global_rank: int | None
+    arm: str = ""
 
 
 @dataclass(frozen=True)
@@ -213,6 +214,8 @@ class InteractionEvent:
     duration_ms: int | None = None
     # Comma-joined badge kinds of the card as shown ("" when none or unknown).
     badges: str = ""
+    surface: str = ""
+    queue_position: int | None = None
 
 
 class InteractionInsertResult(NamedTuple):
@@ -526,7 +529,11 @@ class Database:
                         duration_ms         INTEGER CHECK(
                             duration_ms IS NULL OR duration_ms >= 0
                         ),
-                        received_at         REAL NOT NULL
+                        received_at         REAL NOT NULL,
+                        surface             TEXT NOT NULL DEFAULT '',
+                        queue_position      INTEGER CHECK(
+                            queue_position IS NULL OR queue_position >= 0
+                        )
                     ) STRICT
                 """)
                 interaction_columns = {
@@ -537,6 +544,16 @@ class Database:
                     conn.execute(
                         "ALTER TABLE interaction_events "
                         "ADD COLUMN badges TEXT NOT NULL DEFAULT ''"
+                    )
+                if "surface" not in interaction_columns:
+                    conn.execute(
+                        "ALTER TABLE interaction_events "
+                        "ADD COLUMN surface TEXT NOT NULL DEFAULT ''"
+                    )
+                if "queue_position" not in interaction_columns:
+                    conn.execute(
+                        "ALTER TABLE interaction_events ADD COLUMN queue_position "
+                        "INTEGER CHECK(queue_position IS NULL OR queue_position >= 0)"
                     )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_interaction_events_user_time "
@@ -1375,6 +1392,19 @@ class Database:
                 for row in cursor.fetchall()
             ]
 
+    def get_feedback_times(
+        self, user_id: int, since: float = 0.0
+    ) -> dict[int, tuple[Action, float]]:
+        """story_id -> (action, updated_at) for the user's votes last
+        changed at or after *since*."""
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT story_id, action, updated_at FROM feedback "
+                "WHERE user_id = ? AND updated_at >= ?",
+                (user_id, since),
+            ).fetchall()
+        return {int(r[0]): (r[1], float(r[2])) for r in rows}
+
     def get_feedback_stories(
         self, user_id: int, actions: tuple[str, ...]
     ) -> list[Story]:
@@ -1737,6 +1767,12 @@ class Database:
                         view = str(c["view"])
                         if view not in _DECK_SCORE_VIEWS:
                             raise ValueError(f"unknown view {view!r}")
+                        if "arm" not in c:
+                            arm = ""
+                        elif not isinstance(c["arm"], str):
+                            raise ValueError(f"window {w!r} card arm must be a string")
+                        else:
+                            arm = c["arm"]
                         cards.append(
                             CardScore(
                                 story_id=_req_int(c["story_id"], "story_id"),
@@ -1751,6 +1787,7 @@ class Database:
                                 prob_down=_opt_float(c["prob_down"], "prob_down"),
                                 window_rank=_opt_int(c["window_rank"], "window_rank"),
                                 global_rank=_opt_int(c["global_rank"], "global_rank"),
+                                arm=arm,
                             )
                         )
                     windows[str(w)] = WindowScores(
@@ -1880,8 +1917,8 @@ class Database:
                             event_id, client_session_id, user_id, story_id,
                             event_type, dashboard_version, position, sort_mode,
                             age_filter, source_filter, ranker_arm, occurred_at,
-                            duration_ms, received_at, badges
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            duration_ms, received_at, badges, surface, queue_position
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(event_id) DO NOTHING
                         """,
                         (
@@ -1900,6 +1937,8 @@ class Database:
                             event.duration_ms,
                             received_at,
                             event.badges,
+                            event.surface,
+                            event.queue_position,
                         ),
                     )
                     inserted += cursor.rowcount

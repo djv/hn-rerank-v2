@@ -10,7 +10,7 @@ import httpx
 import pytest
 from werkzeug.serving import make_server
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, cast
 
 from server import DeckState, Handler, SKELETON_HTML, create_app
@@ -3284,6 +3284,168 @@ def test_flask_test_client_tldr_provider_error_degrades_gracefully(
         assert server.llm_limiter.retry_after_seconds > 0
 
 
+def test_tldr_provider_outage_returns_retry_after(
+    test_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider 503 cools every caller down: the tap gets 503 with a
+    Retry-After, and the next tap fails fast instead of calling the LLM."""
+    import server
+
+    _, db, _, handler, user = test_env
+    db.upsert_story(_zero_count_story(9120))
+    db.upsert_story(_zero_count_story(9121))
+    llm_calls: list[str] = []
+
+    async def unavailable(title: str, **kwargs: Any) -> "server.TldrResult":
+        llm_calls.append(title)
+        # What _call_llm_chat records for the provider's answer.
+        server.llm_limiter.record_response(status=503, headers={})
+        return server.TldrResult(
+            kind="llm_error", error_status=503, error_text="HTTP 503"
+        )
+
+    monkeypatch.setattr(server, "generate_detailed_tldr", unavailable)
+    client = _authed_client(handler, user)
+
+    first = client.post("/api/tldr-detail", json={"story_id": 9120})
+    second = client.post("/api/tldr-detail", json={"story_id": 9121})
+
+    assert first.status_code == 503
+    assert int(first.headers["Retry-After"]) >= 1
+    assert first.get_json()["retry_after"] >= 1
+    assert second.status_code == 429
+    assert "cooling down" in second.get_json()["error"]
+    assert llm_calls == ["Quiet story 9120"]
+
+
+class _BodyResponse:
+    """A 200 whose body is not the JSON object the provider promises."""
+
+    status_code = 200
+    headers: dict[str, str] = {}
+    text = "<html>gateway</html>"
+
+    def json(self) -> Any:
+        raise ValueError("not json")
+
+
+def _fake_llm_client(post: Callable[[], Any], posts: list[int]) -> type:
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(self, *args: object, **kwargs: object) -> Any:
+            posts.append(1)
+            return post()
+
+    return FakeClient
+
+
+def _seed_token_bucket() -> None:
+    import server
+
+    server.llm_limiter.record_response(
+        status=200,
+        headers={
+            "x-ratelimit-limit-tokens": "8000",
+            "x-ratelimit-remaining-tokens": "6000",
+        },
+    )
+
+
+@pytest.mark.parametrize("call", ["_call_llm_chat", "_call_llm_responses"])
+@pytest.mark.asyncio
+async def test_llm_transport_error_returns_the_reservation(
+    monkeypatch: pytest.MonkeyPatch, call: str
+) -> None:
+    import server
+
+    posts: list[int] = []
+
+    def refuse() -> Any:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", _fake_llm_client(refuse, posts))
+    _seed_token_bucket()
+    res = await getattr(server, call)(
+        api_key="k", base_url="https://example.test", model="m", prompt="p" * 300, max_tokens=1000
+    )
+
+    assert not res.ok and res.status is None
+    assert "transport error" in res.content
+    assert posts == [1]
+    assert server.llm_limiter._tokens == pytest.approx(6000, abs=50)
+
+
+@pytest.mark.asyncio
+async def test_call_llm_chat_non_json_200_is_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import server
+
+    posts: list[int] = []
+    monkeypatch.setattr(
+        server.httpx, "AsyncClient", _fake_llm_client(_BodyResponse, posts)
+    )
+    res = await server._call_llm_chat(
+        api_key="k", base_url="https://example.test", model="m", prompt="p", max_tokens=10
+    )
+
+    assert not res.ok and res.status is None
+    assert res.content == "Malformed LLM response."
+    assert posts == [1]
+
+
+@pytest.mark.asyncio
+async def test_call_llm_chat_retries_unavailable_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import server
+
+    posts: list[int] = []
+
+    class FakeResponse:
+        status_code = 503
+        headers: dict[str, str] = {}
+        text = "Service unavailable."
+
+        def json(self) -> dict[str, Any]:
+            return {}
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(self, *args: object, **kwargs: object) -> FakeResponse:
+            posts.append(1)
+            return FakeResponse()
+
+    async def allow_acquire(*, estimated_tokens: int = 0) -> bool:
+        return True
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(server.llm_limiter, "acquire", allow_acquire)
+    res = await server._call_llm_chat(
+        api_key="k", base_url="https://example.test", model="m", prompt="p", max_tokens=10
+    )
+
+    assert not res.ok and res.status == 503
+    assert len(posts) == 2
+    assert server.llm_limiter.retry_after_seconds > 0
+
+
 @pytest.mark.parametrize("cacheable", [True, False])
 async def test_prefetch_tldrs_for_ranked_regenerates_stale_beyond_the_view_tops(
     test_env: Any, monkeypatch: pytest.MonkeyPatch, cacheable: bool
@@ -3401,7 +3563,7 @@ async def test_prefetch_tldrs_for_ranked_walks_the_default_window_views(
             "1w": WindowViews(
                 recommended=(top, second),
                 popular=(popular_top, top),
-                explore=(replace(top, is_novel=True),),
+                explore=(replace(top, is_discover=True),),
             ),
             "1d": WindowViews(recommended=(other,)),
         }
@@ -7581,7 +7743,8 @@ def test_warm_deck_scores_logging(
     deck = WindowDeck(
         {
             w: replace(
-                v, explore=tuple(replace(r, is_novel=True) for r in v.recommended[-3:])
+                v,
+                explore=tuple(replace(r, is_discover=True) for r in v.recommended[-3:]),
             )
             for w, v in deck.windows.items()
         }

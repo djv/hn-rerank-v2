@@ -18,10 +18,11 @@ comments links and a "dig deeper" prompt (`HN_RERANK_AGENT` overrides the
 `claude` command; outside tmux the prompt is copied instead); r regenerates
 the selected summary and checks its live points/comments, automatically
 reloading if the discussion outgrew it; ? shows help; q quits. Both q and Ctrl+q
-wait up to five seconds for queued votes and undo requests to finish. If saving
-is still pending or a vote fails during that wait, the reader stays open with a
-warning. Press q again after checking the outcome. New votes and undo are
-disabled during the wait; ambiguous requests are never automatically retried.
+always exit within about three seconds: the first q blocks every key except q
+and shows "Saving N votes… press q again to quit now" while votes finish,
+with telemetry capped at about one second; a second q exits at once. Any vote
+not confirmed is listed after the reader closes ("Vote not saved: …").
+Ambiguous requests are never automatically retried.
 Enter hides the article list and zooms the TLDR pane; Enter or Escape returns
 to the list. Escape also closes help. Use the sort and window selectors (or h/l and d) to change
 filters. Below 100 columns the headline list stacks above the summary.
@@ -52,8 +53,12 @@ can still outrun generation, and changing the time window warms its own targets.
 Selected-story transitions that remain selected for at least one second send
 best-effort impression events to your configured server's existing interaction
 ledger: story ID, zero-based list position, filters, feed version, time and a
-random session ID. Prefetches do not count; failures never block reading.
-This measures selection, not attention or terminal-window visibility. Events
+random session ID. The reader also logs article/comment opens (`o`/`c`) at
+once and dwell intervals per selection, with the same 1 s minimum and a
+90 s idle cap (input idle ends the segment). Prefetches do not count;
+failures never block reading. Dwell also ends when the terminal reports a
+focus loss (in tmux this needs `focus-events on`); without such reports only
+the idle cap bounds it, so it measures selection time, not attention. Events
 are not sent to a separate analytics service and are not retried.
 
 Configuration lives in platformdirs' user config directory (`hn-rerank/profile.json`),
@@ -97,17 +102,24 @@ feed immediately and fetches its latest existing version in the background
 (one request in flight, at most one queued follow-up), keeping the open
 story, its text and scroll usable while waiting.
 Regeneration still respects provider limits and does not guarantee a longer summary.
-Press `s` to cycle Recommended → Popular → Explore → Date; `h` / `l` step to
+Press `s` to cycle Queue → Recommended → Popular → Explore; `h` / `l` step to
 the previous / next sort.
 
 Resize and focus changes preserve reading position. Run the offline preview from
 the repository root with `uv run python -m clients.tui.tests.preview --headless`.
 
-The reader follows the local clock: a light paper theme from 06:00 to 19:59,
-the dark editorial theme otherwise (checked every minute; a theme picked from
-the command palette holds until the next boundary). Unselected headlines are
-dimmed, so the selected row (a lifted band plus the `>` marker) reads first. The
-filter bar and a one-row docked footer share a tint slightly off the page color. The footer carries the current
+The reader follows the local clock: a light theme from 06:00 to 19:59, the dark
+theme otherwise (checked every minute; a theme picked from the command palette
+holds until the next boundary). By default it draws in the terminal's own 16
+ANSI colours and leaves every background at the terminal default, so it follows
+the terminal's palette and tmux's inactive-pane style fades it like any other
+pane. When tmux paints a mid-grey inactive background, the reader switches to
+light text until its pane regains focus (needs tmux `focus-events on`).
+`--truecolor` switches to the editorial truecolor themes, which paint
+their own paper and dark backgrounds. Unselected headlines are dimmed, so the
+selected row (the `>` marker, plus a lifted band in the dark and truecolor
+themes) reads first. In the truecolor themes the filter bar and a one-row docked
+footer share a tint slightly off the page color. The footer carries the current
 filter's counts on the left (`2 shown · +0 ~0 −0`) and context-sensitive keys on
 the right; when both do not fit, the keys shrink step by step down to `? help`,
 then the status is cut with `…`. Failures appear there with a `✗` prefix and replace the counts until
@@ -118,3 +130,43 @@ Empty filters and feed failures get headed notices in the reading pane rather
 than a bare line; the setup form is a bordered card on a dimmed scrim; the
 reading pane caps at 100 columns with a hairline under the headline; votes
 confirm in the status line.
+
+### Queue sort and daily comparison
+
+Queue mixes each window's cards as Recommended → Explore → Recommended → Popular,
+repeating and skipping exhausted sections. Explore is grouped as Discover,
+Unsure (`uncertain`), Interest, and other badge kinds; Popular contributes the
+first five additional stories. Duplicates and unavailable stories are skipped.
+Queue keeps served order within each group and never shuffles. Voting advances
+through the full queue; undo returns a story to its queue slot. Each window's
+queue consists of session-scoped rounds. Each round freezes the current
+mixed Recommended / badge-grouped Explore / five additional Popular composition,
+skipping voted, unavailable, aged-out stories and all ids in earlier rounds.
+When the latest round is exhausted, the current feed builds the next round;
+refreshes never extend an unfinished round. Slots are global across all rounds
+and never shift. Stored card data stays playable when reranking drops a card
+from the served views; fresh feeds update its counts when present. Only a vote,
+unavailability or actual window age removes it (Archive never ages out).
+Switching windows retains rounds; reconnecting or changing profiles clears them.
+An empty next round shows **Caught up for this window**. A later refresh with
+new cards resumes automatically, with `Round N · N cards` in the status line.
+The `s`, `h`, and `l` keys and sort
+tabs/dropdown still reach Recommended, Popular, and Explore.
+
+The startup sort alternates by UTC ordinal day: odd days open Queue, even days
+open Recommended. The choice is made at launch and held across UTC midnight. Analyze actual
+`surface` or the session's assigned default rather than the event's UTC date.
+
+All four reading events (impression, dwell, article open, comments open) carry
+`surface="queue"` and `queue_position` in Queue. `queue_position` is the slot in
+the concatenation of all rounds, including voted and skipped stories.
+`sort_mode` and `position` retain the origin view and that view's served rank,
+excluding client-inserted undo rows. Queue `dashboard_version` is the stored
+`served_version` of the feed that built the round, preserving trial credit by
+(version, window, story id); views events still use the current feed version.
+For Explore cards in Queue, this is the index in the server's Explore order;
+in the Explore view it is the index in the client-shuffled list. Reports must
+split Explore positions by `surface`, treating `surface=''` (old rows) as views.
+Other sorts send `surface="views"` and
+omit `queue_position`. Deploy the server's additive event-field support with
+this client; older servers reject these events (reading remains best effort).

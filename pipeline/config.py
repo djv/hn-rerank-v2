@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import os
 import tomllib
 from dataclasses import dataclass, field, fields, replace
@@ -56,13 +58,22 @@ class ModelConfig:
     # "joined_logistic" (evaluation, 2026-10-07; pipeline/joined_classifier.py)
     # replaces the RBF SVM with one logistic regression over the same rows
     # plus TF-IDF words; it ignores svm_* and needs linear_blend_enabled off.
-    # Live only as an interleaving challenger (Config.interleave_user_ids).
+    # Production in config.toml since 2026-10-16 (the interleaving trial,
+    # Config.interleave_user_ids, ended early by the user's choice).
     classifier: Literal["svm", "joined_logistic"] = "svm"
     joined_features: Literal["all", "no_metadata"] = "all"
     joined_c: float = 4.0
     joined_embedding_weight: float = 16.0
     joined_numeric_scale: float = 0.15811388300841897  # sqrt(0.1 / 4)
     joined_word_scale: float = 1.0
+    # Explore's Unsure ranks by the entropy of Platt-calibrated probabilities
+    # (pipeline/unsure_calibration.py) fit per user on decks recorded at or
+    # after this time (0 = off, raw entropy) and within the last
+    # unsure_calibration_days, once at least unsure_calibration_min_cards
+    # recorded cards have later votes.
+    unsure_calibration_since: float = 0.0
+    unsure_calibration_min_cards: int = 100
+    unsure_calibration_days: float = 7.0
     diversity_threshold: float = 0.75
     knn_k: int = 10
     positive_cluster_k: int = 4
@@ -310,6 +321,18 @@ class Config:
             raise ValueError("warm_pool_size must be >= 1")
         if self.model.svm_precomputed_chunk_size <= 0:
             raise ValueError("svm_precomputed_chunk_size must be positive")
+        if not (
+            math.isfinite(self.model.unsure_calibration_since)
+            and self.model.unsure_calibration_since >= 0
+        ):
+            raise ValueError("unsure_calibration_since must be finite and nonnegative")
+        if not (
+            math.isfinite(self.model.unsure_calibration_days)
+            and self.model.unsure_calibration_days > 0
+        ):
+            raise ValueError("unsure_calibration_days must be finite and positive")
+        if self.model.unsure_calibration_min_cards < 2:
+            raise ValueError("unsure_calibration_min_cards must be at least 2")
         if self.model.classifier == "joined_logistic" and (
             self.model.linear_blend_enabled
         ):

@@ -33,6 +33,7 @@ SCRIPT_MAINS = [
     "benchmark_rank_cold_cache",
     "cap_loss_check",
     "cap_sweep",
+    "check_import_ai_recommended",
     "debug_openvino_divergence",
     "deck_composition_report",
     "drop_dead_tables",

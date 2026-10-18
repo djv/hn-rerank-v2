@@ -5,7 +5,9 @@ import random
 import time
 import unicodedata
 import webbrowser
+from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
@@ -17,7 +19,7 @@ from textual.app import App, ComposeResult
 from textual.binding import BindingType
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.theme import Theme
+from textual.theme import BUILTIN_THEMES, Theme
 from textual.timer import Timer
 from textual.widgets import (
     Button,
@@ -39,12 +41,12 @@ from textual.widgets._select import (
     SelectOverlay,
 )
 from textual.widgets.option_list import Option
-from textual.worker import Worker, WorkerState
+from textual.worker import Worker
 
 from .api import (
     API,
     APIError,
-    Impression,
+    InteractionEvent,
     InvalidProfile,
     Profile,
     TransientError,
@@ -56,6 +58,7 @@ from .api import (
     save_window,
 )
 from .api import Summary as SummaryResult
+from .dwell import Dwell, DwellContext, DwellTracker
 from .models import (
     DEFAULT_WINDOW,
     GRAVITY_TIME_SCALE,
@@ -63,10 +66,26 @@ from .models import (
     WINDOWS,
     Feed,
     FeedStory,
+    terminal_safe,
 )
+from .queue import QueueEntry, build_round, default_sort, in_window
 
 DEFAULT_SERVER = "https://proxy.example.net:8443/hn/"
-QUIT_VOTE_WAIT_SECONDS = 5.0
+# Quit always exits: at most 3 s after the first q, whatever is still saving.
+QUIT_WAIT_SECONDS = 3.0
+# Telemetry quit budget: pending dwell/opens/impressions flush within ~1 s.
+QUIT_TELEMETRY_WAIT_SECONDS = 1.0
+
+
+def _monotonic() -> float:
+    """Monotonic clock for dwell segments (monkeypatched in tests)."""
+    return time.monotonic()
+
+
+def _wall_time() -> float:
+    """Wall clock for interaction occurred_at (monkeypatched in tests)."""
+    return time.time()
+
 
 DARK_PALETTE: dict[str, str] = {
     "bg": "#171717",
@@ -118,9 +137,106 @@ LIGHT_PALETTE: dict[str, str] = {
     "select-fg": "#1F1D1A",
     "overlay": "rgba(60,50,40,0.35)",
 }
+# Text on an accent fill (the focused narrow-layout Select).
+DARK_PALETTE["accent-fg"] = DARK_PALETTE["bg"]
+LIGHT_PALETTE["accent-fg"] = LIGHT_PALETTE["bg"]
+# ANSI palettes use the terminal's own 16 colours (Rich names) and leave every
+# background at the terminal default, so tmux's inactive-pane style and the
+# terminal's light/dark theme reach the reader like any other pane. Grey steps
+# follow the GitHub-style kitty palettes: color7 is lighter than color8 in the
+# dark theme and the reverse in the light one.
+ANSI_DARK_PALETTE: dict[str, str] = {
+    "bg": "default",
+    "fg": "default",
+    "title-dim": "white",
+    "soft": "white",
+    "muted": "bright_black",
+    "faint": "bright_black",
+    "sep": "black",
+    "accent": "yellow",
+    "accent-fg": "black",
+    "link": "blue",
+    "good": "green",
+    "warn": "bright_yellow",
+    "bad": "red",
+    "surface": "default",
+    "panel": "default",
+    "bar": "default",
+    "chrome": "default",
+    "modal": "default",
+    "button-focus": "default",
+    "border": "black",
+    "rule": "black",
+    "select-bg": "black",
+    "select-fg": "bright_white",
+    "overlay": "default",
+}
+ANSI_LIGHT_PALETTE: dict[str, str] = {
+    **ANSI_DARK_PALETTE,
+    "title-dim": "bright_black",
+    "soft": "bright_black",
+    "muted": "white",
+    "faint": "white",
+    "sep": "white",
+    "accent-fg": "bright_white",
+    "border": "white",
+    "rule": "white",
+    # The light palette has no pale grey for a band; the selected row keeps
+    # the page colour and reads by its `>` marker and bold title.
+    "select-bg": "default",
+    "select-fg": "default",
+}
+# While the pane is inactive, tmux paints its `window-style` background under
+# every default-background cell. On a mid grey (theme-mode's fade) the light
+# palette's dark text and the dark palette's greys and hues all but vanish, so
+# the reader switches to light text until it regains focus.
+ANSI_FADED_DARK_PALETTE: dict[str, str] = {
+    **ANSI_DARK_PALETTE,
+    "muted": "white",
+    "faint": "white",
+    "accent": "bright_yellow",
+    "link": "bright_blue",
+    "good": "bright_green",
+    "bad": "bright_red",
+}
+# The light terminal palette's only colour that reads on a mid grey is white,
+# so the faded light theme is monochrome; the `>` marker and bold title still
+# mark the selected row.
+ANSI_FADED_LIGHT_PALETTE: dict[str, str] = {
+    **ANSI_DARK_PALETTE,
+    **dict.fromkeys(
+        (
+            "fg",
+            "title-dim",
+            "soft",
+            "muted",
+            "faint",
+            "accent",
+            "link",
+            "good",
+            "warn",
+            "bad",
+            "select-fg",
+        ),
+        "bright_white",
+    ),
+    "select-bg": "default",
+}
 PALETTES: dict[str, dict[str, str]] = {
     "editorial": DARK_PALETTE,
     "editorial-light": LIGHT_PALETTE,
+    "editorial-ansi": ANSI_DARK_PALETTE,
+    "editorial-ansi-light": ANSI_LIGHT_PALETTE,
+    "editorial-ansi-faded": ANSI_FADED_DARK_PALETTE,
+    "editorial-ansi-light-faded": ANSI_FADED_LIGHT_PALETTE,
+}
+ANSI_THEMES: dict[str, str] = {
+    "editorial": "editorial-ansi",
+    "editorial-light": "editorial-ansi-light",
+}
+FADED_THEMES: dict[str, str] = {
+    "editorial-ansi": "editorial-ansi-faded",
+    "editorial-ansi-light": "editorial-ansi-light-faded",
 }
 # Rich Text styles are baked at render time, so they read the active palette.
 PALETTE: dict[str, str] = dict(DARK_PALETTE)
@@ -131,8 +247,57 @@ def theme_for_hour(hour: int) -> str:
     return "editorial-light" if hour in LIGHT_HOURS else "editorial"
 
 
+def relative_luminance(colour: str) -> float:
+    """WCAG relative luminance of a `#rrggbb` colour."""
+    channels = [int(colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+    r, g, b = (
+        c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels
+    )
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def fades_to_light_text(background: str, *, dark: bool) -> bool:
+    """Whether light text reads better than the palette's own on an inactive
+    pane `background`. Below luminance 0.3 white beats the light palette's grey
+    titles; the dark palette only struggles on mid greys, not near-black."""
+    luminance = relative_luminance(background)
+    return luminance < 0.3 and (not dark or luminance >= 0.04)
+
+
+def tmux_inactive_background() -> str | None:
+    """The `#rrggbb` background tmux paints under this pane while it is
+    inactive, or None outside tmux or when the style sets no hex colour."""
+    import os
+    import re
+    import subprocess
+
+    pane = os.environ.get("TMUX_PANE")
+    if not os.environ.get("TMUX") or not pane:
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", "show-options", "-pAv", "-t", pane, "window-style"],
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"\bbg=(#[0-9a-fA-F]{6})\b", result.stdout)
+    return match.group(1) if match else None
+
+
 def editorial_theme(name: str) -> Theme:
     p = PALETTES[name]
+    ansi = name in ANSI_THEMES.values() or name in FADED_THEMES.values()
+    if ansi:
+        # Textual spells terminal colours `ansi_<rich name>`.
+        p = {key: f"ansi_{value}" for key, value in p.items()}
+    dark = not name.endswith("-light")
+    base = (
+        BUILTIN_THEMES["ansi-dark" if dark else "ansi-light"].variables if ansi else {}
+    )
     return Theme(
         name=name,
         primary=p["muted"],
@@ -142,11 +307,14 @@ def editorial_theme(name: str) -> Theme:
         background=p["bg"],
         surface=p["surface"],
         panel=p["panel"],
+        boost=p["bg"] if ansi else None,
         error=p["bad"],
         success=p["good"],
         warning=p["warn"],
-        dark=p is DARK_PALETTE,
+        dark=dark,
+        ansi=ansi,
         variables={
+            **base,
             "scrollbar": p["border"],
             "scrollbar-hover": p["sep"],
             "scrollbar-active": p["accent"],
@@ -483,6 +651,11 @@ EMPTY_NOTICE = (
     "Try another sort or time window, or press **r** to refresh."
 )
 
+QUEUE_NOTICE = (
+    "# Caught up for this window\n\nTry another sort or time window, "
+    "or press **r** to refresh."
+)
+
 
 def feed_failure_notice(detail: str) -> str:
     return (
@@ -678,8 +851,8 @@ class Reader(App[None]):
     SelectCurrent .arrow { padding: 0 1 0 0; }
     SelectCurrent Static#label { width: auto; }
     Select:focus-within > SelectCurrent { background: $hn-accent; }
-    Select:focus-within Static#label { color: $hn-bg; }
-    Select:focus-within .arrow { color: $hn-bg; }
+    Select:focus-within Static#label { color: $hn-accent-fg; }
+    Select:focus-within .arrow { color: $hn-accent-fg; }
     .narrow #filters { height: 1; }
     Tabs { width: auto; }
     #sort-tabs { width: 45; }
@@ -691,7 +864,7 @@ class Reader(App[None]):
     #panes { height: 1fr; }
     /* Wide layout: list a third, reading pane two thirds. */
     #headlines { width: 1fr; height: 1fr; background: $hn-bg;
-                 border: solid $hn-bg; padding: 0; }
+                 border: blank $hn-bg; padding: 0; }
     #headlines:focus { border: solid $hn-accent; }
     #headlines > .option-list--option { padding: 0 1; }
     #headlines > .option-list--separator { color: $hn-rule; }
@@ -770,8 +943,17 @@ class Reader(App[None]):
         prefetch: int = DEFAULT_PREFETCH,
         prefetch_generate: int = DEFAULT_PREFETCH_GENERATE,
         window_file: Path | None = None,
+        utc_clock: Callable[[], datetime] | None = None,
+        ansi: bool = False,
+        inactive_background: Callable[[], str | None] = tmux_inactive_background,
     ) -> None:
         super().__init__()
+        # Terminal-colour themes; False keeps the truecolor editorial pair.
+        self.ansi_themes = ansi
+        self.inactive_background = inactive_background
+        # The theme to restore on focus while the faded variant shows.
+        self.faded_from: str | None = None
+        self.startup_sort = default_sort(utc_clock() if utc_clock else None)
         # The last window picked opens next time; None (tests) keeps 1w and
         # never writes.
         self.window_file = window_file
@@ -805,6 +987,16 @@ class Reader(App[None]):
         # when the user leaves that view, so each visit gets a fresh order.
         self.explore_orders: dict[str, list[int]] = {}
         self.view_key: str | None = None
+        self.summary_view_key: str | None = None
+        # Each story's slot in the current view's full order (voted and
+        # unavailable stories included): the served rank that impressions
+        # and dwell report, so a vote does not shift later cards' positions.
+        self.view_ranks: dict[int, int] = {}
+        self.queue_origins: dict[int, QueueEntry] = {}
+        # Each shown window keeps its queue for this profile's session.
+        self.queue_snapshots: dict[str, list[QueueEntry]] = {}
+        self.queue_rounds: dict[str, list[list[QueueEntry]]] = {}
+        self.queue_stories: dict[str, dict[int, FeedStory]] = {}
         self.restored: dict[int, FeedStory] = {}
         self.history: list[FeedStory] = []
         # The window and views (sorts) each voted story was listed in, so
@@ -814,9 +1006,23 @@ class Reader(App[None]):
         self.vote_lock = asyncio.Lock()
         self._unconfirmed_votes = 0
         self._last_vote_error: str | None = None
+        # Pending votes by (story_id, revision): (title, action) for the quit
+        # report. Entries are added when submit() starts and removed when it
+        # finishes; failures leave their reason in _vote_errors.
+        self._pending_votes: dict[tuple[int, int], tuple[str, str]] = {}
+        self._vote_errors: dict[tuple[int, int], str] = {}
         self._quit_requested = False
+        # Quit-always-exits state: snapshot at the first q, report for tests,
+        # and a guard so the second q (or the cap) exits exactly once.
+        self.quit_report: list[str] = []
+        self._quit_exited = False
+        self._quit_start: float | None = None
+        self._quit_snapshot: list[tuple[tuple[int, int], str, str]] = []
+        self._quit_votes: tuple[Worker[None], ...] = ()
+        self._quit_events: list[InteractionEvent] = []
         self.selection_serial = 0
         self.interaction_session = str(uuid4())
+        self.dwell_tracker = DwellTracker()
         self.summary_story_id: int | None = None
         self.reading = False
         self.help_open = False
@@ -878,11 +1084,12 @@ class Reader(App[None]):
             yield Tabs(
                 *(Tab(s.title(), id=f"sort-{s}") for s in self.SORT_CYCLE),
                 id="sort-tabs",
+                active=f"sort-{self.startup_sort}",
             )
             yield Static("Sort", classes="filter-caption")
             yield Dropdown(
                 [(s.title(), s) for s in self.SORT_CYCLE],
-                value="recommended",
+                value=self.startup_sort,
                 allow_blank=False,
                 id="sort",
             )
@@ -914,11 +1121,39 @@ class Reader(App[None]):
         """Follow the local clock, but only when the clock's pick changes, so a
         theme chosen from the command palette holds until the next boundary."""
         name = theme_for_hour(time.localtime().tm_hour)
+        if self.ansi_themes:
+            name = ANSI_THEMES[name]
         if name == self.clock_theme:
             return
         self.clock_theme = name
+        faded = self.faded_from is not None
+        self.faded_from = None
         self.theme = name
         PALETTE.update(PALETTES[name])
+        if faded:
+            self.fade(inactive=True)
+
+    def fade(self, *, inactive: bool) -> None:
+        """Show light text while tmux paints its inactive-pane grey under the
+        reader, and restore the previous theme when focus returns."""
+        if not inactive:
+            if self.faded_from is not None:
+                theme, self.faded_from = self.faded_from, None
+                self.theme = theme
+            return
+        faded = FADED_THEMES.get(self.theme)
+        if faded is None or self.faded_from is not None:
+            return
+        background = self.inactive_background()
+        dark = not self.theme.endswith("-light")
+        if background is None or not fades_to_light_text(background, dark=dark):
+            return
+        self.faded_from = self.theme
+        self.theme = faded
+
+    def watch_app_focus(self, focus: bool) -> None:
+        # The reactive also turns True on a key press after a lost focus-in.
+        self.fade(inactive=not focus)
 
     def restyle(self) -> None:
         """Re-render Rich-styled text (headlines, heading, counts) in the
@@ -937,9 +1172,11 @@ class Reader(App[None]):
         self.context_status()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if self._quit_requested:
+            # Quitting: q (and Ctrl+q, same action) always works; every other
+            # key is blocked for ~3 s so nothing else can start while saving.
+            return action == "quit"
         if self.setting_up or isinstance(self.focused, Input):
-            return False
-        if self._quit_requested and action in {"vote", "undo"}:
             return False
         if self._stats_modal_open and action in {
             "vote",
@@ -996,7 +1233,14 @@ class Reader(App[None]):
             return
         counts = self.feed.feedback_counts if self.feed else {}
         line = Text()
-        line.append(f"{len(self.stories)} shown", style=PALETTE["soft"])
+        if self.feed and self.query_one("#sort", Select).value == "queue":
+            rounds = self.queue_rounds.get(self.feed.window, [])
+            line.append(
+                f"Round {len(rounds)} · {len(self.stories)} cards",
+                style=PALETTE["soft"],
+            )
+        else:
+            line.append(f"{len(self.stories)} shown", style=PALETTE["soft"])
         line.append(" · ", style=PALETTE["sep"])
         line.append(f"+{counts.get('up', 0)}", style=PALETTE["good"])
         line.append(" ", style=PALETTE["sep"])
@@ -1056,6 +1300,9 @@ class Reader(App[None]):
         self.workers.cancel_group(self, "refresh")
         self.workers.cancel_group(self, "vote")
         self.workers.cancel_group(self, "impression")
+        self.workers.cancel_group(self, "interaction")
+        # A profile switch drops the open segment unsent.
+        self.dwell_tracker.stop(_monotonic())
         self.push_screen(
             Setup(
                 self.config_path,
@@ -1075,6 +1322,7 @@ class Reader(App[None]):
         self.server = profile.server
         self.api = API(profile.server, profile.token)
         self.interaction_session = str(uuid4())
+        self.dwell_tracker = DwellTracker()
         self.feed = None
         self.feeds.clear()
         self.window_attempts.clear()
@@ -1083,6 +1331,10 @@ class Reader(App[None]):
         self.restored.clear()
         self.history.clear()
         self.vote_views.clear()
+        self.queue_snapshots.clear()
+        self.queue_rounds.clear()
+        self.queue_stories.clear()
+        self.queue_origins.clear()
         self.reset_summaries()
         # Profile-scoped regeneration/stats state must not leak across
         # reconnect: A's declined offer would suppress B's first check
@@ -1140,6 +1392,11 @@ class Reader(App[None]):
 
     def view_order(self, sort: str) -> list[int]:
         """Story order for a sort of the current window as the user sees it."""
+        if sort == "queue":
+            entries = (
+                self.queue_snapshots.get(self.feed.window, []) if self.feed else []
+            )
+            return [entry.story_id for entry in entries]
         order = self.feed.orders.get(sort, []) if self.feed else []
         if sort != "explore" or self.feed is None:
             return order
@@ -1171,21 +1428,76 @@ class Reader(App[None]):
         previous = {s.id: s for s in self.stories}
         sort = str(self.query_one("#sort", Select).value)
         lookup = {story.id: story for story in self.feed.stories} if self.feed else {}
+        expired_restored: set[int] = set()
+        if self.feed is not None:
+            window = self.feed.window
+            now = time.time()
+            # The server already serves only current stories: the age check
+            # applies to cards kept from older decks, not the current feed.
+            served = set(lookup)
+            expired_restored = {
+                sid
+                for sid, story in self.restored.items()
+                if sid not in served and not in_window(story.time, window, now)
+            }
+            lookup = {
+                sid: story
+                for sid, story in lookup.items()
+                if sid not in expired_restored
+            }
+            self.restored = {
+                sid: story
+                for sid, story in self.restored.items()
+                if sid not in expired_restored
+            }
+            lookup = {**self.restored, **lookup}
+            stored = self.queue_stories.setdefault(window, {})
+            stored.update({sid: lookup[sid] for sid in stored if sid in lookup})
+            frozen = {**stored, **lookup}
+            excluded = (
+                self.rated
+                | self.unavailable
+                | expired_restored
+                | {
+                    sid
+                    for sid, story in frozen.items()
+                    if sid not in served and not in_window(story.time, window, now)
+                }
+            )
+            rounds = self.queue_rounds.get(window, [])
+            if not rounds or all(entry.story_id in excluded for entry in rounds[-1]):
+                rounds = build_round(rounds, self.feed, excluded, set(self.restored))
+                self.queue_rounds[window] = rounds
+            entries = [entry for batch in rounds for entry in batch]
+            for entry in entries:
+                if entry.story_id in lookup:
+                    stored[entry.story_id] = lookup[entry.story_id]
+            self.queue_snapshots[window] = entries
+            self.queue_origins = {entry.story_id: entry for entry in entries}
+            if sort == "queue":
+                lookup = {
+                    sid: story for sid, story in stored.items() if sid not in excluded
+                }
+        else:
+            self.queue_origins = {}
         self.view_key = f"{self.selected_window()}:{sort}"
         order = self.view_order(sort)
+        self.view_ranks = {sid: rank for rank, sid in enumerate(order)}
         self.stories = [
             lookup[sid]
             for sid in order
-            if sid not in self.rated and sid not in self.unavailable
+            if sid in lookup and sid not in self.rated and sid not in self.unavailable
         ][:VIEW_LIMIT]
         open_id = self.summary_story_id
         if (
             self.stories
+            and sort != "queue"
             and not explicit
             and open_id is not None
             and open_id not in {s.id for s in self.stories}
             and open_id not in self.rated
             and open_id not in self.unavailable
+            and open_id not in expired_restored
         ):
             carried = lookup.get(open_id, previous.get(open_id))
             if carried is not None:
@@ -1224,8 +1536,9 @@ class Reader(App[None]):
             self.summary_story_id = None
             self.selection_serial += 1
             self.workers.cancel_group(self, "summary")
+            self._stop_dwell()
             self.query_one("#summary", Markdown).update(
-                EMPTY_NOTICE
+                (QUEUE_NOTICE if sort == "queue" else EMPTY_NOTICE)
                 if self.feed is not None
                 else feed_failure_notice(self.last_error)
                 if self.last_error
@@ -1293,29 +1606,167 @@ class Reader(App[None]):
         self._marked_id = current_id
         self.schedule_summary()
 
-    def schedule_summary(self) -> None:
+    def _dwell_ctx(self, story: FeedStory) -> DwellContext | None:
+        """The dwell/impression dimensions for *story* as currently shown."""
+        if self.feed is None or not self.query("#headlines"):
+            return None
+        try:
+            self.stories.index(story)
+        except ValueError:
+            return None
+        position = self.view_ranks.get(story.id)
+        if position is None:
+            # Carried views rows have no position in this version's order.
+            return None
+        sort = str(self.query_one("#sort", Select).value)
+        origin = self.queue_origins.get(story.id) if sort == "queue" else None
+        if sort == "queue" and origin is None:
+            # Only queued entries have a served origin and version.
+            return None
+        return DwellContext(
+            story_id=story.id,
+            position=origin.served_rank if origin else position,
+            dashboard_version=origin.served_version if origin else self.feed.version,
+            sort_mode=origin.origin if origin else sort,
+            surface="queue" if origin else "views",
+            queue_position=position if origin else None,
+            window=self.feed.window,
+            badges=tuple(badge.kind for badge in story.badge_details),
+        )
+
+    def _interaction_event(
+        self,
+        ctx: DwellContext,
+        event_type: str,
+        occurred_at: float,
+        duration_ms: int | None = None,
+    ) -> InteractionEvent:
+        return InteractionEvent(
+            event_id=str(uuid4()),
+            client_session_id=self.interaction_session,
+            story_id=ctx.story_id,
+            dashboard_version=ctx.dashboard_version,
+            position=ctx.position,
+            sort_mode=ctx.sort_mode,
+            window=ctx.window,
+            occurred_at=occurred_at,
+            event_type=event_type,
+            badges=list(ctx.badges),
+            surface=ctx.surface,
+            queue_position=ctx.queue_position,
+            duration_ms=duration_ms,
+        )
+
+    @work(group="interaction", exclusive=False)
+    async def _send_interaction(self, event: InteractionEvent) -> None:
+        api = self.api
+        if api is None:
+            return
+        try:
+            await api.interaction(event)
+        except APIError:
+            # Best effort; telemetry never blocks reading or voting.
+            pass
+
+    def _dwell_event(self, dwell: Dwell) -> InteractionEvent:
+        return self._interaction_event(
+            dwell.ctx, "dwell", _wall_time(), dwell.duration_ms
+        )
+
+    def _send_dwell(self, dwell: Dwell | None) -> None:
+        if dwell is not None:
+            self._send_interaction(self._dwell_event(dwell))
+
+    def _stop_dwell(self) -> None:
+        """End the open dwell segment and send it best effort."""
+        self._send_dwell(self.dwell_tracker.stop(_monotonic()))
+
+    def _touch_dwell(self) -> None:
+        """Record input for the open dwell segment (idle may close it)."""
+        self._send_dwell(self.dwell_tracker.touch(_monotonic()))
+
+    async def _wait_for_interaction_workers(self, timeout: float) -> None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            pending = any(
+                worker.group == "interaction" and not worker.is_finished
+                for worker in self.workers
+            )
+            if not pending:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.05, remaining))
+
+    async def _flush_quit_telemetry(
+        self, events_to_send: list[InteractionEvent]
+    ) -> None:
+        api = self.api
+        if api is not None:
+            for event in events_to_send:
+                try:
+                    await asyncio.wait_for(
+                        api.interaction(event),
+                        timeout=QUIT_TELEMETRY_WAIT_SECONDS,
+                    )
+                except (APIError, TimeoutError):
+                    # Best effort: a failing server changes nothing visible.
+                    pass
+        # In-flight opens/dwells sent just before quitting get a chance
+        # within the same budget; impressions keep their own 1 s delay and
+        # are covered by the pending event above instead.
+        try:
+            await asyncio.wait_for(
+                self._wait_for_interaction_workers(QUIT_TELEMETRY_WAIT_SECONDS),
+                timeout=QUIT_TELEMETRY_WAIT_SECONDS,
+            )
+        except TimeoutError:
+            pass
+
+    async def on_event(self, event: events.Event) -> None:
+        if isinstance(event, (events.Key, events.MouseEvent)):
+            self._touch_dwell()
+        await super().on_event(event)
+
+    def on_app_blur(self, event: events.AppBlur) -> None:
+        self._stop_dwell()
+
+    def on_app_focus(self, event: events.AppFocus) -> None:
+        # Resume without a new impression when a story is selected.
+        if self.help_open or self.setting_up or self.closing:
+            return
+        story = self.selected() if self.query("#headlines") else None
+        if story is None or self.feed is None:
+            return
+        ctx = self._dwell_ctx(story)
+        if ctx is not None:
+            self._send_dwell(self.dwell_tracker.start(ctx, _monotonic()))
+
+    def schedule_summary(self, *, emit_impression: bool = True) -> None:
+        if self._quit_requested:
+            # Quitting: no new dwell segment and no impression; a mouse click
+            # may still move the highlight itself.
+            return
         story = self.selected()
         if self.help_open:
             return
-        if story and story.id != self.summary_story_id:
+        if story and (
+            story.id != self.summary_story_id or self.summary_view_key != self.view_key
+        ):
             self.query_one("#story-heading", Static).update(self.heading(story))
             self.summary_story_id = story.id
+            self.summary_view_key = self.view_key
             self.selection_serial += 1
             if self.feed is not None:
-                self.record_impression(
-                    Impression(
-                        event_id=str(uuid4()),
-                        client_session_id=self.interaction_session,
-                        story_id=story.id,
-                        dashboard_version=self.feed.version,
-                        position=self.stories.index(story),
-                        sort_mode=str(self.query_one("#sort", Select).value),
-                        window=self.feed.window,
-                        occurred_at=time.time(),
-                        badges=[badge.kind for badge in story.badge_details],
-                    ),
-                    self.selection_serial,
-                )
+                ctx = self._dwell_ctx(story)
+                if ctx is not None:
+                    self._send_dwell(self.dwell_tracker.start(ctx, _monotonic()))
+                    if emit_impression:
+                        self.record_impression(
+                            self._interaction_event(ctx, "impression", _wall_time()),
+                            self.selection_serial,
+                        )
             cached = self.summaries.get(story.id)
             if cached is not None:
                 self.query_one("#summary", Markdown).update(cached)
@@ -1326,11 +1777,21 @@ class Reader(App[None]):
             self.query_one("#summary", Markdown).scroll_home(animate=False)
 
     @work(group="impression", exclusive=True)
-    async def record_impression(self, event: Impression, serial: int) -> None:
+    async def record_impression(self, event: InteractionEvent, serial: int) -> None:
         # Only a selected card visible for >=1s counts, not prefetched stories.
         api = self.api
         await asyncio.sleep(1.0)
         selected = self.selected() if self.query("#headlines") else None
+        origin = (
+            self.queue_origins.get(event.story_id) if event.surface == "queue" else None
+        )
+        shown_version = (
+            origin.served_version
+            if origin
+            else self.feed.version
+            if self.feed
+            else None
+        )
         if (
             api is None
             or api is not self.api
@@ -1340,13 +1801,14 @@ class Reader(App[None]):
             or selected is None
             or selected.id != event.story_id
             or self.feed is None
-            or self.feed.version != event.dashboard_version
-            or str(self.query_one("#sort", Select).value) != event.sort_mode
+            or shown_version != event.dashboard_version
+            or str(self.query_one("#sort", Select).value)
+            != ("queue" if event.surface == "queue" else event.sort_mode)
             or self.feed.window != event.window
         ):
             return
         try:
-            await api.impression(event)
+            await api.interaction(event)
         except APIError:
             # Best effort; telemetry must never interrupt reading or voting.
             pass
@@ -1800,9 +2262,14 @@ class Reader(App[None]):
         self.forget_outgrown_summaries(feed)
         self.set_feed(feed)
         self.last_error = None
-        if feed.ready:
-            self.restored.clear()
-        else:
+        # A returned card is server-served even while the next deck is still
+        # ranking. Only missing undo rows are local insertions; excluding a
+        # returned row as restored would compress subsequent Queue ranks.
+        present = {story.id for story in feed.stories}
+        self.restored = {
+            sid: story for sid, story in self.restored.items() if sid not in present
+        }
+        if not feed.ready:
             # Until the reranked deck lands, it may lack undone stories.
             for restored in self.restored.values():
                 self.restore_story(restored)
@@ -1838,6 +2305,11 @@ class Reader(App[None]):
 
     def patch_counts(self, story_id: int, points: int, comments: int | None) -> None:
         """Show the counts a summary reply carried; the feed's may be older."""
+        for stored in self.queue_stories.values():
+            if story_id in stored:
+                stored[story_id] = replace(
+                    stored[story_id], points=points, comments=comments
+                )
         for feed in self.feeds.values():
             for i, item in enumerate(feed.stories):
                 if item.id == story_id:
@@ -1965,7 +2437,12 @@ class Reader(App[None]):
         finally:
             self.window_prefetching = False
 
-    SORT_CYCLE: ClassVar[tuple[str, ...]] = ("recommended", "popular", "explore")
+    SORT_CYCLE: ClassVar[tuple[str, ...]] = (
+        "queue",
+        "recommended",
+        "popular",
+        "explore",
+    )
 
     def action_cycle_window(self, delta: int = 1) -> None:
         """Move the window selector by *delta* steps, wrapping at either end."""
@@ -2223,6 +2700,9 @@ class Reader(App[None]):
         self.apply_vote(story)
         revision = self.vote_revisions.get(story.id, 0) + 1
         self.vote_revisions[story.id] = revision
+        # Record synchronously so a quit snapshot always sees the vote, even
+        # before its worker starts; submit() removes it when done.
+        self._pending_votes[(story.id, revision)] = (story.title, action)
         self.submit(story, action, revision)
 
     def action_undo(self) -> None:
@@ -2233,6 +2713,7 @@ class Reader(App[None]):
             self.apply_undo(story)
             revision = self.vote_revisions.get(story.id, 0) + 1
             self.vote_revisions[story.id] = revision
+            self._pending_votes[(story.id, revision)] = (story.title, "clear")
             self.submit(story, "clear", revision)
 
     def apply_vote(self, story: FeedStory) -> None:
@@ -2243,9 +2724,17 @@ class Reader(App[None]):
         self.restored.pop(story.id, None)
         self.history.append(story)
         if self.feed is not None:
+            views = [
+                key for key, order in self.feed.orders.items() if story.id in order
+            ]
+            origin = self.queue_origins.get(story.id)
+            if origin is not None and self.query_one("#sort", Select).value == "queue":
+                if origin.origin not in views:
+                    views.append(origin.origin)
+                views.append("queue")
             self.vote_views[story.id] = (
                 self.feed.window,
-                [key for key, order in self.feed.orders.items() if story.id in order],
+                views,
             )
         self.rebuild(next_id)
 
@@ -2260,36 +2749,52 @@ class Reader(App[None]):
     @work(group="vote")
     async def submit(self, story: FeedStory, action: str, revision: int) -> None:
         api = self.api
+        key = (story.id, revision)
         if api is None:
+            self._pending_votes.pop(key, None)
             return
-        self.status("Saving vote…")
-        # One at a time, so the server sees votes and undos in the order made.
-        async with self.vote_lock:
-            try:
-                target = await api.vote(story.id, action)
-            except InvalidProfile as exc:
-                self._unconfirmed_votes += 1
-                self._last_vote_error = str(exc)
-                self.setup(str(exc))
-                return
-            except APIError as exc:
-                if api is self.api:
+        self._pending_votes[key] = (story.title, action)
+        try:
+            self.status("Saving vote…")
+            # One at a time, so the server sees votes and undos in the order made.
+            async with self.vote_lock:
+                try:
+                    target = await api.vote(story.id, action)
+                except InvalidProfile as exc:
                     self._unconfirmed_votes += 1
-                    # Never retried: the server may or may not have it.
-                    latest = self.vote_revisions.get(story.id) == revision
-                    if latest:
-                        if action == "clear":
-                            self.apply_vote(story)
-                        else:
-                            self.apply_undo(story)
-                    notice = (
-                        "Vote not confirmed, so the story is back; check before voting again."
-                        if latest
-                        else "Earlier vote not confirmed; your latest choice is still shown."
-                    )
-                    self._last_vote_error = f"{notice} Story {story.id}: {exc}"
-                    self.status(self._last_vote_error, error=True)
-                return
+                    self._last_vote_error = str(exc)
+                    self._vote_errors[key] = str(exc)
+                    self.setup(str(exc))
+                    return
+                except APIError as exc:
+                    self._vote_errors[key] = f"Story {story.id}: {exc}"
+                    if api is self.api:
+                        self._unconfirmed_votes += 1
+                        # Never retried: the server may or may not have it.
+                        latest = self.vote_revisions.get(story.id) == revision
+                        if latest:
+                            if action == "clear":
+                                self.apply_vote(story)
+                            else:
+                                self.apply_undo(story)
+                        notice = (
+                            "Vote not confirmed, so the story is back; check before voting again."
+                            if latest
+                            else "Earlier vote not confirmed; your latest choice is still shown."
+                        )
+                        self._last_vote_error = f"{notice} Story {story.id}: {exc}"
+                        self._vote_errors[key] = self._last_vote_error
+                        self.status(self._last_vote_error, error=True)
+                    return
+        except asyncio.CancelledError:
+            # Also while waiting for the lock: the vote was never confirmed.
+            self._vote_errors[key] = "cancelled"
+            raise
+        except Exception as exc:
+            self._vote_errors[key] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            self._pending_votes.pop(key, None)
         if api is not self.api:
             return
         if self.feed is not None and target > self.feed.version:
@@ -2319,8 +2824,23 @@ class Reader(App[None]):
         now = time.time()
         scale = GRAVITY_TIME_SCALE.get(window, 1.0)
         for key in keys:
+            if key == "queue":
+                continue  # Queue is derived client-side, never a server order.
             order = feed.orders.setdefault(key, [])
             if story.id in order:
+                continue
+            saved = next(
+                (
+                    entry
+                    for entry in self.queue_snapshots.get(window, [])
+                    if "queue" in keys
+                    and entry.story_id == story.id
+                    and entry.origin == key
+                ),
+                None,
+            )
+            if saved is not None:
+                order.insert(min(saved.served_rank, len(order)), story.id)
                 continue
             by_gravity = key == "popular"
 
@@ -2341,6 +2861,25 @@ class Reader(App[None]):
         url = getattr(story, field, "") if story else ""
         if urlsplit(url).scheme in {"http", "https"}:
             open_in_browser(url)
+            if (
+                story is None
+                or self.feed is None
+                or self._quit_requested
+                or self.closing
+            ):
+                return
+            if field == "article_url":
+                event_type = "article_open"
+            elif field == "comments_url":
+                event_type = "comments_open"
+            else:
+                return
+            ctx = self._dwell_ctx(story)
+            if ctx is None:
+                return
+            self._send_interaction(
+                self._interaction_event(ctx, event_type, _wall_time())
+            )
         else:
             self.status("No link available for this story.")
 
@@ -2479,19 +3018,21 @@ class Reader(App[None]):
         self.query_one("#headlines", OptionList).focus()
         if self.help_open:
             self.help_open = False
-            self.schedule_summary()
+            self.schedule_summary(emit_impression=False)
 
     def action_why_story(self) -> None:
         story = self.selected()
         if story is None:
             return
+        self._stop_dwell()
         self.help_open = True
         self.summary_story_id = None
         self.selection_serial += 1
         self.workers.cancel_group(self, "summary")
         view = str(self.query_one("#sort", Select).value)
         reasons = {
-            "recommended": "Recommended orders stories by the model's learned preferences from your votes.",
+            "queue": "Queue mixes Recommended → Explore → Recommended → Popular, repeating and skipping exhausted sections. Explore is grouped as Discover, Unsure, Interest, then other badges; each round includes up to five additional Popular cards. Each window's round freezes its cards and slots. After the latest round is exhausted, the current feed starts another round of unseen cards; original slots stay fixed. Voting through it ends at Caught up for this window. Startup alternates Queue and Recommended by UTC day.",
+            "recommended": "Recommended orders stories by the model's learned preferences from your votes. When a story unlike your up-votes scores well, the last card is a ✨ Discover pick.",
             "popular": "Popular orders eligible HN stories by points and age; older stories lose weight.",
             "explore": "Explore offers discovery picks, including unfamiliar stories and interests Recommended misses. Its order is shuffled.",
         }
@@ -2538,6 +3079,7 @@ class Reader(App[None]):
         self.focus_summary()
 
     def action_badge_legend(self) -> None:
+        self._stop_dwell()
         self.help_open = True
         self.summary_story_id = None
         self.selection_serial += 1
@@ -2547,12 +3089,13 @@ class Reader(App[None]):
             "🔥 **Hot** — rising fast · 🏆 **Top** — at least 100 HN points · "
             "💬 **Talk** — at least 50 comments and comments ≥ points\n\n"
             "Badges combine when several apply.\n\n"
-            "🤔 **Unsure** — model uncertain · ✨ **Novel** — unlike your votes · 🎯 **Interest** — an interest Recommended misses\n\n"
+            "🤔 **Unsure** — model uncertain · ✨ **Discover** — new to you, likely good · 🎯 **Interest** — an interest Recommended misses\n\n"
             "Escape: return to the story. ?: shortcuts."
         )
         self.focus_summary()
 
     def action_help(self) -> None:
+        self._stop_dwell()
         self.help_open = True
         self.summary_story_id = None
         self.selection_serial += 1
@@ -2572,7 +3115,9 @@ class Reader(App[None]):
             "- `1` / `2` / `3`: up / neutral / down (advances to next story)\n"
             "- `u`: undo latest vote\n\n"
             "## Sort\n\n"
-            "- `s`: cycle sort (Recommended → Popular → Explore)\n"
+            "- `s`: cycle sort (Queue → Recommended → Popular → Explore)\n"
+            "- Queue: mixes Recommended → Explore → Recommended → Popular, repeating and skipping exhausted sections. Explore is grouped by badge; each round includes up to five additional Popular cards. Frozen order, no shuffle. Exhausting a round starts another from the current feed, skipping all earlier cards.\n"
+            "- Startup: Queue on odd UTC ordinal days, Recommended on even days.\n"
             "- `h` / `l`: previous / next sort\n"
             "- `d` / `D`: next / previous time window (12 hours → 1 day →"
             " 1 week → 1 month → Archive)\n"
@@ -2584,64 +3129,106 @@ class Reader(App[None]):
             "- `r`: regenerate the selected summary and check its live stats\n"
             "- `b`: badge legend\n"
             "- `?`: this help\n"
-            "- `q`: quit\n"
+            "- `q`: quit (always exits within ~3 s; a second q exits at once)\n"
             "- `Escape`: close this help\n\n"
-            "Votes are never automatically retried after network errors."
+            "Votes are never automatically retried after network errors. "
+            "Quitting shows any vote not saved after the reader closes."
         )
         self.focus_summary()
 
     async def action_quit(self) -> None:
-        """Finish queued votes before allowing teardown to cancel workers."""
+        """Quit always exits: at most QUIT_WAIT_SECONDS after the first q."""
         if self._quit_requested:
+            # Second q while waiting exits immediately.
+            self.workers.cancel_group(self, "quit")
+            self._exit_for_quit()
             return
         self._quit_requested = True
+        self._quit_start = time.monotonic()
+        # The open reading segment's dwell (if >= 1 s) is sent with a ~1 s
+        # cap in the quit worker, never delaying votes. A still-delayed
+        # impression is under 1 s old, so it is not sent.
+        dwell = self.dwell_tracker.stop(_monotonic())
+        quit_events = [] if dwell is None else [self._dwell_event(dwell)]
         votes: tuple[Worker[None], ...] = tuple(
             worker
             for worker in self.workers
             if worker.group == "vote" and not worker.is_finished
         )
-        self._quit_after_votes(votes, self._unconfirmed_votes)
+        self._quit_votes = votes
+        self._quit_events = list(quit_events)
+        self._quit_snapshot = [
+            (key, title, action) for key, (title, action) in self._pending_votes.items()
+        ]
+        pending = len(self._quit_snapshot) or len(votes)
+        if pending:
+            noun = "vote" if pending == 1 else "votes"
+            self.status(f"Saving {pending} {noun}… press q again to quit now")
+        self._quit_after_votes()
+
+    def _build_quit_report(self) -> list[str]:
+        """One line per vote not confirmed at exit; empty when all saved.
+        ``submit`` records every failure (error, cancel) under the vote's key,
+        so a vote neither pending nor failed was saved."""
+        report: list[str] = []
+        for key, title, action in self._quit_snapshot:
+            if key in self._pending_votes:
+                reason = "still saving when the reader closed"
+            elif (error := self._vote_errors.get(key)) is not None:
+                reason = error or "cancelled"
+            else:
+                continue
+            report.append(
+                f"Vote not saved: {terminal_safe(title)} ({action}) — {reason}"
+            )
+        return report
+
+    def _exit_for_quit(self) -> None:
+        """Exit exactly once, carrying the quit report as the exit message."""
+        if self._quit_exited:
+            return
+        self._quit_exited = True
+        self.quit_report = self._build_quit_report()
+        message = "\n".join(self.quit_report) if self.quit_report else None
+        self.exit(message=message)
 
     @work(group="quit")
-    async def _quit_after_votes(
-        self, votes: tuple[Worker[None], ...], unconfirmed_before: int
-    ) -> None:
-        exiting = False
+    async def _quit_after_votes(self) -> None:
+        votes = self._quit_votes
+        quit_start = self._quit_start or time.monotonic()
+        deadline = quit_start + QUIT_WAIT_SECONDS
+        telemetry_deadline = quit_start + QUIT_TELEMETRY_WAIT_SECONDS
+        flush_task: asyncio.Task[None] | None = None
         try:
-            if votes:
-                self.status("Saving pending votes before quitting…")
-            deadline = time.monotonic() + QUIT_VOTE_WAIT_SECONDS
+            if self._quit_events or any(
+                worker.group == "interaction" and not worker.is_finished
+                for worker in self.workers
+            ):
+                flush_task = asyncio.create_task(
+                    self._flush_quit_telemetry(list(self._quit_events))
+                )
+            # Wait for votes up to the 3 s cap; observe completion without
+            # creating/cancelling waiters (Worker.wait cancellation can cancel
+            # the underlying vote).
             while any(not worker.is_finished for worker in votes):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self.status(
-                        "Votes are still saving. Reader stayed open; press q after saving finishes.",
-                        error=True,
-                    )
-                    return
-                # Worker.wait cancellation can cancel the underlying vote.
-                # Observe completion without creating/cancelling waiters.
+                    break
                 await asyncio.sleep(min(0.05, remaining))
-            if self._unconfirmed_votes != unconfirmed_before or any(
-                worker.state != WorkerState.SUCCESS for worker in votes
-            ):
-                detail = (
-                    self._last_vote_error
-                    if self._unconfirmed_votes != unconfirmed_before
-                    else None
+            if flush_task is not None:
+                remaining = min(
+                    deadline - time.monotonic(),
+                    telemetry_deadline - time.monotonic(),
                 )
-                self.status(
-                    "Votes were not confirmed. "
-                    + (detail or "Check before voting again.")
-                    + " Press q to quit.",
-                    error=True,
-                )
-                return
-            self.exit()
-            exiting = True
+                if remaining > 0:
+                    try:
+                        await asyncio.wait_for(flush_task, timeout=remaining)
+                    except TimeoutError:
+                        pass
+            self._exit_for_quit()
         finally:
-            if not exiting:
-                self._quit_requested = False
+            if flush_task is not None and not flush_task.done():
+                flush_task.cancel()
 
     async def on_unmount(self) -> None:
         self.closing = True

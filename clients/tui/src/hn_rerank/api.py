@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
@@ -15,7 +15,7 @@ from .models import DEFAULT_WINDOW, WINDOWS, Feed, Window, terminal_safe
 
 
 @dataclass(frozen=True)
-class Impression:
+class InteractionEvent:
     event_id: str
     client_session_id: str
     story_id: int
@@ -29,6 +29,10 @@ class Impression:
     ranker_arm: str = "tui_observed"
     # Badge kinds of the story as shown.
     badges: list[str] = field(default_factory=list)
+    surface: str = "views"
+    queue_position: int | None = None
+    # Only dwell events carry a duration; omitted from the payload when None.
+    duration_ms: int | None = None
 
 
 class APIError(Exception):
@@ -423,8 +427,27 @@ class API:
         except (KeyError, TypeError, ValueError) as exc:
             raise APIError("Invalid story stats.") from exc
 
-    async def impression(self, event: Impression) -> None:
-        await self.request("POST", "api/interaction", json={"events": [asdict(event)]})
+    async def interaction(self, event: InteractionEvent) -> None:
+        payload: dict[str, object] = {
+            "event_id": event.event_id,
+            "client_session_id": event.client_session_id,
+            "story_id": event.story_id,
+            "dashboard_version": event.dashboard_version,
+            "position": event.position,
+            "sort_mode": event.sort_mode,
+            "window": event.window,
+            "occurred_at": event.occurred_at,
+            "event_type": event.event_type,
+            "source_filter": event.source_filter,
+            "ranker_arm": event.ranker_arm,
+            "badges": list(event.badges),
+            "surface": event.surface,
+        }
+        if event.queue_position is not None:
+            payload["queue_position"] = event.queue_position
+        if event.duration_ms is not None:
+            payload["duration_ms"] = event.duration_ms
+        await self.request("POST", "api/interaction", json={"events": [payload]})
 
     async def vote(self, story_id: int, action: str) -> int:
         response = await self.request(

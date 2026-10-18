@@ -1,8 +1,8 @@
 """Shared LLM provider rate-limit cooldown gate.
 
-All LLM HTTP calls share one module-level limiter so a 429 from one
-background prefetch or on-demand TLDR request slows every caller instead
-of only the coroutine that happened to receive the response.
+All LLM HTTP calls share one module-level limiter so a 429 (or a 502/503/504
+outage) from one background prefetch or on-demand TLDR request slows every
+caller instead of only the coroutine that happened to receive the response.
 """
 
 from __future__ import annotations
@@ -18,9 +18,14 @@ logger = logging.getLogger(__name__)
 
 
 class LlmRateLimiter:
-    """Thread-safe shared cooldown for LLM 429 responses."""
+    """Thread-safe shared cooldown for LLM 429 and 502/503/504 responses."""
 
     BACKOFF: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 30.0)
+    # Provider outages (2026-10-17: two minutes of 503s) cool every caller
+    # down too, so taps fail fast to a stale summary and prefetch pauses
+    # instead of each request retrying through the outage.
+    UNAVAILABLE_STATUSES: frozenset[int] = frozenset({502, 503, 504})
+    UNAVAILABLE_BACKOFF: tuple[float, ...] = (5.0, 15.0, 30.0, 60.0)
     # Providers can demand very long waits (Groq has sent 660s after bulk
     # prefetch tripped the free tier). Honoring that verbatim dead-ends the
     # UI for the full duration, so cap the adopted delay; the consecutive-429
@@ -35,6 +40,7 @@ class LlmRateLimiter:
         with self._lock:
             self._next_allowed_at: float = 0.0
             self._consecutive_429: int = 0
+            self._consecutive_unavailable: int = 0
             self._last_remaining_req_minute: str | None = None
             self._tokens: float | None = None
             self._token_limit = 0.0
@@ -83,6 +89,16 @@ class LlmRateLimiter:
                     return False
             await asyncio.sleep(wait)
 
+    def release(self, reserved_tokens: int) -> None:
+        """Return a reservation whose call never got a provider response."""
+        with self._lock:
+            self._refill(time.monotonic())
+            if self._tokens is not None:
+                self._tokens = min(
+                    self._token_limit,
+                    self._tokens + min(reserved_tokens, self._token_limit),
+                )
+
     def record_response(
         self,
         *,
@@ -94,8 +110,13 @@ class LlmRateLimiter:
         remaining = headers.get("x-ratelimit-remaining-req-minute")
         if status == 429:
             self.on_429(remaining_req_minute=remaining)
+        elif status in self.UNAVAILABLE_STATUSES:
+            self.on_unavailable(status)
         elif 200 <= status < 300:
             self.on_success(remaining_req_minute=remaining)
+        if used_tokens is None and not 200 <= status < 300:
+            # A refused call spent nothing; give its reservation back.
+            used_tokens = 0
         with self._lock:
             now = time.monotonic()
             self._refill(now)
@@ -122,7 +143,7 @@ class LlmRateLimiter:
                     )
             except ValueError:
                 pass
-            if status == 429:
+            if status == 429 or status in self.UNAVAILABLE_STATUSES:
                 try:
                     delay = float(headers.get("retry-after", ""))
                     if math.isfinite(delay) and delay >= 0:
@@ -153,9 +174,24 @@ class LlmRateLimiter:
             remaining_req_minute,
         )
 
+    def on_unavailable(self, status: int) -> None:
+        with self._lock:
+            self._consecutive_unavailable += 1
+            idx = min(self._consecutive_unavailable - 1, len(self.UNAVAILABLE_BACKOFF) - 1)
+            delay = self.UNAVAILABLE_BACKOFF[idx]
+            self._next_allowed_at = max(self._next_allowed_at, time.monotonic() + delay)
+            consecutive = self._consecutive_unavailable
+        logger.warning(
+            "llm_limiter unavailable status=%d consecutive=%d next_delay=%.1fs",
+            status,
+            consecutive,
+            delay,
+        )
+
     def on_success(self, *, remaining_req_minute: str | None = None) -> None:
         with self._lock:
             self._consecutive_429 = 0
+            self._consecutive_unavailable = 0
             self._last_remaining_req_minute = remaining_req_minute
 
 

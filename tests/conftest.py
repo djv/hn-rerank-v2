@@ -16,8 +16,9 @@ from llm_limiter import limiter as llm_limiter
 
 # Example budgets (HYPOTHESIS_PROFILE):
 # - unset, local: a quarter of each test's examples (at least 10, or all of
-#   them if fewer). A 10x run on 2026-09-26 found nothing, so everyday runs
-#   trade depth for speed.
+#   them if fewer), no deadline. A 10x run on 2026-09-26 found nothing, so
+#   everyday runs trade depth for speed. The 200 ms default deadline failed
+#   tests at random on a loaded laptop (2026-10-12); `ci` has none either.
 # - unset under CI: Hypothesis auto-selects the `ci` profile below (300 for
 #   tests without their own @settings); explicit counts stay unscaled.
 # - `deep`: 10x each test's count, at least 1000, no deadline. A one-off
@@ -57,7 +58,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         test._hypothesis_internal_use_settings = settings(
             current,
             max_examples=_scaled_examples(current.max_examples),
-            **({"deadline": None} if _PROFILE == "deep" else {}),
+            deadline=None,
         )
 
 

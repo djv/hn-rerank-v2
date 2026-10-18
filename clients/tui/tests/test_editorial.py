@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -7,17 +8,27 @@ from typing import cast
 
 import httpx
 import pytest
-from rich.color import Color
+from hypothesis import given
+from hypothesis import strategies as st
+from rich.color import Color, ColorType
+from rich.style import Style
 from rich.text import Text
+from textual import events
 from textual.widgets import Button, Input, Markdown, OptionList, Select, Static, Tabs
 
 from hn_rerank.app import (
+    ANSI_DARK_PALETTE,
+    ANSI_FADED_DARK_PALETTE,
+    ANSI_FADED_LIGHT_PALETTE,
+    ANSI_LIGHT_PALETTE,
+    DARK_PALETTE,
     EMPTY_NOTICE,
     LIGHT_PALETTE,
     VIEW_LIMIT,
     Reader,
     Setup,
     _cell_len,
+    fades_to_light_text,
     headline,
     headline_comments,
     headline_domain,
@@ -26,6 +37,7 @@ from hn_rerank.app import (
     story_heading,
     story_metadata,
     theme_for_hour,
+    tmux_inactive_background,
 )
 from hn_rerank.models import FeedStory
 
@@ -483,7 +495,7 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
             "hn",
             1,
             0,
-            0,
+            int(time.time()),
             float(100 - i),
         )
 
@@ -492,7 +504,7 @@ async def test_every_sort_shows_at_most_view_limit(tmp_path: Path) -> None:
     fake.feed = replace(
         fake.feed,
         stories=[story(i) for i in ids],
-        orders={sort: ids for sort in Reader.SORT_CYCLE},
+        orders={sort: ids for sort in Reader.SORT_CYCLE if sort != "queue"},
     )
     app = Reader(api=fake.api(), config_path=tmp_path / "profile.json")
     async with app.run_test(size=(120, 35)) as pilot:
@@ -617,7 +629,7 @@ async def test_badge_legend_hotkey_and_escape_restore_story() -> None:
             "🏆 **Top**",
             "💬 **Talk**",
             "🤔 **Unsure**",
-            "✨ **Novel**",
+            "✨ **Discover**",
             "🎯 **Interest**",
         ):
             assert badge in legend
@@ -884,3 +896,154 @@ async def test_short_pane_keeps_footer_and_heading_compact() -> None:
         app.status_mode = "context"
         app.context_status()
         assert "Enter/Esc back" in str(hints.content)
+
+
+def test_ansi_palettes_cover_every_editorial_role() -> None:
+    roles = set(DARK_PALETTE)
+    assert set(LIGHT_PALETTE) == roles
+    assert set(ANSI_DARK_PALETTE) == roles
+    assert set(ANSI_LIGHT_PALETTE) == roles
+    assert set(ANSI_FADED_DARK_PALETTE) == roles
+    assert set(ANSI_FADED_LIGHT_PALETTE) == roles
+
+
+def _span_colours(app: Reader) -> list[Color]:
+    listing = app.query_one(OptionList)
+    spans = [
+        span
+        for index in range(listing.option_count)
+        for span in cast(Text, listing.get_option_at_index(index).prompt).spans
+    ]
+    styles = [Style.parse(str(span.style)) for span in spans]
+    return [style.color for style in styles if style.color is not None]
+
+
+@pytest.mark.parametrize(
+    ("clock", "expected"),
+    [("editorial", "editorial-ansi"), ("editorial-light", "editorial-ansi-light")],
+)
+async def test_ansi_reader_uses_terminal_colours(
+    monkeypatch: pytest.MonkeyPatch, clock: str, expected: str
+) -> None:
+    """ANSI mode leaves the page at the terminal default, so tmux's inactive-pane
+    style and the terminal theme show through, and headline text uses only the
+    16 terminal colours."""
+    monkeypatch.setattr("hn_rerank.app.theme_for_hour", lambda _hour: clock)
+    app = Reader(api=EditorialServer().api(), ansi=True)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        assert app.theme == expected
+        assert app.current_theme.ansi
+        for selector in ("Screen", "#headlines", "#summary", "#filters", "#footer"):
+            node = app.screen if selector == "Screen" else app.query_one(selector)
+            assert node.styles.background.ansi == -1, selector
+        colours = _span_colours(app)
+        assert colours
+        assert {colour.type for colour in colours} <= {
+            ColorType.STANDARD,
+            ColorType.DEFAULT,
+        }
+
+
+@pytest.mark.parametrize(
+    ("background", "dark", "expected"),
+    [
+        ("#585858", False, True),  # theme-mode light fade (65% toward black)
+        ("#55585c", True, True),  # theme-mode dark fade
+        ("#dcdcdc", False, False),  # a light fade keeps the light palette
+        ("#191c22", True, False),  # near-black keeps the dark palette
+        ("#191c22", False, True),
+    ],
+)
+def test_fades_to_light_text(background: str, dark: bool, expected: bool) -> None:
+    assert fades_to_light_text(background, dark=dark) is expected
+
+
+@given(st.integers(0, 255), st.integers(0, 255))
+def test_lighter_greys_never_fade_where_darker_ones_do_not(a: int, b: int) -> None:
+    darker, lighter = sorted((a, b))
+    if fades_to_light_text(f"#{lighter:02x}{lighter:02x}{lighter:02x}", dark=False):
+        assert fades_to_light_text(f"#{darker:02x}{darker:02x}{darker:02x}", dark=False)
+
+
+def test_tmux_inactive_background(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TMUX", raising=False)
+    assert tmux_inactive_background() is None
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "fg=default,bg=#585858,dim\n")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert tmux_inactive_background() == "#585858"
+    assert calls == [["tmux", "show-options", "-pAv", "-t", "%7", "window-style"]]
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_: subprocess.CompletedProcess(command, 0, "bg=colour238\n"),
+    )
+    assert tmux_inactive_background() is None
+
+
+@pytest.mark.parametrize(
+    ("clock", "theme", "faded"),
+    [
+        ("editorial", "editorial-ansi", "editorial-ansi-faded"),
+        ("editorial-light", "editorial-ansi-light", "editorial-ansi-light-faded"),
+    ],
+)
+async def test_inactive_pane_fades_to_light_text(
+    monkeypatch: pytest.MonkeyPatch, clock: str, theme: str, faded: str
+) -> None:
+    """On tmux's mid-grey inactive background the reader switches to light
+    text and restores its theme when focus returns."""
+    hour = {"theme": clock}
+    monkeypatch.setattr("hn_rerank.app.theme_for_hour", lambda _hour: hour["theme"])
+    app = Reader(
+        api=EditorialServer().api(), ansi=True, inactive_background=lambda: "#585858"
+    )
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        assert app.theme == theme
+        app.post_message(events.AppBlur())
+        await settle(pilot)
+        assert app.theme == faded
+        assert app.current_theme.ansi
+        if faded.endswith("-light-faded"):
+            names = {colour.name for colour in _span_colours(app)}
+            assert names <= {"bright_white", "black", "default"}, names
+        # The clock moving on while inactive picks the other faded variant.
+        hour["theme"] = "editorial" if clock == "editorial-light" else "editorial-light"
+        app.apply_clock_theme()
+        await settle(pilot)
+        assert app.theme == FADED_NAMES[ANSI_NAMES[hour["theme"]]]
+        app.post_message(events.AppFocus())
+        await settle(pilot)
+        assert app.theme == ANSI_NAMES[hour["theme"]]
+
+
+ANSI_NAMES = {"editorial": "editorial-ansi", "editorial-light": "editorial-ansi-light"}
+FADED_NAMES = {
+    "editorial-ansi": "editorial-ansi-faded",
+    "editorial-ansi-light": "editorial-ansi-light-faded",
+}
+
+
+@pytest.mark.parametrize("background", [None, "#dcdcdc"])
+async def test_inactive_pane_keeps_theme_without_a_mid_grey(
+    monkeypatch: pytest.MonkeyPatch, background: str | None
+) -> None:
+    """Outside tmux, or under a light fade, focus loss changes nothing (white
+    text would vanish on the terminal's own light page)."""
+    monkeypatch.setattr("hn_rerank.app.theme_for_hour", lambda _hour: "editorial-light")
+    app = Reader(
+        api=EditorialServer().api(), ansi=True, inactive_background=lambda: background
+    )
+    async with app.run_test(size=(120, 35)) as pilot:
+        await settle(pilot)
+        app.post_message(events.AppBlur())
+        await settle(pilot)
+        assert app.theme == "editorial-ansi-light"

@@ -201,7 +201,7 @@ $$\alpha = \text{clip}\left(\frac{n_{\min} - 20}{60},\ 0,\ 1\right)$$
 
 The blend starts when both classes have at least 20 feedback entries and reaches full SVM influence when both classes have at least 80 entries. A user with 50 upvotes but only 5 downvotes sees pure tier-2 (centroid-diff) regardless of total feedback count.
 
-#### Joined Classifier Challenger and Live Interleaving (opt-in)
+#### Joined Classifier (production since 2026-10-16) and Live Interleaving
 
 `model.classifier = "joined_logistic"` (`pipeline/joined_classifier.py`)
 replaces the RBF SVM and the linear blend with one logistic regression
@@ -217,7 +217,11 @@ shortlist candidates #2 and #4 of the 2026-10-07 offline study
 probabilities equal the offline adapter's exactly
 (`tests/test_joined_classifier.py`). The tier blend is unchanged.
 
-Live, the classifier serves only as an interleaving challenger. For users
+`config.toml` sets `classifier = "joined_logistic"` (all features) and
+`linear_blend_enabled = false` for every profile since 2026-10-16, when the
+user ended the interleaving trial early (INTERLEAVING.md, early endpoint).
+From 2026-10-08 to then it served only as an interleaving challenger, and
+`interleave_user_ids` is now empty. The mechanism remains: for users
 in `interleave_user_ids` (empty by default), each warm also scores the
 candidates with every arm in `interleave_arms` (`joined_all`,
 `joined_no_metadata`), each in its own model-cache entry, reusing
@@ -250,7 +254,7 @@ same procedure on judged offline blocks to estimate power.
 ### 3.4 Selection & Surfacing Passes
 The default dashboard selection is direct relevance order: `rerank_candidates` takes the top ranked stories after `_score_and_rank` and does not remove near-duplicates. MMR remains available behind `config.model.enable_mmr`; when enabled, `mmr_filter` iterates through candidates in SVM-rank order and discards subsequent candidates with cosine similarity above `config.model.diversity_threshold` (default 0.75).
 
-**Linear blend (`config.model.linear_blend_enabled`; code default off, `config.toml` on since 2026-09-29).** `pipeline/linear_blend.py`: after `_score_and_rank` computes the tier-blended score for a voter whose SVM fit, the final score becomes 0.5 x production + 0.2 x dense logistic regression (`linear_blend_dense_weight`; fit on the SVM's scaled feature rows, C `linear_blend_dense_c` 0.1) + 0.3 x TF-IDF logistic regression (`linear_blend_tfidf_weight`; word 1-2 grams over domain/source tokens, title and the first 5,000 characters of `text_content`, C `linear_blend_tfidf_c` 4), each as an average-rank percentile of P(up) - P(down). The dense and TF-IDF weights are multiplied by the SVM tier's weight (`alpha_2 * alpha_3`, `linear_blend_ramp`), so the blend ramps in with the SVM past the 20 up / 20 down gate instead of taking half the ranking there; a heavy voter gets the full weights. The models are fit with the SVM on a cache miss and cached in `linear_blend._CACHE`, one fit per user under its latest feedback signature (a missing entry forces the SVM refit too); that fit is also the next fit's warm start (`_LATEST`, dropped with the cache entry). **Warm starts across restarts** (`pipeline/warm_store.py`): the joined classifier's and the linear blend's latest coefficients per user are also saved as `.npz` (float32, kept-column indices; ~5-12 MB per profile) under `warm_start_dir` (default `$XDG_CACHE_HOME/hn-rewrite/warm_start`), written by a background thread at most every 30 s, atomically. After a restart `latest()` falls back to them; a restored fit only seeds the solver (its IDF is unfitted) and never scores. Cold fits had taken ~60 s of a restart's 92 s first rerank (2026-10-08). The store is off until the server's startup configures it, so tests and scripts write nothing. The first regen also waits (after `regen_initial_delay_seconds`) for the startup warms to finish, up to `regen_startup_warm_wait_seconds` (180 s), so the two no longer overlap. Hashed TF-IDF count rows are cached per (story, text) in `_ROWS` (32k rows, ~110 MB; sized above the candidate caps plus the voters' training stories). A failed fit or score logs and keeps the production score. `scripts/eval_ranker_variants.py` shares `percentile_scores`, `tfidf_text` and the vectorizer with it. Its `production` variant runs whatever the config says (the blend, from `config.toml`); `prodlr`, `produd`, `stack` and the SVM sweeps use production without the blend, and `prodlr`'s default dense logreg is the live one (a production run with all blend weight on it, `linear_blend_ramp=false`), so `prodlr[svm_c=4;lr_weight=0.2;tfidf_weight=0.3]` equals the live blend for a heavy voter (`tests/test_eval_ranker_variants.py`). Other `lr_target`s, half-lives and skipped votes use the eval's own logreg (fewer meta columns, C `linear_blend_dense_c`).
+**Linear blend (`config.model.linear_blend_enabled`; code default off, `config.toml` on from 2026-09-29 to 2026-10-16, replaced by the joined classifier).** `pipeline/linear_blend.py`: after `_score_and_rank` computes the tier-blended score for a voter whose SVM fit, the final score becomes 0.5 x production + 0.2 x dense logistic regression (`linear_blend_dense_weight`; fit on the SVM's scaled feature rows, C `linear_blend_dense_c` 0.1) + 0.3 x TF-IDF logistic regression (`linear_blend_tfidf_weight`; word 1-2 grams over domain/source tokens, title and the first 5,000 characters of `text_content`, C `linear_blend_tfidf_c` 4), each as an average-rank percentile of P(up) - P(down). The dense and TF-IDF weights are multiplied by the SVM tier's weight (`alpha_2 * alpha_3`, `linear_blend_ramp`), so the blend ramps in with the SVM past the 20 up / 20 down gate instead of taking half the ranking there; a heavy voter gets the full weights. The models are fit with the SVM on a cache miss and cached in `linear_blend._CACHE`, one fit per user under its latest feedback signature (a missing entry forces the SVM refit too); that fit is also the next fit's warm start (`_LATEST`, dropped with the cache entry). **Warm starts across restarts** (`pipeline/warm_store.py`): the joined classifier's and the linear blend's latest coefficients per user are also saved as `.npz` (float32, kept-column indices; ~5-12 MB per profile) under `warm_start_dir` (default `$XDG_CACHE_HOME/hn-rewrite/warm_start`), written by a background thread at most every 30 s, atomically. After a restart `latest()` falls back to them; a restored fit only seeds the solver (its IDF is unfitted) and never scores. Cold fits had taken ~60 s of a restart's 92 s first rerank (2026-10-08). The store is off until the server's startup configures it, so tests and scripts write nothing. The first regen also waits (after `regen_initial_delay_seconds`) for the startup warms to finish, up to `regen_startup_warm_wait_seconds` (180 s), so the two no longer overlap. Hashed TF-IDF count rows are cached per (story, text) in `_ROWS` (32k rows, ~110 MB; sized above the candidate caps plus the voters' training stories). A failed fit or score logs and keeps the production score. `scripts/eval_ranker_variants.py` shares `percentile_scores`, `tfidf_text` and the vectorizer with it. Its `production` variant runs whatever the config says (the blend, from `config.toml`); `prodlr`, `produd`, `stack` and the SVM sweeps use production without the blend, and `prodlr`'s default dense logreg is the live one (a production run with all blend weight on it, `linear_blend_ramp=false`), so `prodlr[svm_c=4;lr_weight=0.2;tfidf_weight=0.3]` equals the live blend for a heavy voter (`tests/test_eval_ranker_variants.py`). Other `lr_target`s, half-lives and skipped votes use the eval's own logreg (fewer meta columns, C `linear_blend_dense_c`).
 
 **Side-by-side embeddings (`config.model.side_embedding_enabled`; default off, on in `config.toml` and live since 2026-10-02).** `pipeline/side_embeddings.py`: when on, `_score_and_rank` trains and scores the SVM and the linear blend on each story's stored vector joined with a second model's vector (embeddinggemma-300m, 128 tokens, task prefix `task: classification | query: `), each part scaled 1/sqrt(2), the layout the evaluation replay used (2026-10-02: AUC +0.011, top-12 upvotes +0.056 over 12 time blocks; FINDINGS.md). The score context (closest upvote and its index, closest down/neutral, upvote vectors) stays on the stored vectors, so "Because you upvoted", Explore and dedup thresholds keep their meaning. Side vectors live in the additive `side_embeddings` table (`story_id, model_version` key, matched on the same text hash as `embeddings`), are read through an in-process cache (`SideVectorCache`, one DB read per story text) and are written only by `scripts/embed_side_vectors.py` (voted stories first, then candidates newest first; 0.22 s/story on the VPS on 2 niced threads). A story without one gets a zero side part; below `side_embedding_min_coverage` (0.98) of candidates plus feedback the rerank uses the stored vectors alone (trace label `side_embeddings=off`, warning `side_embeddings_low_coverage`). The model directory is a Hugging Face snapshot (`side_embedding_model_dir`, tokenizer files plus `onnx/model.onnx`).
 
@@ -418,13 +422,23 @@ the fully scored pool at one `now` for all five windows:
   A card may have all three badges or none. Popular membership and order
   still depend only on HN gravity, not the badges.
 * **Explore** (personalized decks only; the cold deck has none): Unsure
-  (highest entropy; needs SVM probabilities), Novel (`1 - max_sim`, farthest
-  from every vote) and 🎯 Interest, picked in that order, each
-  excluding earlier picks and the window's Recommended picks (spares
-  included, since they refill Recommended), skipping (and
-  backfilling past) stories that duplicate a voted one (`is_feedback_match`,
-  WORKLOG 2026-07-10). Served 3 each (`EXPLORE_PER_BADGE`), in model-score
-  order. Interest (replaced 🎯 Similar, 2026-09-30): `interest_centers`
+  (highest entropy; needs SVM probabilities; since 2026-10-16 the entropy
+  of Platt-calibrated probabilities once the profile has
+  `unsure_calibration_min_cards` (100) labelled cards: a per-profile fit of
+  logit(P(up)) against up-vs-rest from the raw P(up) its `deck_scores`
+  decks held and the votes cast after them, last
+  `unsure_calibration_days` (7) days, decks since
+  `unsure_calibration_since`; `pipeline/unsure_calibration.py`, trace label
+  `unsure_calibration`; scores and stored probabilities stay raw), Discover (since 2026-10-12,
+  replaces Novel: the window's highest-scored stories with max cosine
+  similarity to the user's up-votes below `DISCOVER_MAX_SIM_UP` (0.60), no
+  backfill; Phase 0 basis in FINDINGS "Discover Phase 0") and 🎯 Interest,
+  picked in that order, each excluding earlier picks and the window's
+  Recommended picks (spares included, since they refill Recommended),
+  skipping (and backfilling past) stories that duplicate a voted one
+  (`is_feedback_match`, WORKLOG 2026-07-10). Served 3 each
+  (`EXPLORE_PER_BADGE`), in model-score order. Impressions before 2026-10-12
+  carry the old kind `novel`. Interest (replaced 🎯 Similar, 2026-09-30): `interest_centers`
   clusters the user's upvote embeddings (KMeans, `interest_cluster_k=10`,
   cached per user and warm-started from the last centers when upvotes
   change); each candidate belongs to its nearest center. `interest_picks`
@@ -451,14 +465,14 @@ window is served short, never widened. A card's badges are OR'd across the
 views of its window only (`WindowViews.stories`); the view orders are
 authoritative, nothing is derived from badge flags.
 
-**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Top and Talk use the fixed 100-point and 50-comment floors above (user-selected 2026-10-02). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Novel and Interest.
+**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Top and Talk use the fixed 100-point and 50-comment floors above (user-selected 2026-10-02). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Discover and Interest.
 
 **Attribution (F2, `9a83ffd`).** Cards carry a "Because you upvoted …" line
 populated from the already-computed KNN argmax (`cand_closest_up_idx` → the
 nearest upvoted feedback title, no new matmul), shown only when the max
 similarity clears `ATTRIBUTION_MIN_SIM=0.35`. A weak-match attribution is
 worse than none, so cold users and sub-threshold cards show nothing. Cards
-with a Hot/Top/Talk/Unsure/Novel badge from any view of their window need
+with a Hot/Top/Talk/Unsure/Discover badge from any view of their window need
 `BADGED_ATTRIBUTION_MIN_SIM=0.85` (`card_attribution`, applied when the feed
 is built): they are there for popularity or exploration, and full-text
 similarity to the nearest upvote is 0.6-0.8 for most loosely related pairs
@@ -968,6 +982,40 @@ revision is still current, preserving a later choice on the same story.
 
 ### 4.4 Interaction ledger
 
+The terminal Queue sort composes served Recommended, badge-grouped Explore
+(Discover, Unsure, Interest, then other kinds), and up to five additional
+Popular cards per window, without shuffling or changing server ranking.
+Each round repeats Recommended → Explore → Recommended → Popular, skipping
+exhausted sections, so discovery and popularity appear near the start. Duplicate
+ownership remains Recommended first, then Explore, then Popular.
+Queue events preserve `sort_mode` as the origin view and `position` as its
+served rank (including Explore's index in the server order). Explore on the
+`views` surface instead reports the index in its client-shuffled order.
+Each window retains session-scoped rounds. A round freezes the current
+composition, excluding voted/unavailable/aged-out ids and every earlier round's
+ids. Only after the latest round is exhausted does the current feed build the
+next nonempty round. Empty refills show a headed Caught up notice; later new
+cards resume automatically. Stored FeedStory data survives served-view churn
+and updates when a newer feed includes the card. Actual story timestamps decide
+aging within nested recent windows; Archive never ages out. Window switches
+preserve rounds; reconnects and profile switches clear them.
+Each QueueEntry freezes `served_version` from its building feed. Queue events
+send that as `dashboard_version`, preserving trial credit keyed by
+(dashboard_version, window, story_id); views events use the current version.
+Served ranks exclude client-inserted undo rows. An undone card returned in a
+fresh API feed is server-served even when `ready=false`; only absent cards
+keep the local restoration marker. This preserves the returned order's ranks
+when a new Queue round is built during ranking. Only Queue votes record queue
+origin metadata for undo. Reports must split Explore positions by `surface`,
+treating `surface=''` (old rows) as views. Startup daily assignment is held for
+the session, so midnight-crossing sessions must be analyzed by actual surface
+or assigned default, rather than event date.
+Optional `surface` (`queue` or `views`) and `queue_position` mark the reading
+surface and global slot across all rounds, including voted and aged-out cards.
+Queue events require a non-negative signed-64-bit queue position; other
+surfaces omit it. Older clients omit both fields and store `surface=''`
+and NULL position. Both columns are added without rewriting existing rows.
+
 The browser records only explicit deck interactions: card impressions, dwell
 intervals, article opens, and comments opens. Events are batched in memory and
 sent to same-origin `POST /api/interaction` with `navigator.sendBeacon` (falling
@@ -984,7 +1032,16 @@ send them, older clients omit them), stored comma-joined in the added
 exactly. TLDR
 prefetches and automatic card enrichment do not generate interaction events.
 `ranker_arm` is the client's own label (`baseline` on the web,
-`tui_observed` in the terminal). Interleaving arms are recorded server-side
+`tui_observed` in the terminal). The terminal reader logs the same four
+event types with the web's meaning: impressions for selections held at
+least 1 s, immediate article/comment opens, and dwell per selection with a
+1 s minimum and a 5 min idle cap (terminal focus loss, help/legend/why
+panels, and quitting end the segment; focus return and panel close resume
+without a new impression). Telemetry is best effort and never blocks
+reading; quitting stops the open dwell and flushes it within ~1 s without
+delaying votes. The first q blocks every key except q and always exits within
+~3 s (a second q exits at once); any vote not confirmed is reported after the
+reader closes. Interleaving arms are recorded server-side
 in `interleave_decks` (section 3.3) and joined through the event's
 dashboard version and window.
 

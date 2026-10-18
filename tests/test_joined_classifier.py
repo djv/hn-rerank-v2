@@ -6,7 +6,7 @@ from typing import Literal
 
 import numpy as np
 import pytest
-from hypothesis import given, settings, strategies as st
+from hypothesis import example, given, settings, strategies as st
 
 from database import Database, Story
 from pipeline import Config, Embedder, ModelConfig
@@ -323,6 +323,7 @@ def test_rerank_arms_train_on_one_vote_snapshot(
 
 
 @settings(max_examples=10, deadline=None)
+@example(seed=1155516390)
 @given(seed=st.integers(0, 2**32 - 1))
 def test_warm_start_reaches_the_same_model_in_fewer_iterations(seed: int) -> None:
     rng = np.random.default_rng(seed)
@@ -333,7 +334,7 @@ def test_warm_start_reaches_the_same_model_in_fewer_iterations(seed: int) -> Non
     x_cand = rng.normal(size=(len(candidates), EMB_DIM + 3))
 
     def model() -> JoinedLogistic:
-        return JoinedLogistic(
+        classifier = JoinedLogistic(
             c=4.0,
             features="all",
             embedding_dim=EMB_DIM,
@@ -341,6 +342,8 @@ def test_warm_start_reaches_the_same_model_in_fewer_iterations(seed: int) -> Non
             numeric_scale=0.158,
             word_scale=1.0,
         )
+        classifier.estimator.tol = 1e-6
+        return classifier
 
     # The previous fit lacks the newest vote, as after a swipe.
     previous = model().fit(
@@ -357,7 +360,8 @@ def test_warm_start_reaches_the_same_model_in_fewer_iterations(seed: int) -> Non
     np.testing.assert_allclose(
         warm.predict_proba(x_cand, candidates),
         cold.predict_proba(x_cand, candidates),
-        # lbfgs stops at tol=1e-4 from either start: equal to that tolerance.
+        # Solver stopping tolerance does not bound held-out probability error;
+        # use a tighter test-only tolerance to compare converged predictions.
         atol=5e-3,
     )
 

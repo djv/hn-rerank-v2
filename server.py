@@ -9,7 +9,6 @@ import json
 import ipaddress
 import logging
 import os
-import random
 import re
 import secrets
 import sys
@@ -849,6 +848,15 @@ def _usage_int(usage: object, key: str) -> int | None:
     return None
 
 
+def _json_object(resp: httpx.Response) -> dict[str, Any]:
+    """The response's JSON object, or {} for a non-JSON or non-object body."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 async def _call_llm_chat(
     *,
     api_key: str,
@@ -883,9 +891,15 @@ async def _call_llm_chat(
                     # The Go gateway rejects requests without a session id.
                     headers["User-Agent"] = _GO_USER_AGENT
                     headers["x-opencode-session"] = _go_session_id()
-                resp = await client.post(base_url, headers=headers, json=payload)
-                data = resp.json() if resp.status_code == 200 else {}
-                used_tokens = data.get("usage", {}).get("total_tokens")
+                try:
+                    resp = await client.post(base_url, headers=headers, json=payload)
+                except httpx.TransportError as e:
+                    llm_limiter.release(estimated_tokens)
+                    logging.warning("_call_llm_chat transport error: %r", e)
+                    return LlmChatResult(content=f"LLM transport error: {e!r}", ok=False)
+                data = _json_object(resp) if resp.status_code == 200 else {}
+                usage = data.get("usage")
+                used_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
                 llm_limiter.record_response(
                     status=resp.status_code,
                     headers=resp.headers,
@@ -895,10 +909,18 @@ async def _call_llm_chat(
                     else None,
                 )
                 if resp.status_code == 200:
-                    choice = data["choices"][0]
-                    content = choice["message"].get("content") or ""
-                    finish_reason = choice.get("finish_reason")
-                    usage = data.get("usage", {})
+                    try:
+                        choice = data["choices"][0]
+                        content = choice["message"].get("content") or ""
+                        finish_reason = choice.get("finish_reason")
+                    except (KeyError, IndexError, TypeError, AttributeError):
+                        logging.warning(
+                            "_call_llm_chat malformed 200 body: %.200s", resp.text
+                        )
+                        return LlmChatResult(
+                            content="Malformed LLM response.", ok=False
+                        )
+                    usage = usage if isinstance(usage, dict) else {}
                     return LlmChatResult(
                         content=content,
                         ok=_valid_llm_completion(content, finish_reason),
@@ -908,13 +930,11 @@ async def _call_llm_chat(
                     )
                 if resp.status_code == 429 and attempt < 3:
                     continue
-                if resp.status_code == 503 and attempt < 3:
-                    base = 2 ** (attempt + 1)
-                    jitter = random.uniform(0, base * 0.5)
-                    delay = _parse_retry_after(
-                        resp.headers.get("Retry-After"), default=base + jitter
-                    )
-                    await asyncio.sleep(delay)
+                if (
+                    resp.status_code in llm_limiter.UNAVAILABLE_STATUSES
+                    and attempt < 1
+                ):
+                    # One retry; acquire() waits out the cooldown the 5xx set.
                     continue
                 break
             return LlmChatResult(
@@ -995,21 +1015,23 @@ async def _call_llm_responses(
                         content="LLM quota cooldown; retry later.", ok=False, status=429
                     )
                 t0 = time.perf_counter()
-                resp = await client.post(
-                    base_url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                        "User-Agent": _GO_USER_AGENT,
-                        "x-opencode-session": _go_session_id(),
-                    },
-                    json=payload,
-                )
-                ms = (time.perf_counter() - t0) * 1000.0
                 try:
-                    data = resp.json()
-                except ValueError:
-                    data = {}
+                    resp = await client.post(
+                        base_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                            "User-Agent": _GO_USER_AGENT,
+                            "x-opencode-session": _go_session_id(),
+                        },
+                        json=payload,
+                    )
+                except httpx.TransportError as e:
+                    llm_limiter.release(estimated_tokens)
+                    logging.warning("_call_llm_responses transport error: %r", e)
+                    return LlmChatResult(content=f"LLM transport error: {e!r}", ok=False)
+                ms = (time.perf_counter() - t0) * 1000.0
+                data = _json_object(resp)
                 usage = data.get("usage") if isinstance(data, dict) else {}
                 used_tokens = (
                     usage.get("total_tokens") if isinstance(usage, dict) else None
@@ -1062,13 +1084,11 @@ async def _call_llm_responses(
                     )
                 if resp.status_code == 429 and attempt < 3:
                     continue
-                if resp.status_code == 503 and attempt < 3:
-                    base = 2 ** (attempt + 1)
-                    jitter = random.uniform(0, base * 0.5)
-                    delay = _parse_retry_after(
-                        resp.headers.get("Retry-After"), default=base + jitter
-                    )
-                    await asyncio.sleep(delay)
+                if (
+                    resp.status_code in llm_limiter.UNAVAILABLE_STATUSES
+                    and attempt < 1
+                ):
+                    # One retry; acquire() waits out the cooldown the 5xx set.
                     continue
                 break
             err_data: object = data if isinstance(data, dict) else {}
@@ -2244,6 +2264,7 @@ class Handler:
                                     r.prob_down,
                                     window_rank,
                                     global_rank,
+                                    r.arm,
                                 )
                             )
                     windows[window] = WindowScores(
@@ -2276,7 +2297,7 @@ class Handler:
             for w, views in deck.windows.items()
         }
         arms = {arm for picks in windows.values() for _, arm in picks}
-        if not any(arms):
+        if PRODUCTION_ARM not in arms:
             return
         try:
             cls.db.insert_interleave_deck(
@@ -2755,7 +2776,8 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         "occurred_at",
     }
     if not required.issubset(raw_event) or bool(
-        set(raw_event) - (required | {"duration_ms", "badges"})
+        set(raw_event)
+        - (required | {"duration_ms", "badges", "surface", "queue_position"})
     ):
         raise ValueError("event has unexpected or missing fields")
 
@@ -2830,6 +2852,16 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
     if event_type != "dwell" and duration_ms is not None:
         raise ValueError("only dwell events may include duration_ms")
 
+    surface = raw_event.get("surface", "")
+    if "surface" in raw_event and surface not in ("queue", "views"):
+        raise ValueError("surface must be queue or views")
+    queue_position = raw_event.get("queue_position")
+    if surface == "queue":
+        if type(queue_position) is not int or not 0 <= queue_position < 2**63:
+            raise ValueError("queue events require a valid queue_position")
+    elif "queue_position" in raw_event:
+        raise ValueError("only queue events may include queue_position")
+
     # The card's badge kinds as shown (optional: older clients omit them),
     # so per-badge outcomes can be read from the ledger.
     badges = raw_event.get("badges", [])
@@ -2860,6 +2892,8 @@ def _parse_interaction_event(raw_event: object, user_id: int) -> InteractionEven
         occurred_at=timestamp,
         duration_ms=duration_ms,
         badges=",".join(dict.fromkeys(cast("list[str]", badges))),
+        surface=cast(str, surface),
+        queue_position=cast(int | None, queue_position),
     )
 
 
@@ -3121,6 +3155,16 @@ def _tldr_result_reply(
             return _rate_limited_reply(
                 "Summary provider is cooling down. Please try again later.",
                 max(1, llm_limiter.retry_after_seconds),
+            )
+        if result.error_status in llm_limiter.UNAVAILABLE_STATUSES:
+            retry_after = max(1, llm_limiter.retry_after_seconds)
+            return TldrReply(
+                {
+                    "error": "Summary provider is unavailable. Please try again later.",
+                    "retry_after": retry_after,
+                },
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                retry_after,
             )
         return TldrReply(
             {"error": "Failed to generate TLDR. Please try again later."},

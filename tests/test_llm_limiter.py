@@ -255,3 +255,69 @@ async def test_large_estimate_can_use_full_provider_bucket(
     )
     assert await limiter.acquire(estimated_tokens=9000)
     assert limiter._tokens == 0
+
+
+def test_unavailable_backoff_progression(
+    limiter: LlmRateLimiter,
+    fake_clock: FakeClock,
+) -> None:
+    for expected_delay in [5.0, 15.0, 30.0, 60.0, 60.0]:
+        limiter.record_response(status=503, headers={})
+        assert limiter.retry_after_seconds == pytest.approx(expected_delay)
+        fake_clock.advance(expected_delay)
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_success_resets_unavailable_backoff(
+    limiter: LlmRateLimiter, fake_clock: FakeClock, status: int
+) -> None:
+    limiter.record_response(status=status, headers={})
+    fake_clock.advance(5.0)
+    limiter.record_response(status=200, headers={})
+    limiter.record_response(status=status, headers={})
+
+    assert limiter.retry_after_seconds == 5
+
+
+def test_unavailable_adopts_capped_retry_after(limiter: LlmRateLimiter) -> None:
+    limiter.record_response(status=503, headers={"retry-after": "40"})
+    assert limiter.retry_after_seconds == 40
+
+    limiter.reset()
+    limiter.record_response(status=503, headers={"retry-after": "900"})
+    assert limiter.retry_after_seconds == limiter.MAX_PROVIDER_RETRY_AFTER_S
+
+
+@pytest.mark.parametrize("status", [400, 401, 404, 500])
+def test_other_errors_do_not_cool_down(limiter: LlmRateLimiter, status: int) -> None:
+    limiter.record_response(status=status, headers={})
+
+    assert limiter.retry_after_seconds == 0
+
+
+_BUCKET = {
+    "x-ratelimit-limit-tokens": "8000",
+    "x-ratelimit-remaining-tokens": "6000",
+}
+
+
+@pytest.mark.asyncio
+async def test_release_returns_an_unanswered_reservation(
+    limiter: LlmRateLimiter, sleep_recorder: SleepRecorder
+) -> None:
+    limiter.record_response(status=200, headers=_BUCKET)
+    assert await limiter.acquire(estimated_tokens=5000)
+    limiter.release(5000)
+    assert await limiter.acquire(estimated_tokens=5000)
+    assert sleep_recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_refused_call_without_usage_returns_its_reservation(
+    limiter: LlmRateLimiter, sleep_recorder: SleepRecorder
+) -> None:
+    limiter.record_response(status=200, headers=_BUCKET)
+    assert await limiter.acquire(estimated_tokens=5000)
+    limiter.record_response(status=400, headers={}, reserved_tokens=5000)
+    assert await limiter.acquire(estimated_tokens=5000)
+    assert sleep_recorder.calls == []

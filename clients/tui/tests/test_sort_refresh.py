@@ -202,7 +202,7 @@ def modal_text(app: Reader) -> str:
     [
         ("s", "popular", ORDERS["popular"][::-1], ORDERS["popular"][0]),
         ("l", "popular", ORDERS["popular"][::-1], ORDERS["popular"][0]),
-        ("h", "explore", ORDERS["explore"][::-1], ORDERS["explore"][::-1][0]),
+        ("h", "queue", ORDERS["recommended"], ORDERS["recommended"][0]),
     ],
 )
 async def test_sort_key_background_refreshes_counts_and_orders(
@@ -227,7 +227,7 @@ async def test_sort_key_background_refreshes_counts_and_orders(
         await settle(pilot)
         assert str(app.query_one("#sort", Select).value) == sort
         assert server.arrivals == 1
-        assert shown(app) == order  # explore is deterministically shuffled above
+        assert shown(app) == order  # Queue retains its first shown order on refresh.
         selected = app.selected()
         # The background refresh preserves the open story by id (not the row
         # position) and applies the deck's new counts to it.

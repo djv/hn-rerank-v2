@@ -30,6 +30,11 @@ def main() -> None:
         metavar="N",
         help="Generate missing summaries in the next N navigation targets (default 3; 0 uses cache only).",
     )
+    parser.add_argument(
+        "--truecolor",
+        action="store_true",
+        help="Use the editorial truecolor themes instead of the terminal's ANSI colours.",
+    )
     parser.add_argument("--version", action="version", version="hn-rerank 0.1.0")
     args = parser.parse_args()
     if args.prefetch < 0:
@@ -42,6 +47,7 @@ def main() -> None:
             prefetch=args.prefetch,
             prefetch_generate=args.prefetch_generate,
             window_file=window_path(),
+            ansi=not args.truecolor,
         )
     except ValueError as exc:
         parser.error(str(exc))

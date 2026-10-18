@@ -53,6 +53,7 @@ from pipeline import (
     HOT_MIN_SCORE,
 )
 from pipeline.ranking import (
+    DISCOVER_MAX_SIM_UP,
     EXPLORE_PER_BADGE,
     SELECT_MARGIN,
     VIEW_SIZE,
@@ -117,7 +118,7 @@ def test_dashboard_polish_renders_domain_legend_and_queue_status(
         "Top",
         "Talk",
         "Unsure",
-        "Novel",
+        "Discover",
         "Interest",
     ]
 
@@ -224,7 +225,11 @@ def test_config_load_checked_in_config_contains_only_runtime_overrides():
     assert config.server_port == 8766
     assert config.article_fetch_max_per_run == 50
     assert config.model.svm_c == 4.0
-    assert config.model.linear_blend_enabled is True
+    assert config.model.classifier == "joined_logistic"
+    assert config.model.joined_features == "all"
+    assert config.model.linear_blend_enabled is False
+    assert config.interleave_user_ids == ()
+    assert config.model.unsure_calibration_since == 1792153125.0
     assert config.model.svm_gamma == 0.03
     assert len(config.rss.feeds) >= 40
 
@@ -415,7 +420,7 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
     db: Database,
 ) -> None:
     """Popular (Hot/Top/Talk) is non-personalized and computed on the cold
-    deck; Explore (Unsure/Novel/Interest) is personalized and always absent
+    deck; Explore (Unsure/Discover/Interest) is personalized and always absent
     (no feedback to compute it against) — see build_cold_deck docstring."""
     db.upsert_story(_cold_story(1, score=100, time_ts=int(time.time()) - 3600))
 
@@ -429,7 +434,7 @@ def test_build_cold_deck_computes_popular_badges_but_not_explore(
     assert item.prob_up is None
     # Explore badges require feedback to personalize against; always absent.
     assert item.is_uncertain is False
-    assert item.is_novel is False
+    assert item.is_discover is False
     assert item.is_interest is False
     # Popular badges are non-personalized and independent: 100 points
     # qualifies for Top even though this is also the fastest story.
@@ -3626,20 +3631,21 @@ def test_tier3_pure_at_80_each(db: Database, _real_embedder: Embedder) -> None:
     assert ranked[0].story.id == 2
 
 
-def test_novel_archive_pass_surfaces_archive_novel(
+def test_discover_archive_pass_surfaces_archive_discover(
     db: Database, embedder: Embedder, monkeypatch: "pytest.MonkeyPatch"
 ) -> None:
-    """The archive window's Explore surfaces ✨ Novel archive stories.
+    """The archive window's Explore surfaces ✨ Discover archive stories.
 
-    Explore runs per window, so low-score archive stories far from every
-    vote get ✨ in the archive window. The archive fillers outnumber the
-    window's Recommended picks, so Recommended is saturated by fillers
-    (higher score), leaving the low-score novel targets in the Explore
-    pool; the Novel pass sorts by distance (= 1 - sim) desc and the served
-    view keeps the top EXPLORE_PER_BADGE.
+    Explore runs per window, so archive stories far from up-votes get ✨ in
+    the archive window. The archive fillers outnumber the window's
+    Recommended picks, so Recommended is saturated by fillers (higher
+    score), leaving the discover targets in the Explore pool; the Discover
+    pass keeps far stories (max similarity to up-votes below
+    DISCOVER_MAX_SIM_UP) sorted by score, and the served view keeps the top
+    EXPLORE_PER_BADGE.
     """
     config = Config(count=40)
-    user = db.create_user("test_novel_archive")
+    user = db.create_user("test_discover_archive")
 
     def mock_gce(stories, embedder_arg, db_inst):
         arr = np.zeros((len(stories), 384), dtype=np.float32)
@@ -3656,17 +3662,18 @@ def test_novel_archive_pass_surfaces_archive_novel(
 
     now = int(time.time())
     n_archive_filler = RECOMMENDED_PICKS + 4
-    novel_sims = [round(0.05 + 0.05 * i, 2) for i in range(EXPLORE_PER_BADGE + 1)]
+    discover_sims = [round(0.05 + 0.05 * i, 2) for i in range(EXPLORE_PER_BADGE + 1)]
 
     # Setup:
     #   12 recent stories (high score, sim 0.5), irrelevant to archive.
     #   n_archive_filler archive fillers (high score, sim 0.5) — sim 0.5, so
-    #     not novel, and more of them than the archive window's Recommended
-    #     picks, so Recommended is saturated by fillers alone.
-    #   EXPLORE_PER_BADGE+1 archive novel targets (low score, sim 0.05..)
-    #     — one more than the served cap, so the worst can be asserted
-    #     excluded. The Novel pass sorts the Explore pool by distance
-    #     (= 1 - sim) desc.
+    #     far but higher-scored than the targets, yet more of them than the
+    #     archive window's Recommended picks, so Recommended is saturated by
+    #     fillers alone.
+    #   EXPLORE_PER_BADGE+1 archive discover targets (low but distinct
+    #     scores, sim 0.05..) — one more than the served cap, so the
+    #     lowest-scored can be asserted excluded. The Discover pass keeps far
+    #     stories sorted by score desc.
     candidates = []
     for i in range(12):
         candidates.append(
@@ -3694,16 +3701,16 @@ def test_novel_archive_pass_surfaces_archive_novel(
                 comment_count=0,
             )
         )
-    novel_id_base = 12 + n_archive_filler
-    for i, sim in enumerate(novel_sims):
+    discover_id_base = 12 + n_archive_filler
+    for i, sim in enumerate(discover_sims):
         candidates.append(
             Story(
-                id=novel_id_base + i,
-                title=f"ANovel {i}",
+                id=discover_id_base + i,
+                title=f"ADiscover {i}",
                 url=None,
-                score=5,
+                score=5 + i,
                 time=now - 60 * 86400,
-                text_content=f"anovel {i}",
+                text_content=f"adisc {i}",
                 source="ch_seed",
                 comment_count=0,
             )
@@ -3712,36 +3719,39 @@ def test_novel_archive_pass_surfaces_archive_novel(
     n_candidates = len(candidates)
     cand_embs = np.zeros((n_candidates, 384), dtype=np.float32)
     for i in range(12):
-        cand_embs[i, 0] = 0.5
-        cand_embs[i, 50 + i] = np.sqrt(0.75)
+        cand_embs[i, 0] = 0.7
+        cand_embs[i, 50 + i] = np.sqrt(max(1.0 - 0.7 * 0.7, 0.0))
     for i in range(n_archive_filler):
-        cand_embs[12 + i, 0] = 0.5
-        cand_embs[12 + i, 150 + i] = np.sqrt(0.75)
-    for i, s in enumerate(novel_sims):
-        cand_embs[novel_id_base + i, 0] = s
-        cand_embs[novel_id_base + i, 300 + i] = np.sqrt(max(1.0 - s * s, 0.0))
+        cand_embs[12 + i, 0] = 0.7
+        cand_embs[12 + i, 150 + i] = np.sqrt(max(1.0 - 0.7 * 0.7, 0.0))
+    for i, s in enumerate(discover_sims):
+        cand_embs[discover_id_base + i, 0] = s
+        cand_embs[discover_id_base + i, 300 + i] = np.sqrt(max(1.0 - s * s, 0.0))
 
     deck = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
     by_id = _served_by_id(deck, "archive")
-    novel_ids_all = [novel_id_base + i for i in range(len(novel_sims))]
-    # Only the top EXPLORE_PER_BADGE by distance are served as Novel; the
-    # one extra target (worst sim) is not.
-    novel_ids = [aid for aid in novel_ids_all if aid in by_id and by_id[aid].is_novel]
-    assert novel_ids == novel_ids_all[:EXPLORE_PER_BADGE]
-    # The top by distance must be among the novel picks.
+    discover_ids_all = [discover_id_base + i for i in range(len(discover_sims))]
+    # Only the top EXPLORE_PER_BADGE by score are served as Discover; the
+    # lowest-scored target is not.
+    expected = discover_ids_all[-EXPLORE_PER_BADGE:]
+    discover_ids = [
+        aid for aid in discover_ids_all if aid in by_id and by_id[aid].is_discover
+    ]
+    assert sorted(discover_ids) == sorted(expected)
+    # The top by score must be among the discover picks.
     for aid, sim_label in zip(
-        novel_ids_all[:EXPLORE_PER_BADGE],
-        (f"{sim:.2f}" for sim in novel_sims[:EXPLORE_PER_BADGE]),
+        expected,
+        (f"{sim:.2f}" for sim in discover_sims[-EXPLORE_PER_BADGE:]),
     ):
-        assert aid in by_id, f"Archive novel id={aid} should be in final"
-        assert by_id[aid].is_novel, (
-            f"Archive novel id={aid} (sim={sim_label}) should have is_novel=True"
+        assert aid in by_id, f"Archive discover id={aid} should be in final"
+        assert by_id[aid].is_discover, (
+            f"Archive discover id={aid} (sim={sim_label}) should have is_discover=True"
         )
     # Archive stories never reach a recent window.
-    assert not set(novel_ids_all) & set(_served_by_id(deck, "1m"))
+    assert not set(discover_ids_all) & set(_served_by_id(deck, "1m"))
 
 
 def test_each_explore_badge_filled_per_window(db: Database, embedder: Embedder) -> None:
@@ -3824,7 +3834,7 @@ def test_each_explore_badge_filled_per_window(db: Database, embedder: Embedder) 
         served = _served(deck, window)
         assert len(served.recommended) == VIEW_SIZE, window
         assert len(served.popular) == VIEW_SIZE, window
-        for attr in ("is_novel", "is_interest", "is_uncertain"):
+        for attr in ("is_discover", "is_interest", "is_uncertain"):
             n = sum(1 for r in served.explore if getattr(r, attr))
             assert n == EXPLORE_PER_BADGE, f"{attr} in {window}: {n}"
 
@@ -3841,9 +3851,11 @@ def _make_explore_inputs() -> tuple[list[RankedStory], ranking.ExploreContext, i
         prob_down=1/3 and falls off monotonically toward 1, so prob_down
         values increasing from 0.34 give strictly *decreasing* entropy in
         id order). Only these ids have probabilities.
-      - Novel pool: cand_max_sim strictly increasing (novel sort key =
-        1 - max_sim, so the lowest-sim id is most novel). All other ids
-        default to max_sim=0.99 ("not novel").
+      - Discover pool: far from up-votes (cand_closest_up well below
+        DISCOVER_MAX_SIM_UP); all other ids default to 0.99 ("not far").
+        Discover sorts by score, and all these share the same low score,
+        so the stable sort keeps id order. All other ids default to
+        max_sim=0.99 ("not far").
       - Interest pool: each id is the only candidate of its own interest,
         bigger interests first, so the round-robin takes them in id order.
         Every other id belongs to interest 0, which the Recommended picks
@@ -3851,8 +3863,8 @@ def _make_explore_inputs() -> tuple[list[RankedStory], ranking.ExploreContext, i
     Returns the ranked pool, the Explore context and the assembly time.
     """
     unsure_base = RECOMMENDED_PICKS
-    novel_base = unsure_base + _EXPLORE_GROUP
-    interest_base = novel_base + _EXPLORE_GROUP
+    discover_base = unsure_base + _EXPLORE_GROUP
+    interest_base = discover_base + _EXPLORE_GROUP
     n_total = interest_base + _EXPLORE_GROUP
 
     now = int(time.time())
@@ -3887,14 +3899,14 @@ def _make_explore_inputs() -> tuple[list[RankedStory], ranking.ExploreContext, i
         for s in candidates
     ]
     row_of = {s.id: idx for idx, s in enumerate(candidates)}
-    cand_max_sim = np.full(n_total, 0.99, dtype=np.float32)
+    cand_closest_up = np.full(n_total, 0.99, dtype=np.float32)
     cand_interest = np.zeros(n_total, dtype=np.int64)
     for i in range(_EXPLORE_GROUP):
         step = i / (_EXPLORE_GROUP - 1)
-        cand_max_sim[row_of[novel_base + i]] = round(0.05 + 0.9 * step, 4)
+        cand_closest_up[row_of[discover_base + i]] = round(0.05 + 0.5 * step, 4)
         cand_interest[row_of[interest_base + i]] = i + 1
     explore = ranking.ExploreContext(
-        cand_max_sim=cand_max_sim,
+        cand_closest_up=cand_closest_up,
         cand_interest=cand_interest,
         interest_sizes=np.array(
             [1] + [100 - i for i in range(_EXPLORE_GROUP)], dtype=np.int64
@@ -3906,8 +3918,8 @@ def _make_explore_inputs() -> tuple[list[RankedStory], ranking.ExploreContext, i
 
 _EXPLORE_GROUP = EXPLORE_PER_BADGE * SELECT_MARGIN + 2
 _UNSURE_BASE = RECOMMENDED_PICKS
-_NOVEL_BASE = _UNSURE_BASE + _EXPLORE_GROUP
-_INTEREST_BASE = _NOVEL_BASE + _EXPLORE_GROUP
+_DISCOVER_BASE = _UNSURE_BASE + _EXPLORE_GROUP
+_INTEREST_BASE = _DISCOVER_BASE + _EXPLORE_GROUP
 
 
 def _served_explore_ids(
@@ -3916,13 +3928,13 @@ def _served_explore_ids(
     explore = _served(deck, "1w", now).explore
     return (
         {r.story.id for r in explore if r.is_uncertain},
-        {r.story.id for r in explore if r.is_novel},
+        {r.story.id for r in explore if r.is_discover},
         {r.story.id for r in explore if r.is_interest},
     )
 
 
 def test_explore_badges_backfill_past_feedback_matches() -> None:
-    """Explore passes (Unsure/Novel/Interest) skip candidates that duplicate
+    """Explore passes (Unsure/Discover/Interest) skip candidates that duplicate
     already-voted feedback and backfill from the rest of the sorted pool,
     instead of silently losing badge slots.
 
@@ -3934,7 +3946,7 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
     """
     ranked, explore, now = _make_explore_inputs()
     # The best-ranked candidate in each badge's pool duplicates feedback.
-    feedback_matched_ids = {_UNSURE_BASE, _NOVEL_BASE, _INTEREST_BASE}
+    feedback_matched_ids = {_UNSURE_BASE, _DISCOVER_BASE, _INTEREST_BASE}
 
     deck = ranking.assemble_window_deck(
         ranked,
@@ -3944,13 +3956,15 @@ def test_explore_badges_backfill_past_feedback_matches() -> None:
         is_feedback_match=lambda story: story.id in feedback_matched_ids,
     )
 
-    unsure_ids, novel_ids, interest_ids = _served_explore_ids(deck, now)
+    unsure_ids, discover_ids, interest_ids = _served_explore_ids(deck, now)
     # The feedback-matched top pick in each pool is excluded and backfilled
     # with the next-best candidates in that pool.
     assert unsure_ids == set(
         range(_UNSURE_BASE + 1, _UNSURE_BASE + 1 + EXPLORE_PER_BADGE)
     )
-    assert novel_ids == set(range(_NOVEL_BASE + 1, _NOVEL_BASE + 1 + EXPLORE_PER_BADGE))
+    assert discover_ids == set(
+        range(_DISCOVER_BASE + 1, _DISCOVER_BASE + 1 + EXPLORE_PER_BADGE)
+    )
     assert interest_ids == set(
         range(_INTEREST_BASE + 1, _INTEREST_BASE + 1 + EXPLORE_PER_BADGE)
     )
@@ -3970,9 +3984,11 @@ def test_explore_badges_no_feedback_match_predicate_is_unaffected() -> None:
         ranked, config=Config(count=40), now=now, explore=explore
     )
 
-    unsure_ids, novel_ids, interest_ids = _served_explore_ids(deck, now)
+    unsure_ids, discover_ids, interest_ids = _served_explore_ids(deck, now)
     assert unsure_ids == set(range(_UNSURE_BASE, _UNSURE_BASE + EXPLORE_PER_BADGE))
-    assert novel_ids == set(range(_NOVEL_BASE, _NOVEL_BASE + EXPLORE_PER_BADGE))
+    assert discover_ids == set(
+        range(_DISCOVER_BASE, _DISCOVER_BASE + EXPLORE_PER_BADGE)
+    )
     assert interest_ids == set(
         range(_INTEREST_BASE, _INTEREST_BASE + EXPLORE_PER_BADGE)
     )
@@ -3991,24 +4007,24 @@ def test_interest_picks_go_round_robin_least_covered_interest_first() -> None:
     """Each round takes every interest's best-scoring story; interests the
     served Recommended covers least go first, then bigger ones."""
     now = int(time.time())
-    # Recommended: RECOMMENDED_PICKS stories of interest 0; Novel takes the
-    # most novel ones (ids 800..). Left for Interest: interest 1 (big) holds
-    # ids 901 and 902, interest 2 (small) 903, interest 0 904, which scores
-    # best of the four.
+    # Recommended: RECOMMENDED_PICKS stories of interest 0; Discover takes
+    # the far ones (ids 800.., sim 0.1). Left for Interest: interest 1 (big)
+    # holds ids 901 and 902, interest 2 (small) 903, interest 0 904, which
+    # scores best of the four.
     fillers = [(i, 1000.0 - i, 0) for i in range(RECOMMENDED_PICKS)]
-    novel = [(800 + i, 1.0, 0) for i in range(EXPLORE_PER_BADGE * SELECT_MARGIN)]
+    discover = [(800 + i, 1.0, 0) for i in range(EXPLORE_PER_BADGE * SELECT_MARGIN)]
     rest = [(901, 50.0, 1), (902, 40.0, 1), (903, 30.0, 2), (904, 60.0, 0)]
-    stories = fillers + novel + rest
+    stories = fillers + discover + rest
     ranked = [
         RankedStory(story=_f2_story(sid), score=score, best_match_title="")
         for sid, score, _ in stories
     ]
     row_of = {r.story.id: i for i, r in enumerate(ranked)}
-    max_sim = np.full(len(ranked), 0.99, dtype=np.float32)
-    for sid, *_ in novel:
-        max_sim[row_of[sid]] = 0.1
+    closest_up = np.full(len(ranked), 0.99, dtype=np.float32)
+    for sid, *_ in discover:
+        closest_up[row_of[sid]] = 0.1
     explore = ranking.ExploreContext(
-        cand_max_sim=max_sim,
+        cand_closest_up=closest_up,
         cand_interest=np.array([interest for *_, interest in stories], dtype=np.int64),
         interest_sizes=np.array([30, 50, 10], dtype=np.int64),
         row_of=row_of,
@@ -4163,7 +4179,7 @@ def test_explore_and_popular_can_share_a_card() -> None:
     )
     pool = fillers + [target]
     explore = ranking.ExploreContext(
-        cand_max_sim=np.full(len(pool), 0.5, dtype=np.float32),
+        cand_closest_up=np.full(len(pool), 0.5, dtype=np.float32),
         cand_interest=np.zeros(len(pool), dtype=np.int64),
         interest_sizes=np.zeros(0, dtype=np.int64),
         row_of={r.story.id: i for i, r in enumerate(pool)},
@@ -4961,11 +4977,14 @@ def test_prewarm_top_stories_skips_stories_not_in_db() -> None:
         db.close()
 
 
-def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
-    """A candidate close to a neutral feedback story should not get is_novel=True,
-    because cand_max_sim now includes neutral similarity in the 3-way max."""
+def test_candidate_close_to_neutral_but_far_from_up_can_be_discover(
+    db, embedder, monkeypatch
+):
+    """Discover looks at up-votes only: a candidate close to a neutral (or
+    down-voted) story but far from up-votes CAN be Discover, while a
+    candidate close to an up-vote cannot."""
     config = Config(count=3)
-    user = db.create_user("test_neutral_novel")
+    user = db.create_user("test_neutral_discover")
 
     def mock_gce(stories, embedder_arg, db_inst):
         arr = np.zeros((len(stories), 384), dtype=np.float32)
@@ -4995,20 +5014,18 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
 
     # Controlled candidate embeddings. 3 targets + enough fillers to
     # saturate the Recommended picks so targets land in the Explore pool.
-    # 1 -> close to neutral (axis 2), max_sim=0.95
-    # 2 -> close to up (axis 0), max_sim=0.95
-    # 3 -> far from all (axis 3), max_sim=0
+    # 1 -> close to neutral (axis 2), far from up (sim_up=0)
+    # 2 -> close to up (axis 0), sim_up=0.95
+    # 3 -> far from all (axis 3), sim_up=0
     n_total = RECOMMENDED_PICKS + 10  # fill Recommended + room for Explore
     cand_embs = np.zeros((n_total, 384), dtype=np.float32)
     cand_embs[0, 2] = 0.95  # close to neutral
     cand_embs[1, 0] = 0.95  # close to up
     cand_embs[2, 3] = 1.0  # far from all feedback
     for i in range(3, n_total):
-        cand_embs[i, 0] = 0.05
-        cand_embs[i, 1] = 0.05
-        cand_embs[i, 2] = 0.05
-        cand_embs[i, 50 + i] = 0.6
-        cand_embs[i, 200 + i] = 0.8
+        cand_embs[i, 0] = 0.95
+        cand_embs[i, 50 + i] = 0.1
+        cand_embs[i, 200 + i] = 0.2
 
     candidates = []
     now = int(time.time())
@@ -5044,27 +5061,30 @@ def test_candidate_similar_to_neutral_is_not_novel(db, embedder, monkeypatch):
     )
     by_id = _served_by_id(deck, "1w")
 
-    # id=3 (far from all feedback, max_sim=0, dist=1.0) is the most
-    # novel and should be in the top EXPLORE_PER_BADGE by distance.
-    assert 3 in by_id, "id=3 (far from all feedback) should be in final"
-    assert by_id[3].is_novel, (
-        f"id=3 (far from feedback) should be novel; got is_novel={by_id[3].is_novel}"
+    # id=3 (far from up-votes) is Discover-eligible and should be picked.
+    assert 3 in by_id, "id=3 (far from up-votes) should be in final"
+    assert by_id[3].is_discover, (
+        f"id=3 (far from up-votes) should be discover; got is_discover={by_id[3].is_discover}"
     )
-    # id=1 (close to neutral, max_sim=0.95) is not novel.
-    # id=2 (close to up, max_sim=0.95) has high up-similarity so it
-    # may get is_interest but should NOT get is_novel.
-    for cid in (1, 2):
-        if cid in by_id:
-            assert not by_id[cid].is_novel, (
-                f"Candidate {cid} (close to feedback) should not be novel"
-            )
+    # id=1 is close to a neutral story but far from up-votes, so it CAN be
+    # Discover (Discover looks at up-votes only).
+    if 1 in by_id:
+        assert by_id[1].is_discover, (
+            "Candidate 1 (far from up, close to neutral) should be discover-eligible"
+        )
+    # id=2 (close to up, sim_up=0.95) is never Discover.
+    if 2 in by_id:
+        assert not by_id[2].is_discover, (
+            "Candidate 2 (close to up-vote) should not be discover"
+        )
 
 
-def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypatch):
-    """When no neutral feedback exists, cand_max_sim equals max(up, down) because
-    neutral similarities are zeros — same as old behavior."""
+def test_close_to_down_but_far_from_up_can_be_discover(db, embedder, monkeypatch):
+    """Discover ignores down-votes: a story close to a down-vote but far from
+    up-votes CAN be Discover, while a story at or above the threshold is
+    never Discover even when it is the highest-scored."""
     config = Config(count=10)
-    user = db.create_user("test_no_neutral_novel")
+    user = db.create_user("test_down_discover")
 
     def mock_gce(stories, embedder_arg, db_inst):
         arr = np.zeros((len(stories), 384), dtype=np.float32)
@@ -5090,19 +5110,20 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
         )
         db.upsert_feedback(user.id, sid, action)
 
-    # Controlled candidate embeddings. 2 targets + enough fillers to
+    # Controlled candidate embeddings. 3 targets + enough fillers to
     # saturate the Recommended picks so targets land in the Explore pool.
-    # 1 -> close to up (axis 0), max_sim=0.95
-    # 2 -> far from all (axis 3), max_sim=0
+    # 1 -> close to up (axis 0), sim_up=0.95, highest target score
+    # 2 -> close to down (axis 1), sim_up=0
+    # 3 -> far from all (axis 3), sim_up=0
     n_total = RECOMMENDED_PICKS + 8
     cand_embs = np.zeros((n_total, 384), dtype=np.float32)
     cand_embs[0, 0] = 0.95
-    cand_embs[1, 3] = 1.0
-    for i in range(2, n_total):
-        cand_embs[i, 0] = 0.05
-        cand_embs[i, 1] = 0.05
-        cand_embs[i, 50 + i] = 0.6
-        cand_embs[i, 200 + i] = 0.8
+    cand_embs[1, 1] = 0.95
+    cand_embs[2, 3] = 1.0
+    for i in range(3, n_total):
+        cand_embs[i, 0] = 0.95
+        cand_embs[i, 50 + i] = 0.1
+        cand_embs[i, 200 + i] = 0.2
 
     now = int(time.time())
     candidates = [
@@ -5110,7 +5131,7 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
             id=1,
             title="Up-like",
             url=None,
-            score=5,
+            score=50,
             time=now - 86400,
             text_content="",
             source="hn",
@@ -5118,7 +5139,7 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
         ),
         Story(
             id=2,
-            title="Novel",
+            title="Down-like",
             url=None,
             score=5,
             time=now - 86400,
@@ -5126,8 +5147,18 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
             source="hn",
             comment_count=0,
         ),
+        Story(
+            id=3,
+            title="Far",
+            url=None,
+            score=10,
+            time=now - 86400,
+            text_content="",
+            source="hn",
+            comment_count=0,
+        ),
     ]
-    for i in range(2, n_total):
+    for i in range(3, n_total):
         candidates.append(
             Story(
                 id=100 + i,
@@ -5146,32 +5177,37 @@ def test_no_neutral_feedback_uses_up_down_only_for_novel(db, embedder, monkeypat
     )
     by_id = _served_by_id(deck, "1w")
 
-    # id=2 (max_sim=0, dist=1.0) is the most novel; it's in the top
-    # EXPLORE_PER_BADGE by distance.
-    assert 2 in by_id, "id=2 (not similar to any) should be in final"
-    assert by_id[2].is_novel, (
-        f"Candidate 2 should be novel; got is_novel={by_id[2].is_novel}"
+    # id=3 (far from up) is Discover-eligible and should be picked.
+    assert 3 in by_id, "id=3 (far from up-votes) should be in final"
+    assert by_id[3].is_discover, (
+        f"Candidate 3 should be discover; got is_discover={by_id[3].is_discover}"
     )
-    # id=1 (max_sim=0.95) is close to feedback, not novel.
+    # id=2 is close to a down-vote but far from up-votes, so it CAN be
+    # Discover (Discover looks at up-votes only).
+    if 2 in by_id:
+        assert by_id[2].is_discover, (
+            "Candidate 2 (far from up, close to down) should be discover-eligible"
+        )
+    # id=1 (sim_up=0.95) is never Discover even though it is the
+    # highest-scored target.
     if 1 in by_id:
-        assert not by_id[1].is_novel, "Candidate 1 (similar to up) should not be novel"
+        assert not by_id[1].is_discover, (
+            "Candidate 1 (similar to up) should not be discover"
+        )
 
 
-def test_novel_pass_ranks_purely_by_distance_not_score(
+def test_discover_pass_ranks_far_by_score_not_distance(
     db, embedder, monkeypatch
 ) -> None:
-    """The Novel pass ranks by distance (1 - max_similarity) only, not score.
-    A low-score, high-distance story beats a higher-score, lower-distance
-    story when the slot cap forces a cut.
+    """The Discover pass picks the highest-scored far stories, not the
+    farthest. A near story is never Discover even when it is the
+    highest-scored in the Explore pool.
 
-    The served Novel view keeps EXPLORE_PER_BADGE, so the cut is at
-    position EXPLORE_PER_BADGE. We construct scores so the last-kept
-    (by distance) story has a very low score; pure-distance ranking keeps
-    it; a score-blended ranking would have dropped it for the first
-    excluded (higher-score) story.
+    The served Discover view keeps EXPLORE_PER_BADGE, so the cut is at
+    position EXPLORE_PER_BADGE among far stories sorted by score.
     """
     config = Config(count=40)
-    user = db.create_user("test_novel_distance")
+    user = db.create_user("test_discover_score")
 
     # Feedback at axis 0 (one upvoted story).
     def mock_gce(stories, embedder_arg, db_inst):
@@ -5187,11 +5223,11 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
     )
     db.upsert_feedback(user.id, 100, "up")
 
-    # Primary fillers (high score) + controlled extras (low score, varied sim).
-    # The novel pass picks EXPLORE_PER_BADGE by distance. We arrange so
-    # the last-by-distance kept id has a very low score, and the first
-    # excluded id (worse distance) has a high score; a score-blended
-    # ranking would have swapped the two.
+    # Primary fillers (high score) + controlled extras (varied score, all far
+    # except one near with the highest Explore-pool score).
+    # The discover pass picks EXPLORE_PER_BADGE far stories by score. The
+    # near story (sim 0.95, score 60) is never Discover despite outscoring
+    # every far story.
     now = int(time.time())
     candidates = []
     for i in range(RECOMMENDED_PICKS):
@@ -5207,12 +5243,10 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
                 comment_count=0,
             )
         )
-    extra_scores = [10] * (EXPLORE_PER_BADGE + 2)
-    extra_scores[EXPLORE_PER_BADGE - 1] = 1  # last kept, very low score
-    extra_scores[EXPLORE_PER_BADGE] = 50  # first excluded, high score
-    # Strictly increasing sim -> strictly decreasing distance/novelty.
-    extra_sims = [round(0.10 + 0.05 * i, 2) for i in range(EXPLORE_PER_BADGE + 2)]
-    for i, sc in enumerate(extra_scores):
+    n_far = EXPLORE_PER_BADGE + 2
+    far_scores = [10 + 10 * i for i in range(n_far)]
+    far_sims = [round(0.10 + 0.05 * i, 2) for i in range(n_far)]
+    for i, sc in enumerate(far_scores):
         candidates.append(
             Story(
                 id=RECOMMENDED_PICKS + i,
@@ -5225,35 +5259,50 @@ def test_novel_pass_ranks_purely_by_distance_not_score(
                 comment_count=0,
             )
         )
+    near_id = RECOMMENDED_PICKS + n_far
+    candidates.append(
+        Story(
+            id=near_id,
+            title="ENear",
+            url=None,
+            score=60,
+            time=now - 3600,
+            text_content="extra near",
+            source="hn",
+            comment_count=0,
+        )
+    )
 
     n_total = len(candidates)
     cand_embs = np.zeros((n_total, 384), dtype=np.float32)
     for i in range(RECOMMENDED_PICKS):
         cand_embs[i, 0] = 0.5
         cand_embs[i, 50 + i] = np.sqrt(0.75)
-    for i, s in enumerate(extra_sims):
+    for i, s in enumerate(far_sims):
         idx = RECOMMENDED_PICKS + i
         cand_embs[idx, 0] = s
         cand_embs[idx, 100 + i] = np.sqrt(max(1.0 - s * s, 0.0))
+    cand_embs[near_id, 0] = 0.95
+    cand_embs[near_id, 200] = np.sqrt(max(1.0 - 0.95 * 0.95, 0.0))
 
     deck = rerank_candidates(
         db, config, embedder, candidates, cand_embs, user_id=user.id
     )
 
     by_id = _served_by_id(deck, "1w")
-    kept_id = RECOMMENDED_PICKS + (EXPLORE_PER_BADGE - 1)
-    excluded_id = RECOMMENDED_PICKS + EXPLORE_PER_BADGE
-    # kept_id (very low score) is the last-by-distance story within the cap.
-    # Pure-distance ranking keeps it; score-blended would drop it for
-    # excluded_id instead.
-    assert by_id[kept_id].is_novel, (
-        f"id={kept_id} (worst distance kept, score=1) should be novel"
-    )
-    # excluded_id (high score) is just beyond the EXPLORE_PER_BADGE cut,
-    # so NOT novel despite the higher score.
-    if excluded_id in by_id:
-        assert not by_id[excluded_id].is_novel, (
-            f"id={excluded_id} (higher score, worse distance) must NOT be novel"
+    # Top EXPLORE_PER_BADGE far stories by score are Discover.
+    top_far_ids = [
+        RECOMMENDED_PICKS + i
+        for i in sorted(range(n_far), key=lambda i: far_scores[i], reverse=True)[
+            :EXPLORE_PER_BADGE
+        ]
+    ]
+    for fid in top_far_ids:
+        assert by_id[fid].is_discover, f"id={fid} (top-scored far) should be discover"
+    # The near story is never Discover despite the highest Explore-pool score.
+    if near_id in by_id:
+        assert not by_id[near_id].is_discover, (
+            f"id={near_id} (near, highest score) must NOT be discover"
         )
 
 
@@ -7462,7 +7511,7 @@ def test_attribution_skips_matches_that_only_share_the_pool_direction() -> None:
 
 
 def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
-    """Hot/Top/Talk/Unsure/Novel cards are there for popularity or
+    """Hot/Top/Talk/Unsure/Discover cards are there for popularity or
     exploration: they name an upvote only at BADGED_ATTRIBUTION_MIN_SIM,
     even when the match comes from the story's unbadged Recommended entry.
     Unbadged and Interest cards keep the plain floor."""
@@ -7480,7 +7529,7 @@ def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
             is_discussion_rich=flags.get("is_discussion_rich", False),
             is_uncertain=flags.get("is_uncertain", False),
             is_interest=flags.get("is_interest", False),
-            is_novel=flags.get("is_novel", False),
+            is_discover=flags.get("is_discover", False),
         )
 
     weak, close = 0.7, 0.9
@@ -7498,7 +7547,7 @@ def test_badged_cards_name_an_upvote_only_on_a_close_match() -> None:
                 explore=(
                     item(4, weak, is_uncertain=True),
                     item(5, weak, is_interest=True),
-                    item(7, weak, is_novel=True),
+                    item(7, weak, is_discover=True),
                 ),
             )
         }
@@ -8315,3 +8364,276 @@ def test_refresh_hot_counts_updates_the_busiest_young_threads(
         )
     finally:
         db.close()
+
+
+@st.composite
+def _discover_pools(
+    draw: st.DrawFn,
+) -> tuple[list[RankedStory], ranking.ExploreContext]:
+    """Random pools for the Discover property test: recent HN stories with
+    coarse scores (ties common) and random up-similarities in [0, 1]. Sizes
+    run past Recommended's picks plus Unsure's, so Discover usually fills,
+    and below them, so it is sometimes empty."""
+    n = draw(st.integers(20, 60))
+    ids = draw(st.lists(st.integers(1, 10**6), unique=True, min_size=n, max_size=n))
+    now = int(time.time())
+    seed = draw(st.integers(0, 2**32 - 1))
+    rng = np.random.default_rng(seed)
+    scores = rng.integers(-6, 6, n) / 2
+    sims = rng.random(n, dtype=np.float32)
+    ranked = [
+        RankedStory(
+            story=Story(
+                id=sid,
+                title=f"Story {sid}",
+                url=None,
+                score=10,
+                time=now - 3600,
+                text_content="",
+                source="hn",
+                comment_count=0,
+            ),
+            score=float(scores[i]),
+            best_match_title="",
+            prob_down=1 / 3,
+            prob_neutral=1 / 3,
+            prob_up=1 / 3,
+        )
+        for i, sid in enumerate(ids)
+    ]
+    return ranked, ranking.ExploreContext(
+        cand_closest_up=np.asarray(sims, dtype=np.float32),
+        cand_interest=np.zeros(n, dtype=np.int64),
+        interest_sizes=np.zeros(0, dtype=np.int64),
+        row_of={r.story.id: i for i, r in enumerate(ranked)},
+    )
+
+
+@settings(max_examples=40, deadline=None)
+@given(pool_and_context=_discover_pools())
+def test_discover_picks_top_scored_far_outside_recommended(
+    pool_and_context: tuple[list[RankedStory], ranking.ExploreContext],
+) -> None:
+    """Discover holds far stories (< threshold) outside Recommended, top-scored
+    first, and leaves Recommended/Popular untouched."""
+    ranked, explore = pool_and_context
+    now = int(time.time())
+    config = Config()
+    deck = ranking.assemble_window_deck(
+        ranked, config=config, now=now, explore=explore, is_feedback_match=None
+    )
+    bare = ranking.assemble_window_deck(ranked, config=config, now=now, explore=None)
+    sim_of = {
+        r.story.id: float(explore.cand_closest_up[explore.row_of[r.story.id]])
+        for r in ranked
+    }
+    for window in ("12h", "1d", "1w", "1m"):
+        views = deck.window(window)
+        bare_views = bare.window(window)
+        assert [r.story.id for r in views.recommended] == [
+            r.story.id for r in bare_views.recommended
+        ]
+        assert [r.story.id for r in views.popular] == [
+            r.story.id for r in bare_views.popular
+        ]
+        recommended_ids = {r.story.id for r in views.recommended}
+        unsure_ids = {r.story.id for r in views.explore if r.is_uncertain}
+        discover = [r for r in views.explore if r.is_discover]
+        assert len(discover) <= EXPLORE_PER_BADGE * SELECT_MARGIN
+        for r in discover:
+            assert sim_of[r.story.id] < DISCOVER_MAX_SIM_UP
+            assert r.story.id not in recommended_ids
+            assert not r.is_uncertain
+            assert r.story.id not in unsure_ids
+        served = _served(deck, window, now)
+        served_discover = [r for r in served.explore if r.is_discover]
+        assert len(served_discover) <= EXPLORE_PER_BADGE
+        # Exactly the top-scored eligible far stories: any far story left out
+        # scores no higher than the lowest picked one.
+        picked_ids = {r.story.id for r in discover}
+        far = sorted(
+            (
+                r
+                for r in ranked
+                if ranking.in_window(r.story.time, window, now)
+                and r.story.id not in recommended_ids
+                and r.story.id not in unsure_ids
+                and sim_of[r.story.id] < DISCOVER_MAX_SIM_UP
+            ),
+            key=lambda r: r.score,
+            reverse=True,
+        )
+        # Filled as far as the eligible far stories allow, never backfilled.
+        assert len(discover) == min(len(far), EXPLORE_PER_BADGE * SELECT_MARGIN)
+        if discover:
+            lowest = min(r.score for r in discover)
+            assert picked_ids <= {r.story.id for r in far[: len(discover)]}
+            for r in far[len(discover) :]:
+                assert r.score <= lowest
+
+
+def test_discover_skips_feedback_matches() -> None:
+    """A story for which is_feedback_match returns True is never Discover."""
+    now = int(time.time())
+    ranked = [
+        RankedStory(
+            story=Story(
+                id=i,
+                title=f"S{i}",
+                url=None,
+                score=100 - i,
+                time=now - 3600,
+                text_content="",
+                source="hn",
+                comment_count=0,
+            ),
+            score=float(100 - i),
+            best_match_title="",
+        )
+        for i in range(10)
+    ]
+    explore = ranking.ExploreContext(
+        cand_closest_up=np.zeros(len(ranked), dtype=np.float32),
+        cand_interest=np.zeros(len(ranked), dtype=np.int64),
+        interest_sizes=np.zeros(0, dtype=np.int64),
+        row_of={r.story.id: i for i, r in enumerate(ranked)},
+    )
+    deck = ranking.assemble_window_deck(
+        ranked,
+        config=Config(),
+        now=now,
+        explore=explore,
+        is_feedback_match=lambda s: s.id == 9,
+    )
+    for window in WINDOWS:
+        assert 9 not in {
+            r.story.id for r in deck.window(window).explore if r.is_discover
+        }
+
+
+def test_discover_threshold_is_strict() -> None:
+    """A story exactly at DISCOVER_MAX_SIM_UP is not Discover; one just below
+    is."""
+    now = int(time.time())
+    fillers = [
+        RankedStory(
+            story=Story(
+                id=i,
+                title=f"F{i}",
+                url=None,
+                score=100,
+                time=now - 3600,
+                text_content="",
+                source="hn",
+                comment_count=0,
+            ),
+            score=100.0 - i,
+            best_match_title="",
+        )
+        for i in range(RECOMMENDED_PICKS)
+    ]
+    at = RankedStory(
+        story=Story(
+            id=900,
+            title="AtThreshold",
+            url=None,
+            score=50,
+            time=now - 3600,
+            text_content="",
+            source="hn",
+            comment_count=0,
+        ),
+        score=50.0,
+        best_match_title="",
+    )
+    below = RankedStory(
+        story=Story(
+            id=901,
+            title="BelowThreshold",
+            url=None,
+            score=49,
+            time=now - 3600,
+            text_content="",
+            source="hn",
+            comment_count=0,
+        ),
+        score=49.0,
+        best_match_title="",
+    )
+    ranked = fillers + [at, below]
+    explore = ranking.ExploreContext(
+        cand_closest_up=np.asarray(
+            [0.99] * len(fillers) + [DISCOVER_MAX_SIM_UP, DISCOVER_MAX_SIM_UP - 0.01],
+            dtype=np.float32,
+        ),
+        cand_interest=np.zeros(len(ranked), dtype=np.int64),
+        interest_sizes=np.zeros(0, dtype=np.int64),
+        row_of={r.story.id: i for i, r in enumerate(ranked)},
+    )
+    deck = ranking.assemble_window_deck(
+        ranked, config=Config(), now=now, explore=explore, is_feedback_match=None
+    )
+    by_id = {r.story.id: r for r in deck.window("1w").explore}
+    assert 900 not in by_id or not by_id[900].is_discover
+    assert by_id[901].is_discover
+
+
+def test_discover_badge_details_and_no_novel_kind() -> None:
+    """A Discover card's badge_details has kind discover (✨ Discover); no feed
+    contains kind novel."""
+    from pipeline import render
+
+    story = Story(
+        id=424243,
+        title="Discover probe",
+        url=None,
+        score=10,
+        time=int(time.time()) - 3600,
+        text_content="",
+        source="hn",
+        comment_count=0,
+    )
+    item = RankedStory(story=story, score=1.0, best_match_title="", is_discover=True)
+    deck = WindowDeck({"1w": WindowViews(explore=(item,))})
+    feed = render.build_feed(deck, "1w", Config(), {}, 1, 1)
+    kinds = [(b.kind, b.icon, b.label) for s in feed.stories for b in s.badge_details]
+    assert ("discover", "✨", "Discover") in kinds
+    assert not any(kind == "novel" for kind, _, _ in kinds)
+
+
+def test_discover_with_zero_upvotes_takes_best_scored() -> None:
+    """With zero up-votes (all sims zero), Discover takes the best-scored
+    stories outside Recommended (no crash, no empty pass)."""
+    now = int(time.time())
+    ranked = [
+        RankedStory(
+            story=Story(
+                id=i,
+                title=f"S{i}",
+                url=None,
+                score=100 - i,
+                time=now - 3600,
+                text_content="",
+                source="hn",
+                comment_count=0,
+            ),
+            score=float(100 - i),
+            best_match_title="",
+        )
+        for i in range(RECOMMENDED_PICKS + 5)
+    ]
+    explore = ranking.ExploreContext(
+        cand_closest_up=np.zeros(len(ranked), dtype=np.float32),
+        cand_interest=np.zeros(len(ranked), dtype=np.int64),
+        interest_sizes=np.zeros(0, dtype=np.int64),
+        row_of={r.story.id: i for i, r in enumerate(ranked)},
+    )
+    deck = ranking.assemble_window_deck(
+        ranked, config=Config(), now=now, explore=explore, is_feedback_match=None
+    )
+    discover = [r for r in deck.window("1w").explore if r.is_discover]
+    assert discover, "Discover should not be empty with all-zero sims"
+    recommended_ids = {r.story.id for r in deck.window("1w").recommended}
+    assert not recommended_ids & {r.story.id for r in discover}
+    scores = sorted((r.score for r in discover), reverse=True)
+    assert [r.score for r in discover] == scores
