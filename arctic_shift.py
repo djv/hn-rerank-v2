@@ -15,7 +15,7 @@ leaders.
 
 The archive reads the official Reddit API, so it is expected to stop when
 Reddit closes public API access (March 2027) or earlier on a takedown.
-Evidence: FINDINGS.md "Reddit after the RSS shutdown".
+The archive supplies both listing and discussion data without Reddit login.
 """
 
 from __future__ import annotations

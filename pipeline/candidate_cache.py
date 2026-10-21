@@ -7,9 +7,8 @@ every user — per-user personalization only excludes already-voted stories,
 a boolean mask over the same rows. Before this cache, every dashboard
 warm and every cold-deck build re-paid the full SQL + embedding cost
 (measured at 2-8s median, up to 23s) even though the SVM fit itself takes
-single-digit milliseconds (see WORKLOG 2026-07-28 friend-session
-investigation). This module caches the pool once per regen generation and
-lets callers apply the feedback exclusion as an in-memory mask instead.
+single-digit milliseconds. This module caches the pool once per regen generation
+and lets callers apply the feedback exclusion as an in-memory mask instead.
 """
 
 from __future__ import annotations

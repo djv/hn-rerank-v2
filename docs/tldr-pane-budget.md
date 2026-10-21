@@ -39,11 +39,11 @@ closing story. A section gets a second bullet only after every section has
 one. When there are more sections than bullets, the shorter sections share
 one bullet instead of being dropped. Article sections use no `####` headings;
 each bullet starts with its section's topic in bold. Cause: Import AI 475
-(2026-10-05) spent all four bullets on its first item; see FINDINGS.md.
+spent its entire bullet budget on its first item.
 
 ## Long-article budget (detail-v15)
 
-At the user's request (2026-10-05), long articles now get slightly more room.
+Long articles get more room to preserve coverage of distinct arguments.
 The article's length is the longer of its self text and fetched body, not
 their sum, because an RSS self text is usually the feed's copy of the body.
 Discussions always keep the base budget.

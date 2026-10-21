@@ -72,7 +72,7 @@ class RedditRateLimiter:
         Inside the lock, atomically computes this caller's slot time
         (``max(now, _next_allowed_at)``) and reserves the FOLLOWING slot,
         so concurrent callers across threads stagger correctly even
-        before any HTTP response is known (see WORKLOG 2026-06-28).
+        before any HTTP response is known.
         The lock is released during asyncio.sleep so threads proceed.
         """
         with self._lock:

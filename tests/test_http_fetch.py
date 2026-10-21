@@ -54,8 +54,7 @@ def test_urllib_fetch_returns_error_status_without_raising(code: int) -> None:
     Regression: pre-fix, the uncaught ``HTTPError`` propagated from
     ``urlopen`` and silently dropped topfeed tasks when both httpx and
     urllib got 403 from a Reddit block. The live service's topfeed
-    was stalled for 25+ minutes because of this. See WORKLOG
-    2026-06-29 for the diagnosis.
+    was stalled for 25+ minutes because of this.
     """
     msg = _empty_msg()
     msg["Retry-After"] = "30"
@@ -83,7 +82,7 @@ def test_urllib_fetch_propagates_network_errors() -> None:
 # this fix, a transport error from client.get() propagated straight past
 # fetch_with_urllib_fallback to the caller's bare `except Exception`, with
 # no urllib retry -- unlike the existing 403/503 status-code fallback,
-# which already had one. See WORKLOG 2026-08-27.
+# which already had one.
 # ---------------------------------------------------------------------------
 
 

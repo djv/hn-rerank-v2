@@ -2,7 +2,7 @@
 
 A story whose whole discussion is a short "Comments moved to item?id=N" note
 (`pipeline.hn_dupes.pointer_thread_target`) got a TLDR invented from that
-note (story 32148318, 38507672; WORKLOG.md 2026-09-29). Taps and prefetch now
+note. Taps and prefetch now
 follow the link one story at a time; this does all of them at once, with the
 same `server._follow_pointer_thread`, and embeds the new text here so the
 server's next candidate-pool rebuild does not re-embed them under its lock.

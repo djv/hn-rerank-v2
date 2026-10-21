@@ -449,8 +449,7 @@ class _HashEmbedder(Embedder):
     Differentiation is random-but-stable, so structural assertions (badge
     floors, tiers, ordering mechanics, SVM plumbing) hold at ~0 cost vs a
     2.5s ONNX load + per-test encodes. Tests asserting *semantic*
-    similarity use `_real_embedder`. __init__ overridden per the
-    mock-embedder rule in AGENTS.md.
+    similarity use `_real_embedder`. Overriding __init__ avoids loading ONNX.
     """
 
     def __init__(self) -> None:
@@ -2936,7 +2935,7 @@ def test_load_production_candidate_stories_rss_leg_reaches_full_window(
 
     Regression guard for the ~4-day effective RSS window found in
     production (recent_candidate_rss_limit=500 against ~4,200 in-window
-    rows, ORDER BY time DESC — see WORKLOG 2026-08-28/2026-08-30):
+    rows, ORDER BY time DESC):
     with a limit that clears the row count, every in-window row must come
     back, including the oldest ones near the `days` cutoff.
     """
@@ -6093,8 +6092,7 @@ def test_fetch_candidates_only_prewarms_top_n_per_sub_from_cache(
 ) -> None:
     """The prewarm phase reads the topfeed cache and takes the first
     ``reddit_prewarm_top_per_sub`` stories per subreddit (Reddit returns
-    them in hot/score-desc order). Multi-cycle completion is expected —
-    see WORKLOG 2026-06-29 "Reddit refresh".
+    them in hot/score-desc order). Multi-cycle completion is expected.
 
     With 3 subs × 5 stories each and N=2, the prewarm factory receives
     6 IDs: the first 2 from each sub's cache.

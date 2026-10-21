@@ -1,8 +1,9 @@
 # HN Rerank terminal reader
 
-Run `uvx hn-rerank` (Python 3.12+). Choose an existing profile link or create a
+From this checkout, run `uv run hn-rerank` (Python 3.12+). Choose an existing profile link or create a
 profile with your server URL, for example `https://your-host/hn/`.
-`--server URL` selects a deployment; credentials from another server are never reused.
+`--server URL` selects a deployment (`HN_RERANK_SERVER` sets the default;
+otherwise `http://127.0.0.1:8766/`); credentials from another server are never reused.
 The server retains its existing access policy: installing the client does not grant access.
 
 Keys: j/k next/previous story (list and zoom view); arrows scroll the focused

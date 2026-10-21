@@ -443,7 +443,7 @@ def _needs_hn_prewarm(s: Story) -> bool:
     since the last prewarm (see ``_growth_threshold``).
 
     The threshold catches the 1->284 "stale single-comment stub" case
-    (WORKLOG 2026-06-29) and keeps small stories (10-50 fetched comments)
+    and keeps small stories (10-50 fetched comments)
     from sitting on stale ``top_comments`` while the ceiling-only
     ``max(50, ...)`` previously dominated ``fetched // 2`` until
     ``fetched >= 100``. ``prewarm_top_stories`` rewrites
@@ -1063,7 +1063,7 @@ def fast_rerank_for_user(
     # Explore passes (Unsure/Discover/Interest) can skip-and-backfill past
     # candidates that duplicate a story the user already voted on, instead
     # of silently losing badge slots to the downstream `canonicalize_hn_dupes`
-    # feedback-match drop (see WORKLOG 2026-07-10).
+    # feedback-match drop.
     feedback_context = build_feedback_context(
         feedback, tuple(config.model.dedup_exclude_actions)
     )

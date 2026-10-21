@@ -1,6 +1,6 @@
 """Tests for the process-wide candidate pool cache.
 
-See pipeline/candidate_cache.py docstring and WORKLOG 2026-07-28 for why
+See pipeline/candidate_cache.py for why
 this exists: candidate SQL load + embedding materialization dominated
 rank time (median 2-8s across ~8,900 rows) even though the SVM fit itself
 takes single-digit milliseconds. This cache makes that load-once,

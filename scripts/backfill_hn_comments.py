@@ -1,6 +1,6 @@
 """Backfill top_comments for HN stories that missed comment prewarm.
 
-Root cause (see WORKLOG.md, 2026-07-26): `_build_comments_bulk_query`
+Root cause: `_build_comments_bulk_query`
 joined against the full comments table once per tree level, which
 reliably exceeded play.clickhouse.com's query memory limit
 (Code: 241, MEMORY_LIMIT_EXCEEDED) from 2026-07-23 onward. Every regen's
@@ -57,7 +57,9 @@ def main() -> None:
         help="List affected stories without calling ClickHouse or writing to the DB.",
     )
     parser.add_argument(
-        "--config", default="config.toml", help="Path to config.toml (default: %(default)s)."
+        "--config",
+        default="config.toml",
+        help="Path to config.toml (default: %(default)s).",
     )
     args = parser.parse_args()
 
@@ -71,7 +73,9 @@ def main() -> None:
         print("No stuck HN stories found.")
         return
 
-    print(f"Found {len(story_ids)} HN stories with comment_count > 0 and empty top_comments.")
+    print(
+        f"Found {len(story_ids)} HN stories with comment_count > 0 and empty top_comments."
+    )
 
     if args.dry_run:
         preview = ", ".join(str(sid) for sid in story_ids[:20])

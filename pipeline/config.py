@@ -5,6 +5,7 @@ import math
 import os
 import tomllib
 from dataclasses import dataclass, field, fields, replace
+from pathlib import Path
 from types import UnionType
 from typing import (
     TYPE_CHECKING,
@@ -58,8 +59,8 @@ class ModelConfig:
     # "joined_logistic" (evaluation, 2026-10-07; pipeline/joined_classifier.py)
     # replaces the RBF SVM with one logistic regression over the same rows
     # plus TF-IDF words; it ignores svm_* and needs linear_blend_enabled off.
-    # Production in config.toml since 2026-10-16 (the interleaving trial,
-    # Config.interleave_user_ids, ended early by the user's choice).
+    # Selected in config.toml to combine semantic and lexical inputs in one
+    # classifier; see docs/EVALUATION.md for the evidence and tradeoffs.
     classifier: Literal["svm", "joined_logistic"] = "svm"
     joined_features: Literal["all", "no_metadata"] = "all"
     joined_c: float = 4.0
@@ -90,19 +91,23 @@ class ModelConfig:
     dedup_exclude_actions: tuple[str, ...] = ("up", "neutral")
 
 
-# Shared across all worktrees of this repo (sibling to the `main` checkout)
-# so the ~90MB model and secrets never need copying/symlinking per worktree.
-# Kept in sync with config.toml's [hn_rewrite] onnx_model_dir/
-# embedding_model_version/embedding_max_tokens -- these are the fallback
-# used only when config.toml doesn't override them (it currently does not).
+# Existing deployments share model files and secrets beside their checkouts.
+# Fresh clones use local model directories; process environment overrides both.
+_SHARED_DIRECTORY = Path(__file__).resolve().parents[2] / "shared"
 DEFAULT_ONNX_MODEL_DIR = os.environ.get(
-    "HN_ONNX_MODEL_DIR", "~/hn-rewrite/shared/mxbai-embed-xsmall-v1"
+    "HN_ONNX_MODEL_DIR",
+    str(_SHARED_DIRECTORY / "mxbai-embed-xsmall-v1")
+    if _SHARED_DIRECTORY.is_dir()
+    else "onnx_model",
 )
 DEFAULT_EMBEDDING_MODEL_VERSION = "mxbai-embed-xsmall-v1|mean|norm|4096"
 DEFAULT_EMBEDDING_MAX_TOKENS = 4096
-DEFAULT_ENV_PATH = "~/hn-rewrite/shared/.env"
+DEFAULT_ENV_PATH = os.environ.get("HN_ENV_FILE", str(_SHARED_DIRECTORY / ".env"))
 DEFAULT_SIDE_EMBEDDING_MODEL_DIR = os.environ.get(
-    "HN_SIDE_MODEL_DIR", "~/hn-rewrite/shared/embeddinggemma-300m-onnx"
+    "HN_SIDE_MODEL_DIR",
+    str(_SHARED_DIRECTORY / "embeddinggemma-300m-onnx")
+    if _SHARED_DIRECTORY.is_dir()
+    else "onnx_model_embeddinggemma",
 )
 DEFAULT_SIDE_EMBEDDING_MODEL_VERSION = "embeddinggemma-300m|sentence|128|classification"
 
@@ -221,9 +226,9 @@ class Config:
     #
     # rss_limit matches hn_limit (was 500, ~4,200 in-window rows) so the
     # `ORDER BY time DESC` leg actually reaches the full `days` window
-    # instead of truncating to the newest ~4 days of it (see WORKLOG
-    # 2026-08-30: pool_rss_oldest_age_h measured ~93h against a 30-day
-    # window). There's no non-HN engagement signal to sort by instead —
+    # instead of truncating to the newest ~4 days of it (the observed oldest
+    # RSS candidate was ~93h old against a 30-day window). There's no non-HN
+    # engagement signal to sort by instead —
     # score is 0 for nearly all non-HN rows — so once the limit clears
     # the in-window row count, the ordering stops mattering and the
     # ranker's own scoring picks the winners from the full window.

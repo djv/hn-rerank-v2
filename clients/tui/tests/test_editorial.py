@@ -825,8 +825,8 @@ async def test_clock_switch_restyles_css_and_rich_text(
 
 @pytest.mark.parametrize("zoom", [False, True])
 async def test_space_pages_tldr_from_either_view(zoom: bool) -> None:
-    """Space pages the TLDR down whether the list or the TLDR has focus, and
-    leaves the selected headline alone."""
+    """Space pages the TLDR down whether the list or the TLDR has focus,
+    keeping one line of overlap, and leaves the selected headline alone."""
     app = Reader(api=EditorialServer().api())
     async with app.run_test(size=(120, 20)) as pilot:
         await settle(pilot)
@@ -841,7 +841,7 @@ async def test_space_pages_tldr_from_either_view(zoom: bool) -> None:
         await pilot.press("space")
         await pilot.pause()
         first = summary.scroll_y
-        assert first == summary.scrollable_content_region.height
+        assert first == summary.scrollable_content_region.height - 1
         await pilot.press("space")
         await pilot.pause()
         assert summary.scroll_y == min(2 * first, summary.max_scroll_y)

@@ -5,8 +5,7 @@ Inputs are the SVM's scaled training rows, with the embedding block weighted
 by ``sqrt(embedding_weight)`` and everything numeric multiplied by
 ``numeric_scale``, joined to the stories' hashed TF-IDF words (the word
 model's vocabulary rule: terms in at least two training stories). Ranking
-uses P(up) - P(down). Offline (docs/evaluations/model-ablation-20261007/
-FEATURE-REMOVALS.md): "all" is shortlist candidate #2, "no_metadata" #4.
+uses P(up) - P(down). Feature tradeoffs are summarized in docs/EVALUATION.md.
 This matches the offline adapter in scripts/eval_one_classifier.py, which
 tests/test_joined_classifier.py checks.
 """

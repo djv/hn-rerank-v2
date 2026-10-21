@@ -2,8 +2,6 @@
 
 Read-only diagnostic: is the set of stories actually shown to a user
 collapsing toward a shrinking region of the candidate pool over time?
-See notes/improvement-brainstorm-2026-07-15.md (Fable 4.2) for the
-motivating question.
 
 Method: cluster the *current* candidate pool with KMeans, then measure
 the impressed subset (from interaction_events) against those clusters
@@ -49,9 +47,7 @@ from scripts._ledger_common import (  # noqa: E402
 )
 
 
-def _fit_clusters(
-    embeddings: NDArray[np.float32], k: int
-) -> NDArray[np.float32]:
+def _fit_clusters(embeddings: NDArray[np.float32], k: int) -> NDArray[np.float32]:
     """KMeans over the pool, mirroring pipeline/ranking.py's
     _positive_cluster_centers: dedup, fall back to k=n_unique when the
     pool is smaller than k, L2-normalize centers."""
@@ -115,9 +111,11 @@ def main() -> None:
         )
         since_ts: float | None = None
         if args.since:
-            since_ts = dt.datetime.strptime(args.since, "%Y-%m-%d").replace(
-                tzinfo=dt.timezone.utc
-            ).timestamp()
+            since_ts = (
+                dt.datetime.strptime(args.since, "%Y-%m-%d")
+                .replace(tzinfo=dt.timezone.utc)
+                .timestamp()
+            )
             print(f"filtering impressions to occurred_at >= {args.since}")
         else:
             print(
@@ -190,8 +188,10 @@ def main() -> None:
         print()
 
         all_time_coverage = len(all_time_clusters_hit) / n_clusters
-        print(f"all-time cluster coverage: {all_time_coverage:.2f} "
-              f"({len(all_time_clusters_hit)}/{n_clusters} clusters ever shown)")
+        print(
+            f"all-time cluster coverage: {all_time_coverage:.2f} "
+            f"({len(all_time_clusters_hit)}/{n_clusters} clusters ever shown)"
+        )
         print()
 
         # Per-cluster impression share (all-time)

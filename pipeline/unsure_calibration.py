@@ -1,8 +1,7 @@
 """Platt-calibrated probabilities for Explore's Unsure entropy
 (`ModelConfig.unsure_calibration_since`).
 
-The classifier's raw P(up) is overconfident at the top (offline day-forward
-replay 2026-10-16, docs/evaluations/feed-explore-20261016/RESULT.md E7), so
+The classifier's raw P(up) can be overconfident at the top, so
 the highest raw entropy marks mostly downvotes rather than mixed stories.
 Each profile gets its own one-dimensional Platt fit of logit(P(up)) against
 "was the vote up", from the raw probabilities its recorded decks held

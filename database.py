@@ -384,7 +384,7 @@ class Database:
                     conn.execute(
                         "ALTER TABLE embeddings ADD COLUMN text_hash TEXT NOT NULL DEFAULT ''"
                     )
-                # Provenance for the embedding contract (WORKLOG 2026-09-07):
+                # Persist provenance so encoder identity survives process restarts:
                 # model_sha/dim are recorded on new rows only and never enter
                 # the match predicate, so legacy rows keep hitting as-is.
                 if "model_sha" not in emb_columns:

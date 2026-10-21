@@ -566,8 +566,7 @@ def build_reddit_prewarm_factories(
             # rate-limit gate; calling `acquire()` here would reserve
             # a second slot per HTTP (acquire + _fetch_reddit_rss_context
             # both call it), wasting rate-limit budget under the
-            # concurrent-reservation contract. See WORKLOG 2026-06-28
-            # "Limiter concurrency race fix".
+            # concurrent-reservation contract.
             if not use_arctic and reddit_limiter.circuit_open:
                 return
             story = db.get_story(sid)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import time
 import unicodedata
@@ -70,7 +71,7 @@ from .models import (
 )
 from .queue import QueueEntry, build_round, default_sort, in_window
 
-DEFAULT_SERVER = "https://proxy.example.net:8443/hn/"
+DEFAULT_SERVER = os.environ.get("HN_RERANK_SERVER", "http://127.0.0.1:8766/")
 # Quit always exits: at most 3 s after the first q, whatever is still saving.
 QUIT_WAIT_SECONDS = 3.0
 # Telemetry quit budget: pending dwell/opens/impressions flush within ~1 s.
@@ -425,9 +426,9 @@ def dig_deeper_prompt(story: FeedStory) -> str:
             "",
             (
                 "Read the article and the discussion. Tell me the key ideas, what is"
-                " new or surprising, where commenters push back or add expertise, and"
-                " background or related work worth reading next. Then wait for my"
-                " follow-up questions."
+                " new or surprising, where commenters push back or add expertise,"
+                " background or related work worth reading next, and how this is"
+                " useful to me. Then wait for my follow-up questions."
             ),
         ]
     )
@@ -2688,7 +2689,10 @@ class Reader(App[None]):
 
     def action_page_summary(self) -> None:
         """Page the TLDR down from either view, whichever pane has focus."""
-        self.query_one("#summary", Markdown).scroll_page_down(animate=False)
+        summary = self.query_one("#summary", Markdown)
+        # Keep the previous page's last line on screen to anchor the eye.
+        step = max(1, summary.scrollable_content_region.height - 1)
+        summary.scroll_to(y=summary.scroll_y + step, animate=False)
 
     def action_vote(self, action: str) -> None:
         """Hide the story and move on now; the server hears about it next."""

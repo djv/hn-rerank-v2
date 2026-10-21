@@ -319,7 +319,7 @@ HOT_MIN_SCORE = 20
 TOP_MIN_SCORE = 100
 TALK_MIN_COMMENTS = 50
 # A served view holds this many stories: the 8 the clients show (VIEW_LIMIT
-# in templates/index.html and the TUI; 12 before 2026-10-08, user's choice)
+# in templates/index.html and the TUI)
 # plus 4 that slide in as cards ahead of them are voted.
 VIEW_SIZE = 12
 # Explore serves this many each of Unsure, Discover and Interest.
@@ -711,7 +711,7 @@ def _embedding_session_options(ort_variant: EmbeddingOrtVariant) -> ort.SessionO
 
 
 # Single encode() calls slower than this get a loud WARN (stall monsters:
-# one giant batch hogging CPU next to a warm, see WORKLOG 2026-09-08).
+# one giant batch hogging CPU next to a warm).
 # Seam for tests: patched to 0 to force the WARN without a real 10s stall.
 _EMBEDDING_SLOW_WARN_SECONDS = 10.0
 
@@ -2198,7 +2198,7 @@ def assemble_window_deck(
       stories.
       *is_feedback_match* marks stories that duplicate a voted one;
       Explore skips them and backfills from the rest (``canonicalize_hn_
-      dupes`` would drop them downstream anyway; see WORKLOG 2026-07-10).
+      dupes`` would drop them downstream anyway).
     """
     by_score = sorted(ranked, key=lambda r: r.score, reverse=True)
     global_ranks = {r.story.id: i for i, r in enumerate(by_score)}
@@ -2606,7 +2606,7 @@ BADGED_ATTRIBUTION_MIN_SIM = 0.85
 # its raw nearest upvote, but names it only if the pair is still close with
 # the pool mean and top ATTRIBUTION_CENTER_DIRECTIONS directions removed (that
 # pair: 0.20). At 0.30 a line stays on 64% of a week's stories (92% before)
-# and on 90% of raw >= 0.80 matches (2026-10-02, FINDINGS.md). Ranking,
+# and on 90% of raw >= 0.80 matches in an exploratory sample. Ranking,
 # badges and Explore keep the raw vectors.
 ATTRIBUTION_CENTER_DIRECTIONS = 3
 ATTRIBUTION_CENTERED_MIN_SIM = 0.30

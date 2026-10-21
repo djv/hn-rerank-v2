@@ -1,10 +1,16 @@
-# Architecture & Design: hn-rewrite
+# Architecture & Design: HN Rerank
 
 This document outlines the architecture, core design decisions, database schema, ranking system, and maintenance instructions for the `hn-rewrite` minimalist local-first Hacker News reranking dashboard.
 
 ---
 
 ## 1. System Overview
+
+The checked-in model is `joined_logistic` with the linear blend disabled.
+Component breakdowns below apply when the earlier blend is enabled; they do
+not describe the joined model as three separately serving classifiers.
+[Portable path settings](docs/DEPLOYMENT.md) and [current retention/deletion
+limits](docs/PRIVACY.md) complement this reference.
 
 The web card's **Why this story** expander and the TUI's `w` panel show
 the active feed's ordering rule, badge signals, and up to three distinct
@@ -29,7 +35,7 @@ not causal explanations of the complete model score. Opening the panel
 does not fetch content or call an LLM; cold or weak matches are explicitly
 reported as unavailable. Ranking, votes, and database schema are unchanged.
 
-`hn-rewrite` is a unified, resource-efficient rewrite of the original reranking system. It functions as a local-first web application that fetches stories from Hacker News and multiple RSS feeds, semantic-ranks them using a locally run sentence-embedding model and SVM, and presents them in a clean web dashboard.
+HN Rerank (`hn-rewrite` in package/service names) fetches Hacker News, Reddit and RSS stories and learns a personal ranking from votes. The checked-in deployment uses one joined logistic classifier over embeddings, metadata and TF-IDF words since 2026-10-16. The SVM and linear-blend paths described below remain available as earlier alternatives. The owner adopted the joined model after ending the single-profile interleaving trial early; no statistical winner was established.
 
 ```mermaid
 graph TD
@@ -52,7 +58,7 @@ graph TD
 The codebase consists of six primary modules plus the `pipeline/` package:
 
 1. **[database.py](database.py)**: Encapsulates all SQLite interactions. Manages schemas (`stories`, `embeddings`, `feedback`), cascade-deletes, pruned retention rules, and automatic schema migrations. Staging raw inputs directly inside `stories` (`self_text`, `top_comments`, `article_body`) permits on-the-fly text composition and sync-detection. The legacy `article_cache` table is dropped and migrated directly.
-2. **[pipeline/](pipeline/)** — package split from the original `pipeline.py`:
+2. **[pipeline/](pipeline)** — package split from the original `pipeline.py`:
    - **[pipeline/__init__.py](pipeline/__init__.py)** — Conductor: candidate orchestration (`fetch_candidates`, `fetch_candidates_only`), cold-deck assembly (`build_cold_deck`), per-user dashboard entry point (`fast_rerank_for_user`), dedup filter (`_apply_dedup_to_ranked`). Re-exports the full flat namespace so all `from pipeline import X` callers remain unchanged.
    - **[pipeline/candidate_cache.py](pipeline/candidate_cache.py)** — Process-wide `CandidatePool` cache (stories + embedding matrix, masked per user for feedback exclusion) shared across `build_cold_deck`/`fast_rerank_for_user`; see §3.3.1.
    - **[pipeline/config.py](pipeline/config.py)** — Configuration dataclasses (`Config`, `ModelConfig`, `RssConfig`), TOML loader (`Config.load`), config overlay helper, archive/CH source constants, `is_hn_source`.
@@ -121,7 +127,7 @@ We evaluated multiple embedding models for topic-level matching:
 
 **Production embedding input**: The current production encoder is configured in `config.toml` as `mxbai-embed-xsmall-v1|mean|norm|4096` (384 dimensions, 4096-token budget). It embeds a single composed text string, centralized in `story_embedding_text()`. For normal rows this preserves the stored `text_content` exactly, keeping existing cache hashes stable; if `text_content` is empty, it recomposes from `title`, `self_text`, `article_body`, and `top_comments` as a recovery fallback. The MiniLM results in the table above are a historical benchmark, not the live encoder.
 
-**Embedding model contract**: `setup_model.py` pins the HF revision (`MODEL_REVISION`) and records a `model_manifest.json` baseline (sha256 of the six model files) in the model dir; the first run grandfathers existing bytes. `Embedder` init re-verifies the dir against the manifest — on mismatch it logs `embedding_model_changed` and keeps serving stored vectors (warn-and-serve; setup itself refuses to re-baseline without explicit manifest deletion). The `embeddings` table carries additive `model_sha`/`dim` provenance on new rows, never in the match predicate, and rows whose byte length disagrees with the live dim are treated as misses instead of crashing the rerank (`database.py:_decode_embedding_blob`). Net effect: a swapped model dir is a loud log line, not silent garbage or a dead dashboard — and no rollout re-encodes stored rows.
+**Embedding model contract**: `setup_model.py` downloads a configurable HF revision (`MODEL_REVISION`, currently `main`; set a commit hash to pin it) and records a `model_manifest.json` baseline (sha256 of the six model files) in the model dir; the first run grandfathers existing bytes. `Embedder` init re-verifies the dir against the manifest — on mismatch it logs `embedding_model_changed` and keeps serving stored vectors (warn-and-serve; setup itself refuses to re-baseline without explicit manifest deletion). The `embeddings` table carries additive `model_sha`/`dim` provenance on new rows, never in the match predicate, and rows whose byte length disagrees with the live dim are treated as misses instead of crashing the rerank (`database.py:_decode_embedding_blob`). Net effect: a swapped model dir is a loud log line, not silent garbage or a dead dashboard — and no rollout re-encodes stored rows.
 
 **Field-level embedding candidate**: The eval script can test a slower field-level mode that embeds `title`, `self_text`, `article_body`, and `top_comments` separately, then averages the non-empty field vectors. This should not replace production without a new embedding `model_version`, because switching it would intentionally invalidate the existing embedding cache and change feedback-story vectors.
 
@@ -211,16 +217,15 @@ weighted by sqrt(`joined_embedding_weight` = 16), all numeric columns times
 in at least two training stories). It ranks by min-max P(up) - P(down) and
 keeps the fitted probabilities for Explore's Unsure entropy. A vote set
 missing a class fails the fit and falls back to tiers 1-2.
-`joined_features = "no_metadata"` drops the ten meta columns. These are
-shortlist candidates #2 and #4 of the 2026-10-07 offline study
-(docs/evaluations/model-ablation-20261007/FEATURE-REMOVALS.md); the
-probabilities equal the offline adapter's exactly
-(`tests/test_joined_classifier.py`). The tier blend is unchanged.
+`joined_features = "no_metadata"` drops the ten meta columns. Feature tradeoffs
+are summarized in [evaluation](docs/EVALUATION.md); probabilities match the offline
+adapter exactly (`tests/test_joined_classifier.py`). The tier blend is unchanged.
 
 `config.toml` sets `classifier = "joined_logistic"` (all features) and
-`linear_blend_enabled = false` for every profile since 2026-10-16, when the
-user ended the interleaving trial early (INTERLEAVING.md, early endpoint).
-From 2026-10-08 to then it served only as an interleaving challenger, and
+`linear_blend_enabled = false` to combine semantic and lexical inputs in one
+classifier. The early interleaving endpoint did not establish a statistical win;
+see [evaluation](docs/EVALUATION.md).
+From 2026-10-08 to 2026-10-16 it served only as an interleaving challenger, and
 `interleave_user_ids` is now empty. The mechanism remains: for users
 in `interleave_user_ids` (empty by default), each warm also scores the
 candidates with every arm in `interleave_arms` (`joined_all`,
@@ -256,7 +261,7 @@ The default dashboard selection is direct relevance order: `rerank_candidates` t
 
 **Linear blend (`config.model.linear_blend_enabled`; code default off, `config.toml` on from 2026-09-29 to 2026-10-16, replaced by the joined classifier).** `pipeline/linear_blend.py`: after `_score_and_rank` computes the tier-blended score for a voter whose SVM fit, the final score becomes 0.5 x production + 0.2 x dense logistic regression (`linear_blend_dense_weight`; fit on the SVM's scaled feature rows, C `linear_blend_dense_c` 0.1) + 0.3 x TF-IDF logistic regression (`linear_blend_tfidf_weight`; word 1-2 grams over domain/source tokens, title and the first 5,000 characters of `text_content`, C `linear_blend_tfidf_c` 4), each as an average-rank percentile of P(up) - P(down). The dense and TF-IDF weights are multiplied by the SVM tier's weight (`alpha_2 * alpha_3`, `linear_blend_ramp`), so the blend ramps in with the SVM past the 20 up / 20 down gate instead of taking half the ranking there; a heavy voter gets the full weights. The models are fit with the SVM on a cache miss and cached in `linear_blend._CACHE`, one fit per user under its latest feedback signature (a missing entry forces the SVM refit too); that fit is also the next fit's warm start (`_LATEST`, dropped with the cache entry). **Warm starts across restarts** (`pipeline/warm_store.py`): the joined classifier's and the linear blend's latest coefficients per user are also saved as `.npz` (float32, kept-column indices; ~5-12 MB per profile) under `warm_start_dir` (default `$XDG_CACHE_HOME/hn-rewrite/warm_start`), written by a background thread at most every 30 s, atomically. After a restart `latest()` falls back to them; a restored fit only seeds the solver (its IDF is unfitted) and never scores. Cold fits had taken ~60 s of a restart's 92 s first rerank (2026-10-08). The store is off until the server's startup configures it, so tests and scripts write nothing. The first regen also waits (after `regen_initial_delay_seconds`) for the startup warms to finish, up to `regen_startup_warm_wait_seconds` (180 s), so the two no longer overlap. Hashed TF-IDF count rows are cached per (story, text) in `_ROWS` (32k rows, ~110 MB; sized above the candidate caps plus the voters' training stories). A failed fit or score logs and keeps the production score. `scripts/eval_ranker_variants.py` shares `percentile_scores`, `tfidf_text` and the vectorizer with it. Its `production` variant runs whatever the config says (the blend, from `config.toml`); `prodlr`, `produd`, `stack` and the SVM sweeps use production without the blend, and `prodlr`'s default dense logreg is the live one (a production run with all blend weight on it, `linear_blend_ramp=false`), so `prodlr[svm_c=4;lr_weight=0.2;tfidf_weight=0.3]` equals the live blend for a heavy voter (`tests/test_eval_ranker_variants.py`). Other `lr_target`s, half-lives and skipped votes use the eval's own logreg (fewer meta columns, C `linear_blend_dense_c`).
 
-**Side-by-side embeddings (`config.model.side_embedding_enabled`; default off, on in `config.toml` and live since 2026-10-02).** `pipeline/side_embeddings.py`: when on, `_score_and_rank` trains and scores the SVM and the linear blend on each story's stored vector joined with a second model's vector (embeddinggemma-300m, 128 tokens, task prefix `task: classification | query: `), each part scaled 1/sqrt(2), the layout the evaluation replay used (2026-10-02: AUC +0.011, top-12 upvotes +0.056 over 12 time blocks; FINDINGS.md). The score context (closest upvote and its index, closest down/neutral, upvote vectors) stays on the stored vectors, so "Because you upvoted", Explore and dedup thresholds keep their meaning. Side vectors live in the additive `side_embeddings` table (`story_id, model_version` key, matched on the same text hash as `embeddings`), are read through an in-process cache (`SideVectorCache`, one DB read per story text) and are written only by `scripts/embed_side_vectors.py` (voted stories first, then candidates newest first; 0.22 s/story on the VPS on 2 niced threads). A story without one gets a zero side part; below `side_embedding_min_coverage` (0.98) of candidates plus feedback the rerank uses the stored vectors alone (trace label `side_embeddings=off`, warning `side_embeddings_low_coverage`). The model directory is a Hugging Face snapshot (`side_embedding_model_dir`, tokenizer files plus `onnx/model.onnx`).
+**Side-by-side embeddings (`config.model.side_embedding_enabled`; default off, on in `config.toml` and live since 2026-10-02).** `pipeline/side_embeddings.py`: when on, `_score_and_rank` trains and scores the SVM and the linear blend on each story's stored vector joined with a second model's vector (embeddinggemma-300m, 128 tokens, task prefix `task: classification | query: `), each part scaled 1/sqrt(2), the layout used by the matched encoder comparisons in [evaluation](docs/EVALUATION.md). The score context (closest upvote and its index, closest down/neutral, upvote vectors) stays on the stored vectors, so "Because you upvoted", Explore and dedup thresholds keep their meaning. Side vectors live in the additive `side_embeddings` table (`story_id, model_version` key, matched on the same text hash as `embeddings`), are read through an in-process cache (`SideVectorCache`, one DB read per story text) and are written only by `scripts/embed_side_vectors.py` (voted stories first, then candidates newest first; 0.22 s/story on the VPS on 2 niced threads). A story without one gets a zero side part; below `side_embedding_min_coverage` (0.98) of candidates plus feedback the rerank uses the stored vectors alone (trace label `side_embeddings=off`, warning `side_embeddings_low_coverage`). The model directory is a Hugging Face snapshot (`side_embedding_model_dir`, tokenizer files plus `onnx/model.onnx`).
 
 #### 3.4.1 Cross-source URL & title dedup
 The same article can arrive from multiple sources — two HN submissions of the same Verge article (the well-known "[dupe]" pattern), an HN story linking a Reddit thread plus a Reddit RSS feed catching the same thread, etc. Without explicit handling, the same URL would render twice in the deck. Cross-source dedup lives in `dedup.py` and runs at the very end of `fast_rerank_for_user` (after `rerank_candidates`), so it covers all primary-ranked and extra-slot stories, including ones that arrived in different regen cycles.
@@ -389,8 +394,8 @@ reproduce).
   each feed both ways and counts matching story ids.
 
 Arctic Shift reads the official Reddit API, so it is expected to stop by
-March 2027 (Reddit's public API closure) or sooner. Evidence:
-FINDINGS.md "Reddit after the RSS shutdown".
+March 2027 (Reddit's announced public API closure) or sooner; treat this
+as an adapter dependency rather than a durable data-access guarantee.
 
 The live dashboard path applies a **two-leg recent candidate cap** to bound the work the ranker does on each request. The recent candidate fetch is split:
 - **HN leg** (`source='hn'`): ordered by tier-1 gravity `score / age^1.8` (mirrors the cold-start blend in `_score_and_rank`), capped at `recent_candidate_hn_limit` (default 10,000 since 2026-09-29; 5000 had started cutting live stories). This keeps the highest-scoring HN candidates in the pool.
@@ -436,7 +441,7 @@ the fully scored pool at one `now` for all five windows:
   picked in that order, each excluding earlier picks and the window's
   Recommended picks (spares included, since they refill Recommended),
   skipping (and backfilling past) stories that duplicate a voted one
-  (`is_feedback_match`, WORKLOG 2026-07-10). Served 3 each
+  (`is_feedback_match`). Served 3 each
   (`EXPLORE_PER_BADGE`), in model-score order. Impressions before 2026-10-12
   carry the old kind `novel`. Interest (replaced 🎯 Similar, 2026-09-30): `interest_centers`
   clusters the user's upvote embeddings (KMeans, `interest_cluster_k=10`,
@@ -465,7 +470,7 @@ window is served short, never widened. A card's badges are OR'd across the
 views of its window only (`WindowViews.stories`); the view orders are
 authoritative, nothing is derived from badge flags.
 
-**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Top and Talk use the fixed 100-point and 50-comment floors above (user-selected 2026-10-02). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Discover and Interest.
+**No knobs.** All percentile/min knobs are gone from `ModelConfig` and `config.toml` except `hot_badge_percentile` (the velocity p99.5 threshold of the Hot predicate). Top and Talk use the fixed 100-point and 50-comment floors above (fixed floors keep badge eligibility predictable). Velocity is structurally near-zero for archive stories, so archive Popular cards carry 🏆/💬, practically never 🔥. Unsure requires the SVM to have fit (`n_up >= min_up_for_svm=20` AND `n_down >= min_down_for_svm=20`); before that `prob_down is None` and Explore holds only Discover and Interest.
 
 **Attribution (F2, `9a83ffd`).** Cards carry a "Because you upvoted …" line
 populated from the already-computed KNN argmax (`cand_closest_up_idx` → the
@@ -545,7 +550,7 @@ The saved follow-up options are:
 
 #### 3.3.1 Shared candidate pool cache (2026-07-28)
 
-A friend-session investigation (WORKLOG 2026-07-28) found `candidate_sql` and
+A rank-time investigation found `candidate_sql` and
 `candidate_embedding` — not the SVM fit — dominating rank time in production:
 median 2,070ms / 620ms respectively across ~8,900 candidates, versus 5.6ms
 for `svm_fit`. That cost was being paid on *every* warm for *every* user, even
@@ -736,7 +741,7 @@ The system supports multiple users with independent feedback histories and perso
 * **Dynamic Dashboard**: Each user's dashboard is rendered on-request via `fast_rerank_for_user()` → personalized SVM training → top-ranked selection (`enable_mmr=false` by default) → Jinja2 template render. The ranked deck is cached per user as `DeckState(ranked, built_at, version)` and HTML/JSON are rendered from it on each read, so the live version is always rendered in. A user's dashboard version is `_pool_generation + votes counter`: every vote bumps the user's counter, and each regen/RSS refresh (`Handler._pool_changed`) bumps the generation once, making every deck stale and queueing a refresh for each cached user. The generation starts at the boot time in milliseconds (since 2026-09-26; before, at 1), so versions only increase, across restarts too, and a cold deck (version 0) is always behind its target. `Handler._deck_for_user` is the one place a read picks a deck, for `/`, `/api/feed` and `/api/ranking-ready` alike, so they always agree: a user with no votes gets the shared cold deck as their current deck and is never warmed or cached (a deck left over from since-cleared votes is dropped); a voter gets their cached deck (queueing a passive warm while it is stale) or, with no deck yet, the shared cold deck as version 0 plus an urgent warm. At startup (since 2026-10-02) `Handler.warm_recent_users` queues that urgent warm for each profile with a vote in the last 7 days (latest first, at most 4), because the first rank in a fresh process takes 30-60 s against ~6 s for a later refit. Voted stories are filtered out of whatever deck is served. A warm labels its deck with the version current when ranking starts (a regen may have landed since it was queued) and queues a follow-up if a vote or regen lands while it ranks. Decks are capped at 100, evicting the oldest; no time-based TTL. The skeleton is only served for an empty cold deck at version 0 (first boot, before any regen). Tests: `tests/test_deck_state_machine.py` is a Hypothesis state machine over votes, clears, regens, restarts, reads and warms (including a regen or vote landing mid-rank) checking these rules.
 * **Background Regen**: The background loop fetches candidates into the shared `stories` table only. It does not render per-user dashboards.
 * **SVM Training**: Per-user SVM is trained lazily on uncached dashboard requests. The rendered HTML is cached until the next feedback vote bumps the per-user version counter; the fitted SVM model itself is not retained after the render returns.
-* **Feedback API**: `POST /api/feedback` requires valid session cookie. The `user_id` is extracted from the token and passed to `upsert_feedback`. The endpoint rejects cross-site POSTs (`Sec-Fetch-Site: cross-site`, or an `Origin` that does not match the forwarded request origin), keeps the existing 1MB body cap, and applies in-memory fixed-window public-demo throttles before writing feedback (`feedback_per_user_limit = 120` per 10 minutes and `feedback_global_limit = 2000` per hour by default). The endpoint explicitly accepts only integer `story_id` values and `action` in `up`, `neutral`, `down`, or `clear`; malformed payloads return 400 without cache invalidation or regen. A vote that changes nothing (repeating the story's current vote, or clearing a missing one) returns the current `target_version` and queues nothing (`upsert_feedback`/`delete_feedback` report whether a row changed). Every other successful vote (including `action: "clear"`) invalidates the user's dashboard cache, kicks a personalized warm render, and returns the bumped dashboard version as `target_version`. The response is `{ok, target_version}`. The authenticated `GET /api/ranking-ready?min_version=M` returns `{ok, ready, current_version, counts_version}` (`counts_version`: see 3.7, hot-thread counts): `ready` when the deck `_deck_for_user` would serve is at version `M` or newer (it queues a warm when that deck is stale, like any read). A `target_version` parameter (sent by older terminal clients) is ignored; the legacy `version=` alias was removed on 2026-09-26. The previous "defer until queue low / every 5 votes" gating was removed on 2026-06-28 because the SWR stale-hit path could re-inject an already-voted story into the deck via `refillQueue` for up to ~9s after each vote; see `WORKLOG.md` 2026-06-28 for the full bug. Warms run on the bounded, per-user-coalescing `WarmScheduler` described above.
+* **Feedback API**: `POST /api/feedback` requires valid session cookie. The `user_id` is extracted from the token and passed to `upsert_feedback`. The endpoint rejects cross-site POSTs (`Sec-Fetch-Site: cross-site`, or an `Origin` that does not match the forwarded request origin), keeps the existing 1MB body cap, and applies in-memory fixed-window public-demo throttles before writing feedback (`feedback_per_user_limit = 120` per 10 minutes and `feedback_global_limit = 2000` per hour by default). The endpoint explicitly accepts only integer `story_id` values and `action` in `up`, `neutral`, `down`, or `clear`; malformed payloads return 400 without cache invalidation or regen. A vote that changes nothing (repeating the story's current vote, or clearing a missing one) returns the current `target_version` and queues nothing (`upsert_feedback`/`delete_feedback` report whether a row changed). Every other successful vote (including `action: "clear"`) invalidates the user's dashboard cache, kicks a personalized warm render, and returns the bumped dashboard version as `target_version`. The response is `{ok, target_version}`. The authenticated `GET /api/ranking-ready?min_version=M` returns `{ok, ready, current_version, counts_version}` (`counts_version`: see 3.7, hot-thread counts): `ready` when the deck `_deck_for_user` would serve is at version `M` or newer (it queues a warm when that deck is stale, like any read). A `target_version` parameter (sent by older terminal clients) is ignored; the legacy `version=` alias was removed on 2026-09-26. The previous "defer until queue low / every 5 votes" gating was removed on 2026-06-28 because the SWR stale-hit path could re-inject an already-voted story into the deck via `refillQueue` for up to ~9s after each vote. Warms run on the bounded, per-user-coalescing `WarmScheduler` described above.
 * **Frontend**: `localStorage` stores only the first-time tip overlay flag; SQLite feedback is authoritative, and the server filters voted stories out of every deck it serves. See the web client model above.
 * **PERF-2 feedback cadence**: `POST /api/feedback` returns the bumped `target_version`. Per-user in-memory cadence state resets its idle timer on every successful state change and schedules the latest version at 10 changes or 3 idle seconds. No-op clears do not participate.
 
@@ -752,7 +757,7 @@ cold-start blend), so eval tracks serving by construction. Named experiments are
 `margin3_up` (plain 3-class up-margin), `linear_svc_up` / `logreg_up` (cheap linear
 checks), `margin3_up_recency30d` (time-decay ablation), `margin3_plus_cluster` /
 `margin3_plus_source` / `margin3_plus_tierblend` / `margin3_plus_all` (additive
-ablations attributing production's extras — see WORKLOG 2026-09-06; cluster and
+ablations attributing production's extras; cluster and
 source features cost ~−0.014/−0.007 NDCG@40, tier blend is neutral), and
 `tier2_centroid` plus the `gravity` / `candidate_order` baselines. `--svm-c` / `--svm-gamma` add an
 `svm_override` entry; `--sweep-svm` runs the C/γ grid through the same engine
@@ -774,8 +779,8 @@ hash. Only production metadata is standardized. The experimental
 `--embedding-weight` multiplies the entire embedding block by the square
 root of one scalar weight; it does not standardize individual dimensions.
 Fold reports also retain block norms and train/test title overlap IDs.
-These options do not change the serving ranker. The October 7 fixed plan and
-raw outputs live in `docs/evaluations/model-ablation-20261007/`.
+These options do not change the serving ranker. Aggregate comparisons and
+limitations are documented in [evaluation](docs/EVALUATION.md).
 
 `scripts/eval_one_classifier.py` uses the same canonical fold/serving path
 with one joined logistic regression, LinearSVC, histogram gradient booster
@@ -847,8 +852,7 @@ Conclusion: logistic regression is the least-bad faster candidate, but it still 
 
 A follow-up logistic-regression `C` sweep on the same 5-fold 30-day setup tested `C={0.01,0.03,0.05,0.1,0.2,0.4,0.8,1.5,3.0,10.0}`. Best `NDCG@40` was `C=0.1` (`NDCG@40=0.385`, `P@40=0.335`, `Down@40=0.015`, MAP `0.223`, median `167.3`). Best MAP/NDCG@100/median was `C=0.2` (`NDCG@40=0.380`, `NDCG@100=0.392`, MAP `0.225`, `P@40=0.330`, `Down@40=0.010`, median `166.1`). Larger `C` values degraded sharply. The sweep does not change the conclusion: tuned logistic regression remains below the RBF SVC baseline (`NDCG@40=0.416`, MAP `0.253`, `P@40=0.355`, median `159.4`).
 
-MLP classifier variants were evaluated on 2026-06-23 and retired on 2026-09-06
-(see WORKLOG); results retained as provenance. That run reused the standard
+MLP classifier variants were evaluated on 2026-06-23 and retired on 2026-09-06; results retained as provenance. That run reused the standard
 leakage-safe feature matrix, kept raw embedding dimensions unscaled, scaled/clipped only metadata columns, and applied the same balanced sample weights as the simpler classifiers:
 
 | Variant | Raw NDCG@40 | Raw NDCG@100 | Raw MAP | P@40 | Down@40 | Median upvote rank |
@@ -858,7 +862,7 @@ leakage-safe feature matrix, kept raw embedding dimensions unscaled, scaled/clip
 | `mlp_64_a1e-3` | 0.306 | 0.331 | 0.177 | 0.265 | 0.025 | 237.1 |
 | `mlp_64_16_a1e-3` | 0.215 | 0.235 | 0.109 | 0.160 | 0.010 | 426.4 |
 
-Conclusion: the tested MLPs substantially underperform the RBF SVC on the main eyeball metric (`NDCG@40`), P@40, MAP, and median rank. The best MLP (`64` hidden units) is also below tuned logistic regression, so neural classifiers are not a promising replacement without a materially different architecture or much more feedback data. (Separately, the retired unshipped attention-MLP experiment had mixed historical results — see WORKLOG 2026-09-06 — so this is not a blanket claim about all neural approaches.)
+Conclusion: the tested MLPs substantially underperform the RBF SVC on the main eyeball metric (`NDCG@40`), P@40, MAP, and median rank. The best MLP (`64` hidden units) is also below tuned logistic regression, so neural classifiers are not a promising replacement without a materially different architecture or much more feedback data. (Separately, the retired unshipped attention-MLP experiment had mixed historical results — so this is not a blanket claim about all neural approaches.)
 
 Field-level embedding experiments were retired on 2026-09-06; the results below are
 
@@ -911,7 +915,7 @@ The detailed summary endpoint `/api/tldr-detail` runs on Mistral
 gemini (fallback), cerebras/openrouter/zen (experiments), and gospark
 (Muse Spark via the Responses API — quality-validated in a 2026-09-08
 bakeoff but PARKED: 14-87s latency and reasoning-token burn kill tap
-use; see WORKLOG.md). There is no automatic provider fallback; switching
+use). There is no automatic provider fallback; switching
 is `LLM_PROVIDER=` + service restart. A Mistral 402 (the $10 spend cap)
 feeds the same cooldown path as a 429: limited retries, then stale-cache
 fallback with a countdown (see `test_flask_test_client_tldr_provider_error_degrades_gracefully`).

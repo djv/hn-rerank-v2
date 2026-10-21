@@ -2770,7 +2770,7 @@ def _main(argv: list[str] | None, stack: ExitStack) -> None:
             fold, config, cluster=True, source=True, tierblend=True
         ),
         "tier2_centroid": lambda fold: (fold.tier2_scores.copy(), None),
-        # 2026-09-25 ranking study (see FINDINGS.md).
+        # Ranking-study summaries are documented in docs/EVALUATION.md.
         "logreg_up_minus_down": lambda fold: _scores_logreg(
             fold, config, target="up_minus_down"
         ),

@@ -2,11 +2,9 @@
 
 With ``ModelConfig.side_embedding_enabled`` the SVM and the linear models see
 each story's stored vector and a second model's vector joined, each part
-scaled 1/sqrt(2) (the evaluation replay's layout). Offline (2026-10-02,
-FINDINGS.md "Fresh-vote, impression-pool and live-yield evals") embeddinggemma
--300m at 128 tokens added AUC +0.011 and top-12 upvotes +0.056 over 12 time
-blocks. Attribution, Explore and dedup keep the stored vectors, so their
-similarity thresholds keep their meaning.
+scaled 1/sqrt(2) (the evaluation replay's layout). See docs/EVALUATION.md
+for matched encoder comparisons. Attribution, Explore and dedup keep the stored
+vectors, so their similarity thresholds keep their meaning.
 
 Side vectors are encoded out of process by ``scripts/embed_side_vectors.py``
 into the ``side_embeddings`` table; ranking only reads them. Stories without

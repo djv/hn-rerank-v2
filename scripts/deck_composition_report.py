@@ -13,9 +13,8 @@ and ``pipeline/__init__.py``).
 Two modes:
 
 * Default: re-runs ``fast_rerank_for_user`` for ``--user-id`` against a
-  scratch copy of the DB (never the live file — see AGENTS.md's "never
-  destructively modify the local database"; the embedding-cache write path
-  means this needs a writable copy) and prints the fresh trace.
+  scratch copy of the DB (the embedding-cache write path needs a writable
+  copy; never modify the live database) and prints the fresh trace.
 * ``--from-rank-perf``: reads the newest ``rank_perf`` row(s) instead of
   re-ranking, so the live service can be inspected read-only with no
   re-rank cost. Works directly against the configured DB (read-only).
@@ -92,8 +91,7 @@ def _from_rank_perf(config: Config, user_id: int, n: int) -> None:
 
 def _rerank_fresh(config: Config, user_id: int) -> None:
     # Never open the live DB read-write: fast_rerank_for_user's embedding
-    # cache path (get_or_compute_embeddings) can write missing rows, and
-    # AGENTS.md forbids any write path against the production file. Work
+    # cache path (get_or_compute_embeddings) can write missing rows. Work
     # on a scratch copy instead.
     with tempfile.TemporaryDirectory(prefix="deck_composition_report_") as tmpdir:
         scratch_db = Path(tmpdir) / "scratch.db"

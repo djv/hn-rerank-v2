@@ -11,7 +11,7 @@ than joining against the full comments table. A single-query join
 (`INNER JOIN (SELECT * FROM hackernews_history FINAL WHERE type =
 'comment' ...)`, repeated once per level) reliably exceeds the shared
 play.clickhouse.com instance's query memory limit regardless of batch
-size — see incident notes in WORKLOG.md.
+size; walking item IDs avoids that full-table scan.
 
 Public API:
 - query_live_window(days, min_score, limit) -> list of story metadata dicts

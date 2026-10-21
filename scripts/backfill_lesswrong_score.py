@@ -15,7 +15,7 @@ RSS-default 0. This script:
   fresher run
 
 Idempotent. Non-destructive (UPDATE only, no DELETE, no DROP).
-Respects the AGENTS.md DB safety rules.
+Updates only matched LessWrong stories; preserves feedback and other rows.
 
 Run: ``uv run python scripts/backfill_lesswrong_score.py``
 """

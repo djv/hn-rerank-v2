@@ -1,9 +1,8 @@
 """Interaction-ledger diagnostic: is dwell a usable label, does preference
 drift exist, and where does the deck's effective engagement collapse?
 
-Read-only. Motivated by ROADMAP.md B1/B2/B3 and
-notes/improvement-brainstorm-2026-07-15.md — this is the "measure before you
-build" pass those items call for. See `scripts/narrowing_report.py` for the
+Read-only. Measures the implicit-signal questions in ROADMAP.md B1/B2/B3
+before changing ranking behavior. See `scripts/narrowing_report.py` for the
 sibling *topical coverage* report; this script covers position bias, source
 mix, dwell-vote agreement, and centroid drift, and ends with an explicit
 next-step recommendation.
@@ -151,9 +150,7 @@ def centroid(vectors: NDArray[np.float32]) -> NDArray[np.float32]:
 # --- report sections ---
 
 
-def _load_window(
-    db: Database, user_id: int, since_ts: float | None
-) -> LedgerWindow:
+def _load_window(db: Database, user_id: int, since_ts: float | None) -> LedgerWindow:
     query = "SELECT event_type, occurred_at FROM interaction_events WHERE user_id = ?"
     params: tuple = (user_id,)
     if since_ts is not None:
@@ -201,19 +198,22 @@ def _position_stats(
         return []
 
     voted_story_ids = {
-        sid for (sid,) in db.execute(
+        sid
+        for (sid,) in db.execute(
             "SELECT DISTINCT story_id FROM feedback WHERE user_id = ? AND action != 'neutral'",
             (user_id,),
         )
     }
     up_story_ids = {
-        sid for (sid,) in db.execute(
+        sid
+        for (sid,) in db.execute(
             "SELECT DISTINCT story_id FROM feedback WHERE user_id = ? AND action = 'up'",
             (user_id,),
         )
     }
     opened_story_ids = {
-        sid for (sid,) in db.execute(
+        sid
+        for (sid,) in db.execute(
             "SELECT DISTINCT story_id FROM interaction_events "
             "WHERE user_id = ? AND event_type IN ('article_open', 'comments_open')",
             (user_id,),
@@ -326,7 +326,9 @@ def _dwell_vote_stats(
     auc = rank_auc(scores, is_up)
 
     if capped_count:
-        print(f"note: {capped_count} of {len(rows)} dwell rows capped at {dwell_cap_ms}ms")
+        print(
+            f"note: {capped_count} of {len(rows)} dwell rows capped at {dwell_cap_ms}ms"
+        )
 
     return stats, auc
 
@@ -353,15 +355,21 @@ def _drift_stat(
 
     all_ids = list({*recent_ids, *older_ids})
     hashed = _story_embeddings(db, config, all_ids)
-    recent_vecs = np.array([hashed[i] for i in recent_ids if i in hashed], dtype=np.float32)
-    older_vecs = np.array([hashed[i] for i in older_ids if i in hashed], dtype=np.float32)
+    recent_vecs = np.array(
+        [hashed[i] for i in recent_ids if i in hashed], dtype=np.float32
+    )
+    older_vecs = np.array(
+        [hashed[i] for i in older_ids if i in hashed], dtype=np.float32
+    )
     if len(recent_vecs) == 0 or len(older_vecs) == 0:
         return None
 
     return DriftStat(
         recent_n=len(recent_vecs),
         older_n=len(older_vecs),
-        centroid_cos_distance=cosine_distance(centroid(recent_vecs), centroid(older_vecs)),
+        centroid_cos_distance=cosine_distance(
+            centroid(recent_vecs), centroid(older_vecs)
+        ),
     )
 
 
@@ -386,10 +394,19 @@ def _story_embeddings(
 
     stories = [
         Story(
-            id=r[0], title=r[1], url=r[2], score=r[3], time=r[4],
-            text_content=r[5], source=r[6], comment_count=r[7],
-            discussion_url=r[8], comment_count_at_fetch=r[9], self_text=r[10],
-            top_comments=r[11], article_body=r[12],
+            id=r[0],
+            title=r[1],
+            url=r[2],
+            score=r[3],
+            time=r[4],
+            text_content=r[5],
+            source=r[6],
+            comment_count=r[7],
+            discussion_url=r[8],
+            comment_count_at_fetch=r[9],
+            self_text=r[10],
+            top_comments=r[11],
+            article_body=r[12],
         )
         for r in rows
     ]
@@ -414,7 +431,9 @@ def main() -> None:
     parser.add_argument("--min-events", type=int, default=100)
     parser.add_argument("--since", default=SINCE_LEDGER_FIX)
     parser.add_argument("--dwell-cap-ms", type=int, default=DWELL_CAP_MS_DEFAULT)
-    parser.add_argument("--drift-recent-days", type=int, default=DRIFT_RECENT_DAYS_DEFAULT)
+    parser.add_argument(
+        "--drift-recent-days", type=int, default=DRIFT_RECENT_DAYS_DEFAULT
+    )
     args = parser.parse_args()
 
     config = Config.load(args.config)
@@ -459,7 +478,9 @@ def main() -> None:
 
         print("== 2. position bias ==")
         positions = _position_stats(db, user_id, since_ts)
-        print(f"{'sort_mode':>12} {'bucket':>6} {'n':>6} {'vote_rate':>9} {'up_rate':>7} {'open_rate':>9}")
+        print(
+            f"{'sort_mode':>12} {'bucket':>6} {'n':>6} {'vote_rate':>9} {'up_rate':>7} {'open_rate':>9}"
+        )
         for p in positions:
             print(
                 f"{p.sort_mode:>12} {p.bucket:>6} {p.impressions:>6} "
@@ -486,7 +507,9 @@ def main() -> None:
         print("== 5. preference drift (the B1 gate) ==")
         drift = _drift_stat(db, config, user_id, args.drift_recent_days)
         if drift is None:
-            print("not enough split data (need upvotes both inside and outside the recent window)")
+            print(
+                "not enough split data (need upvotes both inside and outside the recent window)"
+            )
         else:
             print(
                 f"recent_n={drift.recent_n} older_n={drift.older_n} "
@@ -495,7 +518,10 @@ def main() -> None:
         print()
 
         print("== recommendation ==")
-        if drift is not None and drift.centroid_cos_distance >= DRIFT_MATERIAL_THRESHOLD:
+        if (
+            drift is not None
+            and drift.centroid_cos_distance >= DRIFT_MATERIAL_THRESHOLD
+        ):
             print(
                 f"drift={drift.centroid_cos_distance:.3f} >= {DRIFT_MATERIAL_THRESHOLD} "
                 "-> do B1 (time-decay) next as a one-flag eval_ranker_variants.py ablation."

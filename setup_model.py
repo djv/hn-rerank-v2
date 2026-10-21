@@ -3,7 +3,7 @@
 
 Provisions DEFAULT_ONNX_MODEL_DIR with whatever model config.toml's
 embedding_model_version currently names (mxbai-embed-xsmall-v1 as of
-2026-08-27; see WORKLOG for the switch history). If a future model swap
+2026-08-27). If a future model swap
 changes MODEL_REPO here, also update DEFAULT_ONNX_MODEL_DIR/
 DEFAULT_EMBEDDING_MODEL_VERSION/DEFAULT_EMBEDDING_MAX_TOKENS in
 pipeline/config.py so the two stay in lockstep.
@@ -18,8 +18,8 @@ import httpx
 from pipeline import DEFAULT_ONNX_MODEL_DIR
 
 MODEL_REPO = "mixedbread-ai/mxbai-embed-xsmall-v1"
-# Pinned HF revision the URLs below resolve at. Bump this (and re-run) for a
-# deliberate model upgrade; embeddings stay valid across runs as long as the
+# HF revision the URLs below resolve at; `main` is mutable, so set a commit
+# hash here to pin the model. Bump it (and re-run) for a deliberate upgrade; embeddings stay valid across runs as long as the
 # bytes behind the pin do not change (manifest-verified).
 MODEL_REVISION = "main"
 HF_BASE = f"https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}"
@@ -96,8 +96,7 @@ def ensure_manifest() -> None:
                 "Refusing to overwrite the baseline. If this change is "
                 "deliberate, delete "
                 f"{manifest_path(DEFAULT_ONNX_MODEL_DIR)} and re-run to "
-                "re-baseline (stored vectors keep serving; see WORKLOG "
-                "2026-09-07).",
+                "re-baseline (stored vectors keep serving).",
                 file=sys.stderr,
             )
             raise SystemExit(1)

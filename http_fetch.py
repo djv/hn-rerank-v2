@@ -327,7 +327,7 @@ async def fetch_with_urllib_fallback(
     httpx's TLS fingerprint gets blocked or reset (see module docstring).
     Six feeds produced ~112 such failures in a week, all against hosts
     that were live when probed manually -- these were transient, not
-    dead feeds (WORKLOG 2026-08-27). A genuine network-down/DNS failure
+    dead feeds. A genuine network-down/DNS failure
     still propagates from the urllib attempt (see urllib_fetch) so the
     caller's broad except still catches it.
 

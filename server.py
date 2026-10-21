@@ -896,10 +896,14 @@ async def _call_llm_chat(
                 except httpx.TransportError as e:
                     llm_limiter.release(estimated_tokens)
                     logging.warning("_call_llm_chat transport error: %r", e)
-                    return LlmChatResult(content=f"LLM transport error: {e!r}", ok=False)
+                    return LlmChatResult(
+                        content=f"LLM transport error: {e!r}", ok=False
+                    )
                 data = _json_object(resp) if resp.status_code == 200 else {}
                 usage = data.get("usage")
-                used_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+                used_tokens = (
+                    usage.get("total_tokens") if isinstance(usage, dict) else None
+                )
                 llm_limiter.record_response(
                     status=resp.status_code,
                     headers=resp.headers,
@@ -930,10 +934,7 @@ async def _call_llm_chat(
                     )
                 if resp.status_code == 429 and attempt < 3:
                     continue
-                if (
-                    resp.status_code in llm_limiter.UNAVAILABLE_STATUSES
-                    and attempt < 1
-                ):
+                if resp.status_code in llm_limiter.UNAVAILABLE_STATUSES and attempt < 1:
                     # One retry; acquire() waits out the cooldown the 5xx set.
                     continue
                 break
@@ -1029,7 +1030,9 @@ async def _call_llm_responses(
                 except httpx.TransportError as e:
                     llm_limiter.release(estimated_tokens)
                     logging.warning("_call_llm_responses transport error: %r", e)
-                    return LlmChatResult(content=f"LLM transport error: {e!r}", ok=False)
+                    return LlmChatResult(
+                        content=f"LLM transport error: {e!r}", ok=False
+                    )
                 ms = (time.perf_counter() - t0) * 1000.0
                 data = _json_object(resp)
                 usage = data.get("usage") if isinstance(data, dict) else {}
@@ -1084,10 +1087,7 @@ async def _call_llm_responses(
                     )
                 if resp.status_code == 429 and attempt < 3:
                     continue
-                if (
-                    resp.status_code in llm_limiter.UNAVAILABLE_STATUSES
-                    and attempt < 1
-                ):
+                if resp.status_code in llm_limiter.UNAVAILABLE_STATUSES and attempt < 1:
                     # One retry; acquire() waits out the cooldown the 5xx set.
                     continue
                 break
@@ -1262,6 +1262,13 @@ _LLM_PROVIDERS: dict[str, tuple[str, str, str, dict[str, object]]] = {
         # Without it a 31k-char article spent the whole cap reasoning.
         {"reasoning_effort": "low"},
     ),
+    # Diffusion LLM (Mercury 3, 2026-10-19 launch); trial for TLDR latency.
+    "inception": (
+        "INCEPTION_API_KEY",
+        "https://api.inceptionlabs.ai/v1/chat/completions",
+        "mercury-3",
+        {},
+    ),
     "gemini": (
         "GEMINI_API_KEY",
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -1297,7 +1304,7 @@ def _max_tokens_for_provider(cfg: LlmProviderConfig, base: int) -> int:
         # Responses API deducts reasoning from the same max_output_tokens
         # bucket. Reasoning is usually 350-1000 tokens at effort=low, but a
         # 1,647-token outlier exhausted the old +1200 cap and dropped the
-        # article section (WORKLOG 2026-09-25); +2000 covers it plus output.
+        # article section; +2000 covers it plus output.
         return base + 2000
     if cfg.provider == "gofree":
         # The free Go models reason without reporting it: 450 tokens came
@@ -2183,7 +2190,7 @@ class Handler:
         if _warm_is_starved(rank_ms, stage_sum_ms):
             # Starvation signature: the thread was stalled, not computing.
             # Stages explain <1/3 of wall time (regen contention, pool
-            # exhaustion, or host-level stalls — see WORKLOG 2026-09-08).
+            # exhaustion, or host-level stalls).
             logging.warning(
                 "dashboard_warm_starved user_id=%s version=%s rank_ms=%.1f"
                 " stage_sum_ms=%.1f model_cache=%s",

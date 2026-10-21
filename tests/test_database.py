@@ -677,7 +677,7 @@ def test_upsert_story_preserves_richer_comment_metadata(db) -> None:
     and discussion_url=None. The Reddit prewarm / LW prewarm / on-demand
     TLDR paths correctly populate these after the RSS upsert — but
     without metadata-aware merge, the next regen's stale RSS upsert
-    would clobber the populated values. See WORKLOG 2026-06-29.
+    would clobber the populated values.
     """
     from pipeline import compose_story_text
 

@@ -1,0 +1,24 @@
+# Fresh-clone configuration. Copy to config.toml and edit locally.
+# config.toml retains the owner's deployment settings; this example is smaller.
+[hn_rewrite]
+server_port = 8766
+# Omit onnx_model_dir to honor HN_ONNX_MODEL_DIR and the portable defaults.
+# Without an existing sibling shared/ directory, setup_model.py uses ./onnx_model.
+embedding_model_version = "mxbai-embed-xsmall-v1|mean|norm|4096"
+embedding_max_tokens = 4096
+embedding_batch_size = 1
+warm_pool_size = 2
+non_hn_candidates_enabled = true
+reddit_source = "arctic_shift"
+
+[hn_rewrite.model]
+classifier = "joined_logistic"
+# Optional side vectors need separate provisioning; not needed for a first run.
+side_embedding_enabled = false
+
+[hn_rewrite.rss]
+feeds = [
+    "https://simonwillison.net/atom/everything/",
+    "https://jvns.ca/atom.xml",
+    "https://www.reddit.com/r/programming/top/.rss?t=week&limit=25",
+]

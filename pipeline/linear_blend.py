@@ -1,8 +1,8 @@
 """Opt-in blend of the production score with a dense logistic regression and
 a TF-IDF logistic regression (`linear_blend_enabled`).
 
-Offline (FINDINGS.md, 2026-09-29): 0.5 production + 0.2 dense LR + 0.3 TF-IDF,
-each as an average-rank percentile, beat production on user 1's votes.
+Combines average-rank percentiles from the base score, dense LR and TF-IDF.
+See docs/EVALUATION.md for the retrospective comparisons and limitations.
 """
 
 from __future__ import annotations

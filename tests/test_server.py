@@ -67,8 +67,7 @@ def _read_template_and_static() -> tuple[str, str]:
 
     Tests that look for JS code should check the inline script returned here,
     while tests that look for HTML attributes / Jinja2 directives check the full
-    template source, including component partials. (The script is inline again
-    after the static extraction was rolled back — see WORKLOG 2026-06-27.)
+    template source, including component partials.
     """
     repo_root = Path(__file__).resolve().parents[1]
     index_template = (repo_root / "templates" / "index.html").read_text(
@@ -3374,7 +3373,11 @@ async def test_llm_transport_error_returns_the_reservation(
     monkeypatch.setattr(server.httpx, "AsyncClient", _fake_llm_client(refuse, posts))
     _seed_token_bucket()
     res = await getattr(server, call)(
-        api_key="k", base_url="https://example.test", model="m", prompt="p" * 300, max_tokens=1000
+        api_key="k",
+        base_url="https://example.test",
+        model="m",
+        prompt="p" * 300,
+        max_tokens=1000,
     )
 
     assert not res.ok and res.status is None
@@ -3394,7 +3397,11 @@ async def test_call_llm_chat_non_json_200_is_an_error(
         server.httpx, "AsyncClient", _fake_llm_client(_BodyResponse, posts)
     )
     res = await server._call_llm_chat(
-        api_key="k", base_url="https://example.test", model="m", prompt="p", max_tokens=10
+        api_key="k",
+        base_url="https://example.test",
+        model="m",
+        prompt="p",
+        max_tokens=10,
     )
 
     assert not res.ok and res.status is None
@@ -3438,7 +3445,11 @@ async def test_call_llm_chat_retries_unavailable_once(
     monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
     monkeypatch.setattr(server.llm_limiter, "acquire", allow_acquire)
     res = await server._call_llm_chat(
-        api_key="k", base_url="https://example.test", model="m", prompt="p", max_tokens=10
+        api_key="k",
+        base_url="https://example.test",
+        model="m",
+        prompt="p",
+        max_tokens=10,
     )
 
     assert not res.ok and res.status == 503
@@ -4791,6 +4802,13 @@ async def test_generate_detailed_tldr_folds_thin_article_to_discussion_only(
             "opencode.ai",
         ),
         (
+            "inception",
+            "INCEPTION_API_KEY",
+            "mercury-3",
+            {},
+            "api.inceptionlabs.ai",
+        ),
+        (
             "gemini",
             "GEMINI_API_KEY",
             "models/gemini-2.5-flash-lite",
@@ -4908,7 +4926,7 @@ async def test_generate_detailed_tldr_cerebras_passes_reasoning_effort_and_bumpe
 ) -> None:
     """Cerebras's gpt-oss-120b is a reasoning model: without reasoning_effort
     and extra max_tokens headroom it burns the whole budget on hidden
-    reasoning and returns no content (see WORKLOG 2026-07-10)."""
+    reasoning and returns no content."""
     import server
 
     calls = []
@@ -6331,7 +6349,7 @@ def test_warm_background_article_fetch_failure_still_prefetches_tldrs(
 def test_quiet_third_party_loggers_silences_httpx_and_trafilatura() -> None:
     """httpx INFO and trafilatura's benign "discarding data" WARNING made up
     ~88% of a week of journal volume in production, drowning out anything
-    actionable during an incident (see WORKLOG 2026-08-27)."""
+    actionable during an incident."""
     import logging
     import server as srv
 

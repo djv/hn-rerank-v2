@@ -105,7 +105,7 @@ def migrate_database(
         source_conn.close()
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    dest_conn = sqlite3.connect(destination)
+    dest_conn = sqlite3.connect(f"file:{destination}", uri=True)
     try:
         dest_conn.execute("PRAGMA journal_mode=DELETE")
         dest_conn.execute("PRAGMA foreign_keys=OFF")

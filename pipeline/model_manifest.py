@@ -4,7 +4,7 @@ The manifest records which exact bytes the model directory held when it was
 last provisioned (or first seen), so a later swap shows up as an explicit
 mismatch instead of silently invalidating every stored vector. It is purely
 additive: existing embedding rows keep matching regardless of manifest
-state (see WORKLOG 2026-09-07 — no re-embed rotation).
+state without rotating the stored embeddings.
 """
 
 from __future__ import annotations

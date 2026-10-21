@@ -59,9 +59,10 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 nice -n 19 \
 ```
 
 Keep detailed reports (feedback IDs/configuration) outside Git; record only
-aggregate results in FINDINGS.md. The source directory needs Git metadata
-for report provenance; do not run a bare archive without initializing an
-isolated source snapshot. Do not copy credentials into experiment folders.
+aggregate results in [the evaluation summary](EVALUATION.md). The source directory
+needs Git metadata for report provenance; do not run a bare archive without
+initializing an isolated source snapshot. Do not copy credentials into experiment
+folders.
 
 ## Hill-climbing and embedding comparisons (added 2026-09-25)
 

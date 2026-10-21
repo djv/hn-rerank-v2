@@ -1,5 +1,9 @@
 # hn-rewrite: improvement roadmap
 
+Historical roadmap. Consult [ARCHITECTURE.md](ARCHITECTURE.md) for the system
+reference and [evaluation](docs/EVALUATION.md) for measured ranking tradeoffs;
+unchecked items here are proposals.
+
 ## Context
 
 This is a personal, single-user, local-first Hacker News reranking dashboard.
@@ -10,11 +14,8 @@ service; do not reach for Postgres, Redis, a message broker, FAISS, or a deep
 model to fix these problems — the bottlenecks are the current warm-path work
 and its lifecycle, not the storage/serving layer.
 
-This file merges two earlier advisory reviews — `fable_plan.md` (rich per-item
-technical detail, file:line references) and `codex_ultra_plan.md` (a later
-reconciliation against the live tree, with corrected priorities and two items
-fable lacked) — into one canonical roadmap, deduped and re-numbered. Merged
-2026-07-10; both source files are deleted.
+This historical roadmap groups performance, interface and evaluation proposals.
+Its measurements describe the configurations at the time of each experiment.
 
 ---
 
@@ -24,7 +25,7 @@ fable lacked) — into one canonical roadmap, deduped and re-numbered. Merged
   `hn-rewrite-backup.service`'s stale `WorkingDirectory`/`ExecStart` (pointed
   at an old checkout), ran the corrected unit, and completed a non-destructive
   restore drill (checksum + `PRAGMA integrity_check` + row-count comparison,
-  all clean). See WORKLOG.md 2026-07-10.
+  all clean).
 - ✅ **`rank_perf` metrics table + `scripts/perf_report.py`** — `470f787`,
   2026-07-09. Every warm persists a typed `RankPerfSample` row
   (`database.py`'s `insert_rank_perf`, wired into `server.py`'s
@@ -35,7 +36,7 @@ fable lacked) — into one canonical roadmap, deduped and re-numbered. Merged
   deployment shape: DB reachability, last regen, warm failures, and the
   Reddit circuit are all already in journalctl or directly queryable in the
   DB; a live status endpoint only pays off with an external poller, and none
-  exists here. See WORKLOG.md 2026-07-10.
+  exists here.
 - ✅ **Interaction measurement ledger** — 2026-07-12. Added additive STRICT
   schema v2, idempotent `POST /api/interaction`, bounded client batching,
   explicit impression/dwell/link telemetry, and backup-verified migration
@@ -232,8 +233,7 @@ ordering, active-HN refresh, stale-TLDR fallback, and the rule that
 
 ### F1. Personal archive: true save/read-later + SQLite FTS5 search (M, 1-2 days)
 
-**⛔ Rejected 2026-09-08 — the user doesn't want it.** Kept for the record
-so future sessions don't re-propose it. Original pitch: a `saved_items`
+**⛔ Rejected: keep the product focused on feed ranking.** Original pitch: a `saved_items`
 table independent of `feedback`, a save button + keyboard shortcut, and a
 `/library` view backed by SQLite FTS5 over title, self_text, article_body,
 and cached TLDRs.
@@ -249,7 +249,7 @@ no new matmul), gated by `ATTRIBUTION_MIN_SIM=0.35`, rendered as a
 downweighting the attributed neighbor. Two designs were explored (a separate
 per-user mute table with its own button; then downvote-implicates-neighbor
 via a `feedback.attributed_neighbor_id` edge) and both scrapped — no second
-mechanism, downvote semantics unchanged. See WORKLOG.md.
+mechanism, downvote semantics unchanged.
 
 ### F3. Explore/exploit dial (S, ~1 day)
 
@@ -293,7 +293,7 @@ sign-off per the DB-safety rule.)
 
 ### B1. Test preference drift explicitly
 
-**Blocked, not just low-priority — read 2026-08-14, see WORKLOG.md.**
+**Blocked by unreliable vote-creation timestamps.**
 `scripts/ledger_report.py`'s drift gate found `feedback.updated_at` is
 mutation time, not vote-creation time: all 1,386 of user 1's upvote rows
 show `updated_at` inside the last 60 days (a STRICT-schema-migration and
@@ -339,7 +339,7 @@ decision instead of vibes.
 ### B3. Build an impression ledger; don't discard implicit signals
 
 **Ledger exists (2026-07-12) and its consumer is now the recommended next
-step — read 2026-08-14, see WORKLOG.md.** `scripts/ledger_report.py` found
+step for validating implicit signals.** `scripts/ledger_report.py` found
 capped dwell time predicts eventual vote direction with rank-AUC 0.771 (up
 vs. down, 159/171 story-sums, `--since 2026-07-15`) — well above noise. This
 clears the gate the roadmap set for treating dwell as a real signal. Next
@@ -402,7 +402,7 @@ Each item is a visual change only; behavior and the wire contract stay fixed.
 7. ~~read the interaction ledger (`scripts/ledger_report.py`)~~ — done,
    2026-08-14. Result: B1 blocked (no true vote-creation timestamp), B2
    unmeasurable retroactively (constant `ranker_arm`), **B3 cleared**
-   (dwell rank-AUC 0.771). See WORKLOG.md.
+   (dwell rank-AUC 0.771).
 8. ~~**B3's consumer** (dwell as a `sample_weight` modifier), then
    **REF-1 → REF-2 → REF-3**, then **F1-F3** by appetite. B1/B2 stay
    blocked/deferred until their prerequisites above are addressed.~~ —

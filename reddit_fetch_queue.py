@@ -31,7 +31,7 @@ State machine:
     on one task collapsed the gap before the next task's HTTP request
     to ~1.5s (the limiter's bare `INTER_REQUEST_DELAY` floor), well
     under Reddit's real tolerance, causing a self-reinforcing 429
-    cascade (see WORKLOG 2026-08-01 "429-cascade").
+    cascade.
   - When the heap is empty, the worker sets `_idle_event` and sleeps
     for `POLL_INTERVAL` before re-checking.
   - `wait_until_empty` returns when `_idle_event` is set (or the
@@ -101,8 +101,7 @@ class RedditFetchQueue:
         # inside the factory). `_last_dispatch_at` records when the most
         # recently *dispatched* task actually finished, and `_pop_ready`
         # requires `_current_min_gap` to elapse from there too — closing
-        # the gap a stale `target_at` would otherwise leave wide open. See
-        # WORKLOG 2026-08-01 "429-cascade" for the incident this fixes.
+        # the gap a stale `target_at` would otherwise leave wide open.
         self._last_dispatch_at: float = 0.0
         self._current_min_gap: float = self.MIN_FETCH_SPACING
         self._thread = threading.Thread(
